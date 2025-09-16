@@ -21,7 +21,7 @@ API_TOKEN = os.environ["TFNSW_API_TOKEN"]
 
 URLS_VP = [
     "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains",
-    "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneymetro",
+    # "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneymetro",  # 404 on TfNSW
 ]
 
 # Distance thresholds (m)
@@ -335,6 +335,10 @@ def fetch_vehicle_positions_cached():
     merged = gtfs_realtime_pb2.FeedMessage()
     merged.header.gtfs_realtime_version = "2.0"
 
+    total_entities = 0
+    total_with_vehicle = 0
+    total_with_pos = 0
+
     for url in URLS_VP:
         try:
             r = s.get(url, headers=headers, timeout=20)
@@ -342,16 +346,34 @@ def fetch_vehicle_positions_cached():
             feed = gtfs_realtime_pb2.FeedMessage()
             feed.ParseFromString(r.content)
             merged.entity.extend(feed.entity)
+
+            ents = len(feed.entity)
+            vehs = sum(1 for e in feed.entity if e.HasField("vehicle"))
+            poss = sum(
+                1 for e in feed.entity
+                if e.HasField("vehicle") and e.vehicle.HasField("position")
+                and hasattr(e.vehicle.position, "latitude")
+                and hasattr(e.vehicle.position, "longitude")
+            )
+            total_entities += ents
+            total_with_vehicle += vehs
+            total_with_pos += poss
+            print(f"[metroboard] fetched {url}: entities={ents}, vehicles={vehs}, vehicles_with_pos={poss}")
         except Exception as e:
             print(f"[metroboard] WARN: failed fetching {url}: {e}")
+
+    print(f"[metroboard] merged feed: entities={total_entities}, vehicles={total_with_vehicle}, vehicles_with_pos={total_with_pos}")
+
 
     _FEED_CACHE = merged
     _FEED_TS = now
     return merged, 0.0
 
-def collect_allowed_trains(feed: gtfs_realtime_pb2.FeedMessage,
-                           route_id_to_short: dict[str,str]) -> list[tuple[float,float]]:
+def collect_allowed_trains(feed: gtfs_realtime_pb2.FeedMessage, route_id_to_short: dict[str,str]) -> list[tuple[float,float]]:
     trains: list[tuple[float,float]] = []
+    skipped_by_short = 0
+    no_position = 0
+
     for e in feed.entity:
         if not e.HasField("vehicle"):
             continue
@@ -359,15 +381,21 @@ def collect_allowed_trains(feed: gtfs_realtime_pb2.FeedMessage,
         rid = v.trip.route_id if v.HasField("trip") else ""
         short = route_id_to_short.get(rid, "")
         if ROUTE_SHORT_ALLOW and short and short not in ROUTE_SHORT_ALLOW:
+            skipped_by_short += 1
             continue
         if not v.HasField("position"):
+            no_position += 1
             continue
         lat = getattr(v.position, "latitude", None)
         lon = getattr(v.position, "longitude", None)
         if lat is None or lon is None:
+            no_position += 1
             continue
         trains.append((lat, lon))
+
+    print(f"[metroboard] collect_allowed_trains: trains={len(trains)}, skipped_by_short={skipped_by_short}, no_position={no_position}")
     return trains
+
 
 # ------------- FastAPI -------------
 app = FastAPI()
