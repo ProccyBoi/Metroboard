@@ -1,3 +1,9 @@
+# app.py — Metroboard backend (Sydney Trains + optional Sydney Metro)
+# - Loads ONLY numeric parent stations (skips bus "G..." stop groups)
+# - Supports station whitelist (names or numeric parent stop_ids)
+# - Merges GTFS-RT feeds for Sydney Trains and Sydney Metro
+# - Exposes: /, /healthz, /debug, /stations, /states
+
 import os, time, math, csv, random, typing as T
 import requests
 from fastapi import FastAPI, Query
@@ -7,21 +13,27 @@ from google.transit import gtfs_realtime_pb2
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# ---------------- Env & constants ----------------
 API_TOKEN = os.environ["TFNSW_API_TOKEN"]
-URL_VP_ST = "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains"
+
+# Merge both feeds (Trains + Metro). Comment the Metro line out if you want Trains-only.
+URLS_VP = [
+    "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains",
+    "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneymetro",
+]
 
 # Distance thresholds (meters)
 D_SOLID = 120
 D_NEAR  = 500
 
-# Route short-names you'll consider "in network"
-ROUTE_SHORT_ALLOW = {"T1","T2","T3","T4","T5","T6","T7","T8","T9","CCN","SCO","BMT","SHL"}
+# Optional route short-name allowlist (safe to keep; doesn't block unknowns if short name missing)
+ROUTE_SHORT_ALLOW = {"T1","T2","T3","T4","T5","T6","T7","T8","T9","CCN","SCO","BMT","SHL","M","M1","M2"}
 
 # Caching + CORS
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
 CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN")
 
-# Optional geographic guardrail (kept as a safety net, but we won't rely on it)
+# Optional geographic guardrail (soft)
 DEFAULT_SYD_BBOX = (-34.2, 150.5, -33.4, 151.4)
 def parse_bbox_env() -> T.Optional[tuple[float,float,float,float]]:
     if os.getenv("SYD_BBOX_DISABLE") == "1":
@@ -37,7 +49,11 @@ def parse_bbox_env() -> T.Optional[tuple[float,float,float,float]]:
 
 SYD_BBOX = parse_bbox_env()
 
-# ---------- Helpers ----------
+# ---------------- Helpers ----------------
+def is_numeric_parent_stop_id(s: str) -> bool:
+    # Rail/Metro parent station IDs are numeric. Bus "Stop Groups" (addresses) are often 'G...'.
+    return s.isdigit()
+
 def status_from_distance(m: T.Optional[float]) -> int:
     if m is None: return 0
     if m <= D_SOLID: return 3
@@ -83,11 +99,9 @@ def clean_station_name(name: str) -> str:
 
 def load_whitelist(path: str) -> tuple[set[str], set[str]]:
     """
-    Reads a simple text/CSV file listing stations that should be included.
-    Accepts either parent station stop_ids or cleaned names (case-insensitive).
-    - Lines starting with '#' are comments
-    - CSV accepted (first token per line is used)
-    Returns: (stop_id_whitelist, name_whitelist)
+    Reads a simple text/CSV file listing stations to include.
+    Accepts parent station numeric stop_ids OR station names (case-insensitive).
+    Lines starting with '#' are comments; CSV accepted (uses first token per line).
     """
     sid_w: set[str] = set()
     name_w: set[str] = set()
@@ -99,7 +113,7 @@ def load_whitelist(path: str) -> tuple[set[str], set[str]]:
             if not line:
                 continue
             token = line.split(",", 1)[0].strip()
-            if token.isdigit():
+            if token.isdigit():  # only accept numeric IDs as valid parent station IDs
                 sid_w.add(token)
             else:
                 name_w.add(clean_station_name(token).lower())
@@ -110,9 +124,10 @@ def load_station_index(stops_path="stops.txt",
                        sid_whitelist: set[str] = set(),
                        name_whitelist: set[str] = set()):
     """
-    Build { name -> {stop_id, name, lat, lon} } only for stations present in the whitelist.
-    Whitelist can list parent stop_ids OR station names (cleaned, case-insensitive).
-    If whitelist sets are empty, falls back to 'all parents' (optionally filtered by bbox).
+    Build { name -> {stop_id, name, lat, lon} } for rail/metro parent stations.
+    - Only accepts PARENT rows with NUMERIC stop_id (drops G... bus groups).
+    - If a whitelist is provided, keep only those (by numeric id or name).
+    - If parent coords missing, average platform child coords.
     """
     parents: dict[str, dict] = {}
     kids: dict[str, list[tuple[float,float]]] = {}
@@ -129,9 +144,11 @@ def load_station_index(stops_path="stops.txt",
             lon = float(lon_s) if lon_s else None
 
             if loc_type == 1:
-                # Parent station row
-                parents[stop_id] = {"stop_id": stop_id, "raw_name": name_raw, "lat": lat, "lon": lon}
+                # Parent station row — keep only numeric parent ids
+                if is_numeric_parent_stop_id(stop_id):
+                    parents[stop_id] = {"stop_id": stop_id, "raw_name": name_raw, "lat": lat, "lon": lon}
             else:
+                # Child rows: collect platform coords if within bbox (or no bbox)
                 if parent and lat is not None and lon is not None:
                     if (bbox is None) or within_bbox(lat, lon, bbox):
                         kids.setdefault(parent, []).append((lat, lon))
@@ -142,25 +159,23 @@ def load_station_index(stops_path="stops.txt",
         name = clean_station_name(raw_name)
         lat, lon = meta["lat"], meta["lon"]
 
-        # Use averaged child coords if parent missing/blank
-        if (lat is None or lon is None) and pid in kids:
+        # Fill missing parent coords from children
+        if (lat is None or lon is None) and pid in kids and kids[pid]:
             plat = kids[pid]
-            if plat:
-                lat = sum(p[0] for p in plat) / len(plat)
-                lon = sum(p[1] for p in plat) / len(plat)
+            lat = sum(p[0] for p in plat) / len(plat)
+            lon = sum(p[1] for p in plat) / len(plat)
 
         if lat is None or lon is None:
             continue
 
-        # If whitelist provided, enforce it:
+        # Whitelist enforcement (if provided)
         want = True
         if sid_whitelist or name_whitelist:
             want = (pid in sid_whitelist) or (clean_station_name(name).lower() in name_whitelist)
 
-        # If still wanted, optionally keep a loose bbox guardrail to exclude obvious outliers
+        # Soft bbox guardrail (only if still wanted)
         if want and bbox is not None and not within_bbox(lat, lon, bbox):
-            # If we averaged from in-bbox platforms, it's still fine; otherwise skip
-            if pid not in kids:
+            if pid not in kids:  # if we didn't get coords from in-bbox children, drop
                 want = False
 
         if not want:
@@ -173,8 +188,8 @@ def load_station_index(stops_path="stops.txt",
 
     return index
 
-# ---------- Train feed (cached) ----------
-_FEED_CACHE = None  # type: ignore
+# ---------------- Train feed (cached + merged) ----------------
+_FEED_CACHE: T.Optional[gtfs_realtime_pb2.FeedMessage] = None
 _FEED_TS = 0.0
 
 def fetch_vehicle_positions_cached():
@@ -182,6 +197,7 @@ def fetch_vehicle_positions_cached():
     now = time.time()
     if _FEED_CACHE is not None and (now - _FEED_TS) < FEED_CACHE_SEC:
         return _FEED_CACHE, (now - _FEED_TS)
+
     headers = {
         "Authorization": f"apikey {API_TOKEN}",
         "Accept": "application/x-protobuf",
@@ -190,22 +206,35 @@ def fetch_vehicle_positions_cached():
     }
     s = session()
     time.sleep(random.uniform(0, 0.25))
-    r = s.get(URL_VP_ST, headers=headers, timeout=20)
-    r.raise_for_status()
-    feed = gtfs_realtime_pb2.FeedMessage()
-    feed.ParseFromString(r.content)
-    _FEED_CACHE = feed
-    _FEED_TS = now
-    return feed, 0.0
 
-def collect_allowed_trains(feed, route_id_to_short: dict[str,str]) -> list[tuple[float,float]]:
+    merged = gtfs_realtime_pb2.FeedMessage()
+    merged.header.gtfs_realtime_version = "2.0"
+
+    for url in URLS_VP:
+        try:
+            r = s.get(url, headers=headers, timeout=20)
+            r.raise_for_status()
+            feed = gtfs_realtime_pb2.FeedMessage()
+            feed.ParseFromString(r.content)
+            merged.entity.extend(feed.entity)
+        except Exception as e:
+            print(f"[metroboard] WARN: failed fetching {url}: {e}")
+
+    _FEED_CACHE = merged
+    _FEED_TS = now
+    return merged, 0.0
+
+def collect_allowed_trains(feed: gtfs_realtime_pb2.FeedMessage,
+                           route_id_to_short: dict[str,str]) -> list[tuple[float,float]]:
     trains: list[tuple[float,float]] = []
     for e in feed.entity:
         if not e.HasField("vehicle"):
             continue
         v = e.vehicle
+        # Map route_id -> short name (may be empty)
         rid = v.trip.route_id if v.HasField("trip") else ""
         short = route_id_to_short.get(rid, "")
+        # If short name exists AND isn't allowed, skip. If it's empty, accept.
         if short and short not in ROUTE_SHORT_ALLOW:
             continue
         if not v.HasField("position"):
@@ -217,7 +246,7 @@ def collect_allowed_trains(feed, route_id_to_short: dict[str,str]) -> list[tuple
         trains.append((lat, lon))
     return trains
 
-# ---------- FastAPI ----------
+# ---------------- FastAPI ----------------
 app = FastAPI()
 if CORS_ALLOW_ORIGIN:
     app.add_middleware(
@@ -236,17 +265,23 @@ def _startup():
     global ROUTE_ID_TO_SHORT, STATION_INDEX
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
 
-    # Whitelist support
     wl_path = os.getenv("STATION_WHITELIST_PATH", "stations_whitelist.txt")
-    sid_w, name_w = load_whitelist(wl_path)  # empty sets if file missing
+    sid_w, name_w = load_whitelist(wl_path)
 
-    # Build station index restricted to whitelist (if provided)
     STATION_INDEX = load_station_index(
         "stops.txt",
-        bbox=SYD_BBOX,               # soft guardrail
+        bbox=SYD_BBOX,
         sid_whitelist=sid_w,
         name_whitelist=name_w
     )
+
+    # Final hard filter (belt & braces): drop any non-numeric parents that slipped through
+    STATION_INDEX = {k: v for k, v in STATION_INDEX.items() if is_numeric_parent_stop_id(v["stop_id"])}
+
+    if not STATION_INDEX:
+        raise RuntimeError("[metroboard] No stations loaded. Check your whitelist and GTFS files.")
+
+    print(f"[metroboard] Loaded {len(STATION_INDEX)} stations")
 
 @app.get("/")
 def root():
@@ -264,16 +299,16 @@ def debug():
         "bbox": list(SYD_BBOX) if SYD_BBOX else None,
         "allowed_routes": sorted(ROUTE_SHORT_ALLOW),
         "cache_sec": FEED_CACHE_SEC,
-        "whitelist_active": True
+        "feeds": URLS_VP,
     }
 
 @app.get("/stations")
 def stations():
+    # Sorted by name for readability
     return JSONResponse([STATION_INDEX[k] for k in sorted(STATION_INDEX.keys())])
 
 @app.get("/states")
 def states(only: T.Optional[str] = Query(None, description="Comma-separated station names to restrict the output")):
-    # Select subset
     subset = STATION_INDEX
     if only:
         wanted = [n.strip() for n in only.split(",") if n.strip()]
@@ -281,7 +316,6 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
         if not subset:
             return JSONResponse({})
 
-    # Fetch trains (cached)
     feed, _ = fetch_vehicle_positions_cached()
     trains = collect_allowed_trains(feed, ROUTE_ID_TO_SHORT)
 
