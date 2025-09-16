@@ -3,7 +3,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 # routes.txt and stops.txt must be in the image (same versions you use locally)
-COPY routes.txt stops.txt ./
+COPY stops.txt routes.txt trips.txt stop_times.txt agency.txt /app/
 COPY app.py .
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8000
