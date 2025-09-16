@@ -29,7 +29,7 @@ D_SOLID = 120
 D_NEAR  = 500
 
 # Agencies to include (empty = no agency filtering)
-AGENCY_NAME_ALLOW: set[str] = set()
+AGENCY_NAME_ALLOW = {"Sydney Trains", "NSW TrainLink", "Sydney Metro"}
 
 # Route short-names allowlist (empty = no short-name filtering)
 ROUTE_SHORT_ALLOW: set[str] = set()
@@ -135,7 +135,7 @@ def require_allowed_parents(
     trips_path="trips.txt",
     stop_times_path="stop_times.txt",
     agency_path="agency.txt",
-    route_types_allowed=(1,2,401,109),   # include common TfNSW encodings
+    route_types_allowed=(2,401),   # include common TfNSW encodings
     agencies_allowed: T.Set[str] = AGENCY_NAME_ALLOW,
     route_short_allow: T.Set[str] = ROUTE_SHORT_ALLOW,
 ) -> set[str]:
