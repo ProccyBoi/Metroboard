@@ -1,11 +1,13 @@
-# app.py — Metroboard backend (Rail + Metro only)
-# - Keeps ONLY parents served by route_type in (1=subway/metro, 2=rail)
-# - Optional agency guard: {"Sydney Trains","NSW Trains","Sydney Metro"}
-# - Supports station whitelist (names or numeric IDs) + soft bbox
-# - Merges GTFS-RT feeds for Sydney Trains and Sydney Metro
+# app.py — Metroboard backend (Rail + Metro only, strict)
+# - Requires static GTFS files: stops.txt, routes.txt, trips.txt, stop_times.txt, agency.txt
+# - Computes allowed parent stations by route_type in (1=subway/metro, 2=rail),
+#   optionally filtered to agencies {"Sydney Trains","NSW Trains","Sydney Metro"}
+# - NO fallback: if the mode filter can't be built, startup fails (to avoid wharfs/light rail/bus)
+# - Supports a station whitelist (names or numeric IDs) layered on top
+# - Merges GTFS-RT for Sydney Trains + Sydney Metro
 # - Exposes: /, /healthz, /debug, /stations, /states
 
-import os, time, math, csv, random, typing as T, sys
+import os, time, math, csv, random, typing as T
 import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
@@ -14,7 +16,7 @@ from google.transit import gtfs_realtime_pb2
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-# ---------------- Env & constants ----------------
+# ------------- Config -------------
 API_TOKEN = os.environ["TFNSW_API_TOKEN"]
 
 URLS_VP = [
@@ -22,21 +24,21 @@ URLS_VP = [
     "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneymetro",
 ]
 
-# Distance thresholds (meters)
+# Distance thresholds (m)
 D_SOLID = 120
 D_NEAR  = 500
 
-# Optional route short-name allowlist
+# Optional route short-name allowlist (harmless if short-name is missing)
 ROUTE_SHORT_ALLOW = {"T1","T2","T3","T4","T5","T6","T7","T8","T9","CCN","SCO","BMT","SHL","M","M1","M2"}
 
-# Agencies to include (set empty to disable agency filtering)
+# Included agencies (set() to disable)
 AGENCY_NAME_ALLOW = {"Sydney Trains", "NSW Trains", "Sydney Metro"}
 
 # Caching + CORS
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
 CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN")
 
-# Optional geographic guardrail (soft)
+# Optional geographic guardrail
 DEFAULT_SYD_BBOX = (-34.2, 150.5, -33.4, 151.4)
 def parse_bbox_env() -> T.Optional[tuple[float,float,float,float]]:
     if os.getenv("SYD_BBOX_DISABLE") == "1":
@@ -49,10 +51,14 @@ def parse_bbox_env() -> T.Optional[tuple[float,float,float,float]]:
         return (a,b,c,d)
     except Exception:
         return DEFAULT_SYD_BBOX
-
 SYD_BBOX = parse_bbox_env()
 
-# ---------------- Helpers ----------------
+# Belt-and-braces name excludes (extra guard)
+EXCLUDE_NAME_SUBSTR = tuple(x.lower() for x in [
+    "wharf", "light rail", "b-line", "interchange", "motorway", "m2",
+])
+
+# ------------- Helpers -------------
 def is_numeric_parent_stop_id(s: str) -> bool:
     return s.isdigit()
 
@@ -74,7 +80,7 @@ def session():
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000.0
     dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lon2 - lon1)
+    dlon = math.radians(lat2 - lon1)
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
     return 2 * R * math.asin(math.sqrt(a))
 
@@ -116,8 +122,8 @@ def load_whitelist(path: str) -> tuple[set[str], set[str]]:
                 name_w.add(clean_station_name(token).lower())
     return sid_w, name_w
 
-# ---------------- Static GTFS mode filter (rail+metro) ----------------
-def build_allowed_parent_set(
+# ------------- Static GTFS filter: Rail + Metro only -------------
+def require_allowed_parents(
     stops_path="stops.txt",
     routes_path="routes.txt",
     trips_path="trips.txt",
@@ -126,24 +132,19 @@ def build_allowed_parent_set(
     route_types_allowed=(1,2),
     agencies_allowed: T.Set[str] = AGENCY_NAME_ALLOW,
     route_short_allow: T.Set[str] = ROUTE_SHORT_ALLOW,
-) -> T.Optional[set[str]]:
-    """
-    Returns a set of parent station IDs that are served by routes with route_type in {1,2}
-    (metro + rail), optionally filtered by agency name and route short-name.
-    If any required file is missing, returns None (caller may fall back).
-    """
-    for p in (stops_path, routes_path, trips_path, stop_times_path, agency_path):
-        if not os.path.exists(p):
-            print(f"[metroboard] WARN: missing {p}; mode filtering disabled (falling back to whitelist/bbox only)")
-            return None
+) -> set[str]:
+    # Ensure all required files are present
+    missing = [p for p in (stops_path, routes_path, trips_path, stop_times_path, agency_path) if not os.path.exists(p)]
+    if missing:
+        raise RuntimeError("[metroboard] Missing static GTFS files: " + ", ".join(missing))
 
-    # agency_id -> agency_name
+    # agency_id -> name
     agency_name_by_id: dict[str,str] = {}
     with open(agency_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             agency_name_by_id[(r.get("agency_id") or "").strip()] = (r.get("agency_name") or "").strip()
 
-    # route_id -> (route_type, route_short, agency_name)
+    # route_id -> (route_type, short, agency_name)
     route_meta: dict[str, tuple[int,str,str]] = {}
     with open(routes_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
@@ -189,20 +190,19 @@ def build_allowed_parent_set(
                 continue
             if agencies_allowed and agname not in agencies_allowed:
                 continue
-            # If we have an allowlist of short names, enforce it only when present
             if route_short_allow and rshort and rshort not in route_short_allow:
                 continue
 
             p = parent_of(stop_id)
-            if p:
+            if p and is_numeric_parent_stop_id(p):
                 allowed_parents.add(p)
 
-    # Keep only numeric parents (belt & braces)
-    allowed_parents = {p for p in allowed_parents if is_numeric_parent_stop_id(p)}
-    print(f"[metroboard] Mode filter allowed parents: {len(allowed_parents)}")
+    if not allowed_parents:
+        raise RuntimeError("[metroboard] Mode filter produced zero parents — check GTFS files and filters")
+    print(f"[metroboard] Mode filter: {len(allowed_parents)} parent stations (rail+metro)")
     return allowed_parents
 
-# ---------------- Build station index ----------------
+# ------------- Build station index -------------
 def load_station_index(
     stops_path="stops.txt",
     bbox: T.Optional[tuple[float,float,float,float]] = None,
@@ -210,12 +210,9 @@ def load_station_index(
     name_whitelist: set[str] = set(),
     allowed_parents: T.Optional[set[str]] = None,
 ):
-    """
-    Build { name -> {stop_id, name, lat, lon} } for Rail/Metro parents.
-    - Parent must be numeric AND in allowed_parents (if provided)
-    - Whitelist (by id or name) further restricts set if provided
-    - Parent coords filled from platform children if missing
-    """
+    if allowed_parents is None:
+        raise RuntimeError("[metroboard] allowed_parents required")
+
     parents: dict[str, dict] = {}
     kids: dict[str, list[tuple[float,float]]] = {}
 
@@ -233,8 +230,10 @@ def load_station_index(
             if loc_type == 1:
                 if not is_numeric_parent_stop_id(stop_id):
                     continue
-                # If mode filter present, enforce it
-                if allowed_parents is not None and stop_id not in allowed_parents:
+                if stop_id not in allowed_parents:
+                    continue
+                # extra name guard
+                if any(s in name_raw.lower() for s in EXCLUDE_NAME_SUBSTR):
                     continue
                 parents[stop_id] = {"stop_id": stop_id, "raw_name": name_raw, "lat": lat, "lon": lon}
             else:
@@ -246,14 +245,15 @@ def load_station_index(
     for pid, meta in parents.items():
         raw_name = meta["raw_name"]
         name = clean_station_name(raw_name)
-        lat, lon = meta["lat"], meta["lon"]
+        # extra name guard (again on cleaned)
+        if any(s in name.lower() for s in EXCLUDE_NAME_SUBSTR):
+            continue
 
-        # Fill from children if missing
+        lat, lon = meta["lat"], meta["lon"]
         if (lat is None or lon is None) and pid in kids and kids[pid]:
             plat = kids[pid]
             lat = sum(p[0] for p in plat) / len(plat)
             lon = sum(p[1] for p in plat) / len(plat)
-
         if lat is None or lon is None:
             continue
 
@@ -275,7 +275,7 @@ def load_station_index(
 
     return index
 
-# ---------------- Train feed (cached + merged) ----------------
+# ------------- Train feed (cached + merged) -------------
 _FEED_CACHE: T.Optional[gtfs_realtime_pb2.FeedMessage] = None
 _FEED_TS = 0.0
 
@@ -331,7 +331,7 @@ def collect_allowed_trains(feed: gtfs_realtime_pb2.FeedMessage,
         trains.append((lat, lon))
     return trains
 
-# ---------------- FastAPI ----------------
+# ------------- FastAPI -------------
 app = FastAPI()
 if CORS_ALLOW_ORIGIN:
     app.add_middleware(
@@ -350,34 +350,32 @@ def _startup():
     global ROUTE_ID_TO_SHORT, STATION_INDEX
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
 
-    wl_path = os.getenv("STATION_WHITELIST_PATH", "stations_whitelist.txt")
-    sid_w, name_w = load_whitelist(wl_path)
-
-    # Build mode filter (rail+metro parents)
-    allowed_parents = build_allowed_parent_set(
+    # Build allowed parents from static GTFS (mandatory)
+    allowed_parents = require_allowed_parents(
         stops_path="stops.txt",
         routes_path="routes.txt",
         trips_path="trips.txt",
         stop_times_path="stop_times.txt",
         agency_path="agency.txt",
-        route_types_allowed=(1,2),
-        agencies_allowed=AGENCY_NAME_ALLOW,
+        route_types_allowed=(1,2),                 # Metro + Rail only
+        agencies_allowed=AGENCY_NAME_ALLOW,        # Optional: tighten here
         route_short_allow=ROUTE_SHORT_ALLOW
     )
+
+    # Optional: further restrict by user whitelist
+    wl_path = os.getenv("STATION_WHITELIST_PATH", "stations_whitelist.txt")
+    sid_w, name_w = load_whitelist(wl_path)
 
     STATION_INDEX = load_station_index(
         "stops.txt",
         bbox=SYD_BBOX,
         sid_whitelist=sid_w,
         name_whitelist=name_w,
-        allowed_parents=allowed_parents   # None => fallback (not ideal)
+        allowed_parents=allowed_parents
     )
 
-    # Final hard filter (belt & braces)
-    STATION_INDEX = {k: v for k, v in STATION_INDEX.items() if is_numeric_parent_stop_id(v["stop_id"])}
-
     if not STATION_INDEX:
-        raise RuntimeError("[metroboard] No stations loaded. Ensure static GTFS files exist and/or whitelist is valid.")
+        raise RuntimeError("[metroboard] No stations loaded after filtering — check whitelist and GTFS files.")
 
     print(f"[metroboard] Loaded {len(STATION_INDEX)} stations (rail+metro only)")
 
