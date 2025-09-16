@@ -358,7 +358,7 @@ def collect_allowed_trains(feed: gtfs_realtime_pb2.FeedMessage,
         v = e.vehicle
         rid = v.trip.route_id if v.HasField("trip") else ""
         short = route_id_to_short.get(rid, "")
-        if short and short not in ROUTE_SHORT_ALLOW:
+        if ROUTE_SHORT_ALLOW and short and short not in ROUTE_SHORT_ALLOW:
             continue
         if not v.HasField("position"):
             continue
