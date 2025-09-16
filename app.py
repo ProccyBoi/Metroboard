@@ -196,6 +196,12 @@ def require_allowed_parents(
             p = parent_of(stop_id)
             if p and is_numeric_parent_stop_id(p):
                 allowed_parents.add(p)
+                
+    print("[metroboard] DEBUG: route_types seen:",
+          {rtype for (_, (rtype, _, _)) in route_meta.items()})
+    print("[metroboard] DEBUG: sample route_meta:",
+          list(route_meta.items())[:5])
+    print("[metroboard] DEBUG: parent_ids count:", len(parent_ids))
 
     if not allowed_parents:
         raise RuntimeError("[metroboard] Mode filter produced zero parents — check GTFS files and filters")
