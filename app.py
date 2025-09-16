@@ -480,6 +480,38 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
 
     feed, _ = fetch_vehicle_positions_cached()
     trains = collect_allowed_trains(feed, ROUTE_ID_TO_SHORT)
+    # --- DEBUG: inspect distances ---
+    sample_names = [
+        "Central", "Town Hall", "Wynyard", "Redfern", "Parramatta",
+        "Hornsby", "Chatswood", "Strathfield", "Bankstown", "Penrith"
+    ]
+    # pick first train for reference
+    if trains:
+        tlat0, tlon0 = trains[0]
+        print(f"[metroboard] DEBUG trains[0]: lat={tlat0}, lon={tlon0}")
+    else:
+        print("[metroboard] DEBUG trains: empty")
+
+    # check a few well-known stations if present
+    for nm in sample_names:
+        if nm in STATION_INDEX:
+            slat = STATION_INDEX[nm]["lat"]
+            slon = STATION_INDEX[nm]["lon"]
+            # distance to first train only, just for sanity
+            d0 = haversine_m(slat, slon, tlat0, tlon0) if trains else None
+            print(f"[metroboard] DEBUG station {nm}: lat={slat}, lon={slon}, d_to_first_train_m={d0}")
+
+    # compute global minimum distance (any station vs any train)
+    global_min = None
+    global_min_pair = None
+    for nm, meta in STATION_INDEX.items():
+        slat, slon = meta["lat"], meta["lon"]
+        for (tlat, tlon) in trains:
+            d = haversine_m(slat, slon, tlat, tlon)
+            if global_min is None or d < global_min:
+                global_min = d
+                global_min_pair = (nm, (slat, slon), (tlat, tlon))
+    print(f"[metroboard] DEBUG global_min_distance_m={global_min} pair={global_min_pair}")
 
     out: dict[str, int] = {}
     if not trains:
