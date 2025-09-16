@@ -28,11 +28,11 @@ URLS_VP = [
 D_SOLID = 120
 D_NEAR  = 500
 
-# Optional route short-name allowlist (harmless if short-name is missing)
-ROUTE_SHORT_ALLOW = {"T1","T2","T3","T4","T5","T6","T7","T8","T9","CCN","SCO","BMT","SHL","M","M1","M2"}
+# Agencies to include (empty = no agency filtering)
+AGENCY_NAME_ALLOW: set[str] = set()
 
-# Included agencies (set() to disable)
-AGENCY_NAME_ALLOW = {"Sydney Trains", "NSW Trains", "Sydney Metro"}
+# Route short-names allowlist (empty = no short-name filtering)
+ROUTE_SHORT_ALLOW: set[str] = set()
 
 # Caching + CORS
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
@@ -188,11 +188,11 @@ def require_allowed_parents(
 
             if rtype not in route_types_allowed:
                 continue
+            # only filter by route_type; agency/short-name filters disabled if the sets are empty
             if agencies_allowed and agname not in agencies_allowed:
                 continue
             if route_short_allow and rshort and rshort not in route_short_allow:
                 continue
-
             p = parent_of(stop_id)
             if p and is_numeric_parent_stop_id(p):
                 allowed_parents.add(p)
