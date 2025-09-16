@@ -123,17 +123,23 @@ def load_whitelist(path: str) -> tuple[set[str], set[str]]:
     return sid_w, name_w
 
 # ------------- Static GTFS filter: Rail + Metro only -------------
+def _is_stationish(name: str) -> bool:
+    n = (name or "").strip().lower()
+    if any(s in n for s in EXCLUDE_NAME_SUBSTR):  # wharf, light rail, b-line, etc.
+        return False
+    return n.endswith(" station") or n.endswith(" railway station")
+
 def require_allowed_parents(
     stops_path="stops.txt",
     routes_path="routes.txt",
     trips_path="trips.txt",
     stop_times_path="stop_times.txt",
     agency_path="agency.txt",
-    route_types_allowed=(1,2),
+    route_types_allowed=(1,2,401,109),   # include common TfNSW encodings
     agencies_allowed: T.Set[str] = AGENCY_NAME_ALLOW,
     route_short_allow: T.Set[str] = ROUTE_SHORT_ALLOW,
 ) -> set[str]:
-    # Ensure all required files are present
+    # Ensure files exist
     missing = [p for p in (stops_path, routes_path, trips_path, stop_times_path, agency_path) if not os.path.exists(p)]
     if missing:
         raise RuntimeError("[metroboard] Missing static GTFS files: " + ", ".join(missing))
@@ -149,7 +155,10 @@ def require_allowed_parents(
     with open(routes_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             rid = (r.get("route_id") or "").strip()
-            rtype = int((r.get("route_type") or "3").strip() or "3")
+            try:
+                rtype = int((r.get("route_type") or "3").strip() or "3")
+            except Exception:
+                rtype = 3
             rshort = (r.get("route_short_name") or "").strip()
             agid = (r.get("agency_id") or "").strip()
             agname = agency_name_by_id.get(agid, "")
@@ -178,7 +187,9 @@ def require_allowed_parents(
         if p: return p
         return sid if sid in parent_ids else None
 
+    # ---------- STRICT PATH: by trips/stop_times ----------
     allowed_parents: set[str] = set()
+    seen_types, seen_agencies = set(), set()
     with open(stop_times_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             trip_id = (r.get("trip_id") or "").strip()
@@ -186,27 +197,48 @@ def require_allowed_parents(
             rid = trip_route.get(trip_id, "")
             rtype, rshort, agname = route_meta.get(rid, (None, "", ""))
 
-            if rtype not in route_types_allowed:
+            if rtype is None:
                 continue
-            # only filter by route_type; agency/short-name filters disabled if the sets are empty
+            seen_types.add(rtype)
+            if agname: seen_agencies.add(agname)
+
+            if route_types_allowed and rtype not in route_types_allowed:
+                continue
             if agencies_allowed and agname not in agencies_allowed:
                 continue
             if route_short_allow and rshort and rshort not in route_short_allow:
                 continue
+
             p = parent_of(stop_id)
             if p and is_numeric_parent_stop_id(p):
                 allowed_parents.add(p)
-                
-    print("[metroboard] DEBUG: route_types seen:",
-          {rtype for (_, (rtype, _, _)) in route_meta.items()})
-    print("[metroboard] DEBUG: sample route_meta:",
-          list(route_meta.items())[:5])
-    print("[metroboard] DEBUG: parent_ids count:", len(parent_ids))
 
-    if not allowed_parents:
-        raise RuntimeError("[metroboard] Mode filter produced zero parents — check GTFS files and filters")
-    print(f"[metroboard] Mode filter: {len(allowed_parents)} parent stations (rail+metro)")
-    return allowed_parents
+    print(f"[metroboard] routes: route_types_seen={sorted(seen_types)} agencies_seen={sorted(seen_agencies)}")
+    if allowed_parents:
+        print(f"[metroboard] Mode filter (by trips): {len(allowed_parents)} parent stations")
+        return allowed_parents
+
+    # ---------- FALLBACK PATH: by station-like parent names ----------
+    print("[metroboard] WARN: trip-based filter yielded 0 parents; falling back to name-based station filter.")
+    fallback_parents: set[str] = set()
+    with open(stops_path, newline="", encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            if (r.get("location_type") or "0").strip() != "1":
+                continue
+            pid = (r.get("stop_id") or "").strip()
+            if not is_numeric_parent_stop_id(pid):
+                continue
+            raw_name = (r.get("stop_name") or "").strip()
+            if not _is_stationish(raw_name):
+                continue
+            # keep it — coordinates checked later when building STATION_INDEX
+            fallback_parents.add(pid)
+
+    if not fallback_parents:
+        raise RuntimeError("[metroboard] Name-based fallback produced zero parents — check GTFS stops.txt")
+
+    print(f"[metroboard] Mode filter (by names): {len(fallback_parents)} parent stations")
+    return fallback_parents
 
 # ------------- Build station index -------------
 def load_station_index(
