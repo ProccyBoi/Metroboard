@@ -77,12 +77,37 @@ def session():
     s.mount("https://", HTTPAdapter(max_retries=retry))
     return s
 
+def _valid_ll(lat: float, lon: float) -> bool:
+    try:
+        lat = float(lat); lon = float(lon)
+    except Exception:
+        return False
+    return (-90.0 <= lat <= 90.0) and (-180.0 <= lon <= 180.0)
+
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    R = 6371000.0
-    dlat = math.radians(lat2 - lat1)
-    dlon = math.radians(lat2 - lon1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1))*math.cos(math.radians(lat2))*math.sin(dlon/2)**2
-    return 2 * R * math.asin(math.sqrt(a))
+    """
+    Great-circle distance in meters. Guards against bad inputs and unit mistakes.
+    """
+    # Coerce & validate
+    try:
+        lat1 = float(lat1); lon1 = float(lon1); lat2 = float(lat2); lon2 = float(lon2)
+    except Exception:
+        return float("inf")
+    if not (_valid_ll(lat1, lon1) and _valid_ll(lat2, lon2)):
+        return float("inf")
+
+    # Convert degrees -> radians
+    from math import radians, sin, cos, asin, sqrt
+    R = 6371000.0  # meters
+    dlat = radians(lat2 - lat1)
+    dlon = radians(lon2 - lon1)
+    a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+    # Numerical guard (can happen with garbage inputs)
+    if a < 0.0:
+        a = 0.0
+    elif a > 1.0:
+        a = 1.0
+    return 2 * R * asin(sqrt(a))
 
 def load_route_shortnames(path="routes.txt") -> dict[str,str]:
     out: dict[str,str] = {}
