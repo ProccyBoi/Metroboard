@@ -15,6 +15,7 @@ from google.transit import gtfs_realtime_pb2
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 import re
+import json
 
 # ---------------- Config ----------------
 API_TOKEN = os.environ["TFNSW_API_TOKEN"]
@@ -33,6 +34,9 @@ D_NEAR  = 500
 AGENCY_NAME_ALLOW = {"Sydney Trains", "Sydney Metro"}
 # (remove "NSW TrainLink" for now — it usually has no T*/M* code)
 
+ROUTE_SHORT_OVERRIDES_JSON = os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "")
+ROUTE_SHORT_OVERRIDES_PATH = os.getenv("ROUTE_SHORT_OVERRIDES_PATH", "route_overrides.csv")
+SHORT_RE = re.compile(r'\b([TM]\d{1,2})\b', re.IGNORECASE)
 
 # Route short-names allowlist (empty=set() means no filter)
 ROUTE_SHORT_ALLOW: set[str] = set()
@@ -71,21 +75,52 @@ EXCLUDE_NAME_SUBSTR = tuple(x.lower() for x in [
 SHORT_RE = re.compile(r'\b([TM]\d{1,2})\b', re.IGNORECASE)
 
 def derive_route_short(route_short_name: str, route_long_name: str) -> str:
-    """
-    Prefer route_short_name if present; otherwise try to pull something like
-    'T1' / 'T9' / 'M1' out of route_long_name. Returns '' if no match.
-    """
     rs = (route_short_name or "").strip()
     if rs:
         return rs.upper()
-
     rl = (route_long_name or "").strip()
     if rl:
         m = SHORT_RE.search(rl)
         if m:
             return m.group(1).upper()
+    return ""
 
-    return ""  # unknown / intercity etc.
+def load_route_overrides(path: str, env_json: str) -> dict[str, str]:
+    """
+    Load a user-provided mapping route_id -> route_short_name from:
+      - CSV file (route_id, route_short_name)
+      - ENV JSON string {"<route_id>":"T1", ...}
+    Later sources override earlier ones.
+    """
+    out: dict[str, str] = {}
+    # file (CSV)
+    try:
+        if path and os.path.exists(path):
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    rid = (row.get("route_id") or "").strip()
+                    rs  = (row.get("route_short_name") or "").strip().upper()
+                    if rid and rs:
+                        out[rid] = rs
+            print(f"[metroboard] route_overrides: loaded {len(out)} from {path}")
+    except Exception as e:
+        print(f"[metroboard] WARN: failed reading {path}: {e}")
+
+    # env JSON
+    if env_json:
+        try:
+            obj = json.loads(env_json)
+            if isinstance(obj, dict):
+                for rid, rs in obj.items():
+                    rid = (rid or "").strip()
+                    rs  = (rs or "").strip().upper()
+                    if rid and rs:
+                        out[rid] = rs
+                print(f"[metroboard] route_overrides: merged {len(obj)} from env JSON")
+        except Exception as e:
+            print(f"[metroboard] WARN: bad ROUTE_SHORT_OVERRIDES_JSON: {e}")
+
+    return out
 
 
 def is_numeric_parent_stop_id(s: str) -> bool:
@@ -136,16 +171,30 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 def load_route_shortnames(path="routes.txt") -> dict[str,str]:
     """
-    Build route_id -> route_short_name, deriving from route_long_name if short is blank.
+    Build route_id -> route_short_name.
+    Priority:
+      1) user overrides (CSV / env JSON)
+      2) GTFS route_short_name
+      3) token 'T*/M*' derived from route_long_name
     """
+    overrides = load_route_overrides(ROUTE_SHORT_OVERRIDES_PATH, ROUTE_SHORT_OVERRIDES_JSON)
+
     out: dict[str,str] = {}
     with open(path, newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             rid = (row.get("route_id") or "").strip()
-            rs  = derive_route_short(row.get("route_short_name"), row.get("route_long_name"))
-            if rid and rs:
+            if not rid:
+                continue
+            # start with override if present
+            rs = overrides.get(rid)
+            if not rs:
+                rs = derive_route_short(row.get("route_short_name"), row.get("route_long_name"))
+            if rs:
                 out[rid] = rs
+    print(f"[metroboard] route_short mapping: {len(out)} entries "
+          f"(incl. overrides={len(load_route_overrides(ROUTE_SHORT_OVERRIDES_PATH, ROUTE_SHORT_OVERRIDES_JSON))})")
     return out
+
 
 
 def within_bbox(lat: float, lon: float, bbox: tuple[float,float,float,float]) -> bool:
@@ -304,18 +353,14 @@ def require_allowed_pairs(
     agencies_allowed: T.Set[str] = AGENCY_NAME_ALLOW,
     route_short_allow: T.Set[str] = ROUTE_SHORT_ALLOW,
 ) -> set[tuple[str, str]]:
-    """
-    Returns a set of (parent_station_id, route_short_name) that are valid under
-    the configured filters. Only numeric parent station IDs are included.
-    """
     # agency_id -> name
     agency_name_by_id: dict[str,str] = {}
     with open(agency_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             agency_name_by_id[(r.get("agency_id") or "").strip()] = (r.get("agency_name") or "").strip()
 
-    # route_id -> (route_type, rshort_derived, agency_name)
-    route_meta: dict[str, tuple[int,str,str]] = {}
+    # route_id -> (route_type, agency_name, long_name)
+    route_type_agency_long: dict[str, tuple[int,str,str]] = {}
     with open(routes_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             rid = (r.get("route_id") or "").strip()
@@ -323,10 +368,11 @@ def require_allowed_pairs(
                 rtype = int((r.get("route_type") or "3").strip() or "3")
             except Exception:
                 rtype = 3
-            rshort = derive_route_short(r.get("route_short_name"), r.get("route_long_name"))
             agid = (r.get("agency_id") or "").strip()
             agname = agency_name_by_id.get(agid, "")
-            route_meta[rid] = (rtype, rshort, agname)
+            rlong = (r.get("route_long_name") or "").strip()
+            if rid:
+                route_type_agency_long[rid] = (rtype, agname, rlong)
 
     # trip_id -> route_id
     trip_route: dict[str,str] = {}
@@ -351,29 +397,33 @@ def require_allowed_pairs(
         if p: return p
         return sid if sid in parent_ids else None
 
+    # route_id -> short (with overrides applied already)
+    route_id_to_short = load_route_shortnames(routes_path)
+
     pairs: set[tuple[str,str]] = set()
-    seen_types, seen_agencies = set(), set()
+    missing_short_seen: dict[str, int] = {}
 
     with open(stop_times_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             trip_id = (r.get("trip_id") or "").strip()
             stop_id = (r.get("stop_id") or "").strip()
             rid = trip_route.get(trip_id, "")
-            rtype, rshort, agname = route_meta.get(rid, (None, "", ""))
+            rtype, agname, _rlong = route_type_agency_long.get(rid, (None, "", ""))
 
             if rtype is None:
                 continue
-            seen_types.add(rtype)
-            if agname: seen_agencies.add(agname)
 
-            # filters
+            # Filters
             if route_types_allowed and rtype not in route_types_allowed:
                 continue
             if agencies_allowed and agname not in agencies_allowed:
                 continue
 
-            # IMPORTANT: allow derived short names; skip if still unknown (e.g., TrainLink intercity)
+            rshort = route_id_to_short.get(rid, "")
             if not rshort:
+                # collect a limited sample for helpful logs
+                if len(missing_short_seen) < 10:
+                    missing_short_seen[rid] = missing_short_seen.get(rid, 0) + 1
                 continue
             if route_short_allow and rshort not in route_short_allow:
                 continue
@@ -382,18 +432,20 @@ def require_allowed_pairs(
             if p and is_numeric_parent_stop_id(p):
                 pairs.add((p, rshort))
 
-    # Friendly diagnostics
     if not pairs:
-        print("[metroboard] WARN: derived 0 station×route pairs. "
-              "Likely your static GTFS lacks T/M short codes in routes; "
-              "we tried deriving from route_long_name but found none for allowed agencies/types.")
-        # Do NOT raise — let caller decide whether to fallback or stop.
-        # But for our app we need some pairs. To be safe, keep raising here so you notice.
-        raise RuntimeError("[metroboard] No (station, route) pairs found after derivation — check GTFS routes.txt "
-                           "(route_long_name should contain tokens like 'T1', 'T9', 'M1').")
+        if missing_short_seen:
+            print("[metroboard] WARN: Zero station×route pairs; sample route_ids with no short code:")
+            for rid, _ in list(missing_short_seen.items())[:10]:
+                meta = route_type_agency_long.get(rid, (None,"",""))
+                print(f"  - rid={rid}  agency={meta[1]!r}  rtype={meta[0]}  (add to overrides)")
+        raise RuntimeError(
+            "[metroboard] No (station, route) pairs found. Your static GTFS lacks T*/M* short codes. "
+            "Provide an override mapping via route_overrides.csv or ROUTE_SHORT_OVERRIDES_JSON."
+        )
 
     print(f"[metroboard] Pair filter: {len(pairs)} station×route pairs")
     return pairs
+
 
 
 # ---------------- Build station index (per station × route) ----------------
@@ -570,6 +622,14 @@ if CORS_ALLOW_ORIGIN:
 
 ROUTE_ID_TO_SHORT: dict[str,str] = {}
 STATION_INDEX: dict[str, dict] = {}
+
+# Build a quick lookup parent_id -> set({ 'T1','M1', ... })
+def build_parent_to_shorts(pairs: set[tuple[str,str]]) -> dict[str, set[str]]:
+    out: dict[str,set[str]] = {}
+    for pid, rs in pairs:
+        out.setdefault(pid, set()).add(rs)
+    return out
+
 
 @app.on_event("startup")
 def _startup():
