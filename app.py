@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.transit import gtfs_realtime_pb2
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import re
 
 # ---------------- Config ----------------
 API_TOKEN = os.environ["TFNSW_API_TOKEN"]
@@ -29,7 +30,9 @@ D_SOLID = 120
 D_NEAR  = 500
 
 # Agencies to include (empty=set() means no filter)
-AGENCY_NAME_ALLOW = {"Sydney Trains", "NSW TrainLink", "Sydney Metro"}
+AGENCY_NAME_ALLOW = {"Sydney Trains", "Sydney Metro"}
+# (remove "NSW TrainLink" for now — it usually has no T*/M* code)
+
 
 # Route short-names allowlist (empty=set() means no filter)
 ROUTE_SHORT_ALLOW: set[str] = set()
@@ -65,6 +68,26 @@ EXCLUDE_NAME_SUBSTR = tuple(x.lower() for x in [
 ])
 
 # ---------------- Helpers ----------------
+SHORT_RE = re.compile(r'\b([TM]\d{1,2})\b', re.IGNORECASE)
+
+def derive_route_short(route_short_name: str, route_long_name: str) -> str:
+    """
+    Prefer route_short_name if present; otherwise try to pull something like
+    'T1' / 'T9' / 'M1' out of route_long_name. Returns '' if no match.
+    """
+    rs = (route_short_name or "").strip()
+    if rs:
+        return rs.upper()
+
+    rl = (route_long_name or "").strip()
+    if rl:
+        m = SHORT_RE.search(rl)
+        if m:
+            return m.group(1).upper()
+
+    return ""  # unknown / intercity etc.
+
+
 def is_numeric_parent_stop_id(s: str) -> bool:
     return s.isdigit()
 
@@ -112,14 +135,18 @@ def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * R * asin(sqrt(a))
 
 def load_route_shortnames(path="routes.txt") -> dict[str,str]:
+    """
+    Build route_id -> route_short_name, deriving from route_long_name if short is blank.
+    """
     out: dict[str,str] = {}
     with open(path, newline="", encoding="utf-8-sig") as f:
         for row in csv.DictReader(f):
             rid = (row.get("route_id") or "").strip()
-            rs  = (row.get("route_short_name") or "").strip()
-            if rid:
+            rs  = derive_route_short(row.get("route_short_name"), row.get("route_long_name"))
+            if rid and rs:
                 out[rid] = rs
     return out
+
 
 def within_bbox(lat: float, lon: float, bbox: tuple[float,float,float,float]) -> bool:
     S, W, N, E = bbox
@@ -287,7 +314,7 @@ def require_allowed_pairs(
         for r in csv.DictReader(f):
             agency_name_by_id[(r.get("agency_id") or "").strip()] = (r.get("agency_name") or "").strip()
 
-    # route_id -> (route_type, short, agency_name)
+    # route_id -> (route_type, rshort_derived, agency_name)
     route_meta: dict[str, tuple[int,str,str]] = {}
     with open(routes_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
@@ -296,7 +323,7 @@ def require_allowed_pairs(
                 rtype = int((r.get("route_type") or "3").strip() or "3")
             except Exception:
                 rtype = 3
-            rshort = (r.get("route_short_name") or "").strip()
+            rshort = derive_route_short(r.get("route_short_name"), r.get("route_long_name"))
             agid = (r.get("agency_id") or "").strip()
             agname = agency_name_by_id.get(agid, "")
             route_meta[rid] = (rtype, rshort, agname)
@@ -325,6 +352,8 @@ def require_allowed_pairs(
         return sid if sid in parent_ids else None
 
     pairs: set[tuple[str,str]] = set()
+    seen_types, seen_agencies = set(), set()
+
     with open(stop_times_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             trip_id = (r.get("trip_id") or "").strip()
@@ -332,13 +361,19 @@ def require_allowed_pairs(
             rid = trip_route.get(trip_id, "")
             rtype, rshort, agname = route_meta.get(rid, (None, "", ""))
 
-            if not rshort:    # we need a short name like "T9" or "M1"
-                continue
             if rtype is None:
                 continue
+            seen_types.add(rtype)
+            if agname: seen_agencies.add(agname)
+
+            # filters
             if route_types_allowed and rtype not in route_types_allowed:
                 continue
             if agencies_allowed and agname not in agencies_allowed:
+                continue
+
+            # IMPORTANT: allow derived short names; skip if still unknown (e.g., TrainLink intercity)
+            if not rshort:
                 continue
             if route_short_allow and rshort not in route_short_allow:
                 continue
@@ -347,10 +382,19 @@ def require_allowed_pairs(
             if p and is_numeric_parent_stop_id(p):
                 pairs.add((p, rshort))
 
+    # Friendly diagnostics
     if not pairs:
-        raise RuntimeError("[metroboard] No (station, route) pairs found under filters — check static GTFS and filters.")
+        print("[metroboard] WARN: derived 0 station×route pairs. "
+              "Likely your static GTFS lacks T/M short codes in routes; "
+              "we tried deriving from route_long_name but found none for allowed agencies/types.")
+        # Do NOT raise — let caller decide whether to fallback or stop.
+        # But for our app we need some pairs. To be safe, keep raising here so you notice.
+        raise RuntimeError("[metroboard] No (station, route) pairs found after derivation — check GTFS routes.txt "
+                           "(route_long_name should contain tokens like 'T1', 'T9', 'M1').")
+
     print(f"[metroboard] Pair filter: {len(pairs)} station×route pairs")
     return pairs
+
 
 # ---------------- Build station index (per station × route) ----------------
 def route_display_suffix(route_short: str) -> str:
