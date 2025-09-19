@@ -608,3 +608,268 @@ def fetch_vehicle_positions_cached():
     for url in URLS_VP:
         try:
             r = s.get(url, headers=headers, timeout=20)
+            r.raise_for_status()
+            feed = gtfs_realtime_pb2.FeedMessage()
+            feed.ParseFromString(r.content)
+            merged.entity.extend(feed.entity)
+            vlog(f"fetched {url}: entities={len(feed.entity)}")
+        except Exception as e:
+            vlog(f"WARN: failed fetching {url}: {e}")
+
+    _FEED_CACHE = merged
+    _FEED_TS = now
+    return merged, 0.0
+
+# Enhanced train collection with better debugging
+def collect_allowed_trains(
+    feed: gtfs_realtime_pb2.FeedMessage,
+    route_id_to_short: dict[str,str]
+) -> list[tuple[T.Optional[float],T.Optional[float],str,str,int]]:
+    VP_INCOMING_AT   = gtfs_realtime_pb2.VehiclePosition.INCOMING_AT
+    VP_STOPPED_AT    = gtfs_realtime_pb2.VehiclePosition.STOPPED_AT
+    VP_IN_TRANSIT_TO = gtfs_realtime_pb2.VehiclePosition.IN_TRANSIT_TO
+
+    trains: list[tuple[T.Optional[float],T.Optional[float],str,str,int]] = []
+    route_counts: dict[str, int] = {}
+    
+    for e in feed.entity:
+        if not e.HasField("vehicle"):
+            continue
+        v = e.vehicle
+        rid = v.trip.route_id if v.HasField("trip") else ""
+        rshort = (route_id_to_short.get(rid, "") or "").upper()
+        
+        # Count all trains by route for debugging
+        if rshort:
+            route_counts[rshort] = route_counts.get(rshort, 0) + 1
+        
+        if not rshort:
+            continue
+        if ROUTE_SHORT_ALLOW and rshort not in ROUTE_SHORT_ALLOW:
+            continue
+
+        sid = getattr(v, "stop_id", "")
+        status = getattr(v, "current_status", VP_IN_TRANSIT_TO)
+        lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
+        lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
+
+        trains.append((lat, lon, rshort, sid, int(status)))
+    
+    if MB_VERBOSE:
+        vlog(f"collect_allowed_trains: {len(trains)} trains total")
+        for route, count in sorted(route_counts.items()):
+            vlog(f"  Route {route}: {count} trains")
+    
+    return trains
+
+# ---------------- FastAPI app ----------------
+app = FastAPI()
+if CORS_ALLOW_ORIGIN:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[o.strip() for o in CORS_ALLOW_ORIGIN.split(",")],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+ROUTE_ID_TO_SHORT: dict[str,str] = {}
+STATION_INDEX: dict[str, dict] = {}
+CHILD_TO_PARENT: dict[str, str] = {}
+
+@app.on_event("startup")
+def _startup():
+    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT
+
+    ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
+
+    allowed_parents = require_allowed_parents(
+        stops_path="stops.txt",
+        routes_path="routes.txt",
+        trips_path="trips.txt",
+        stop_times_path="stop_times.txt",
+        agency_path="agency.txt",
+        route_types_allowed=(1, 2),  # Metro + Rail only
+        agencies_allowed=AGENCY_NAME_ALLOW,
+        route_short_allow=ROUTE_SHORT_ALLOW,
+    )
+
+    allowed_pairs = require_allowed_pairs(
+        stops_path="stops.txt",
+        routes_path="routes.txt",
+        trips_path="trips.txt",
+        stop_times_path="stop_times.txt",
+        agency_path="agency.txt",
+        route_types_allowed=(1, 2),
+        agencies_allowed=AGENCY_NAME_ALLOW,
+        route_short_allow=ROUTE_SHORT_ALLOW,
+        allowed_parents_for_fallback=allowed_parents,
+    )
+
+    wl_path = os.getenv("STATION_WHITELIST_PATH", "stations_whitelist.txt")
+    sid_w, name_w = load_whitelist(wl_path)
+
+    STATION_INDEX = load_station_index(
+        "stops.txt",
+        bbox=SYD_BBOX,
+        sid_whitelist=sid_w,
+        name_whitelist=name_w,
+        allowed_parents=allowed_parents,
+        allowed_pairs=allowed_pairs,
+    )
+
+    CHILD_TO_PARENT = build_child_to_parent("stops.txt")
+
+    if not STATION_INDEX:
+        raise RuntimeError("No stations loaded after filtering — check whitelist and GTFS files.")
+
+    vlog(f"Loaded {len(STATION_INDEX)} station×line entries (rail+metro only)")
+
+@app.get("/")
+def root():
+    return {"ok": True, "endpoints": ["/states", "/stations", "/healthz", "/debug", "/trains"]}
+
+@app.get("/healthz")
+def healthz():
+    age = None if _FEED_TS == 0 else (time.time() - _FEED_TS)
+    return {"status": "ok", "stations": len(STATION_INDEX), "trains_last_fetch_s": age}
+
+@app.get("/debug")
+def debug():
+    # Get current feed stats
+    feed, _ = fetch_vehicle_positions_cached()
+    trains = collect_allowed_trains(feed, ROUTE_ID_TO_SHORT)
+    route_counts = {}
+    for _, _, rshort, _, _ in trains:
+        route_counts[rshort] = route_counts.get(rshort, 0) + 1
+    
+    return {
+        "stations_count": len(STATION_INDEX),
+        "bbox": list(SYD_BBOX) if SYD_BBOX else None,
+        "allowed_routes": sorted(ROUTE_SHORT_ALLOW) if ROUTE_SHORT_ALLOW else "all",
+        "allowed_agencies": sorted(AGENCY_NAME_ALLOW) if AGENCY_NAME_ALLOW else "all",
+        "cache_sec": FEED_CACHE_SEC,
+        "feeds": URLS_VP,
+        "verbose_logs": MB_VERBOSE,
+        "force_distance_mode": MB_FORCE_DISTANCE,
+        "distance_thresholds": {"solid": D_SOLID, "near": D_NEAR, "far": D_FAR},
+        "sample_stations": list(STATION_INDEX.keys())[:10],
+        "current_trains": {
+            "total": len(trains),
+            "by_route": route_counts
+        }
+    }
+
+@app.get("/trains")  
+def trains():
+    """Debug endpoint to see raw train data"""
+    feed, age = fetch_vehicle_positions_cached()
+    trains = collect_allowed_trains(feed, ROUTE_ID_TO_SHORT)
+    
+    train_data = []
+    for lat, lon, rshort, sid, status in trains[:50]:  # Limit to first 50
+        status_name = ["IN_TRANSIT_TO", "INCOMING_AT", "?", "STOPPED_AT"][min(status, 3)]
+        train_data.append({
+            "route": rshort,
+            "lat": lat,
+            "lon": lon, 
+            "stop_id": sid,
+            "status": status_name,
+            "parent_station": CHILD_TO_PARENT.get(sid, sid) if sid else None
+        })
+    
+    return {
+        "feed_age_seconds": age,
+        "total_trains": len(trains),
+        "sample_trains": train_data
+    }
+
+@app.get("/stations")
+def stations():
+    # Sorted by name for stable UI
+    return JSONResponse([STATION_INDEX[k] for k in sorted(STATION_INDEX.keys())])
+
+@app.get("/states")
+def states(only: T.Optional[str] = Query(None, description="Comma-separated station names to restrict the output")):
+    subset = STATION_INDEX
+    if only:
+        wanted = [n.strip() for n in only.split(",") if n.strip()]
+        subset = {n: STATION_INDEX[n] for n in wanted if n in STATION_INDEX}
+        if not subset:
+            return JSONResponse({})
+
+    feed, _ = fetch_vehicle_positions_cached()
+    trains = collect_allowed_trains(feed, ROUTE_ID_TO_SHORT)
+
+    # Debug train data
+    if MB_VERBOSE:
+        vlog(f"Processing {len(trains)} trains for {len(subset)} stations")
+
+    # No trains -> all zeros
+    out: dict[str, int] = {}
+    if not trains:
+        for name in subset.keys():
+            out[name] = 0
+        vlog("No trains in feed - all stations = 0")
+        return JSONResponse(out)
+
+    # Group trains by route for efficiency
+    trains_by_route: dict[str, list[tuple[T.Optional[float],T.Optional[float],str,str,int]]] = {}
+    for rec in trains:
+        _, _, rshort, _, _ = rec
+        trains_by_route.setdefault(rshort, []).append(rec)
+
+    # VP current_status enum aliases
+    VP_INCOMING_AT   = gtfs_realtime_pb2.VehiclePosition.INCOMING_AT
+    VP_STOPPED_AT    = gtfs_realtime_pb2.VehiclePosition.STOPPED_AT
+
+    # Process each station
+    matches_found = 0
+    distance_fallbacks = 0
+    
+    for name, meta in subset.items():
+        station_pid = meta["stop_id"]               # numeric parent id
+        slat, slon = meta["lat"], meta["lon"]
+        rshort = (meta.get("route_short") or "").upper()
+
+        best_state_vp = 0  # 0 none, 1 near, 2 medium, 3 solid
+        best_dist = None   # float meters for fallback
+
+        relevant_trains = trains_by_route.get(rshort, [])
+        
+        for (tlat, tlon, trs, child_sid, status) in relevant_trains:
+            # --- Method 1: GTFS-RT stop_id matching (preferred) ---
+            if not MB_FORCE_DISTANCE and child_sid:
+                parent = CHILD_TO_PARENT.get(child_sid)
+                if parent is None and is_numeric_parent_stop_id(child_sid):
+                    parent = child_sid
+                    
+                if parent == station_pid:
+                    if status == VP_STOPPED_AT:
+                        best_state_vp = 3
+                        matches_found += 1
+                        break  # Perfect match, can't do better
+                    elif status == VP_INCOMING_AT:
+                        best_state_vp = max(best_state_vp, 2)  # Changed to 2 (medium)
+                        matches_found += 1
+
+            # --- Method 2: Distance fallback ---
+            if best_state_vp < 3 and tlat is not None and tlon is not None:
+                d = haversine_m(slat, slon, tlat, tlon)
+                if best_dist is None or d < best_dist:
+                    best_dist = d
+
+        # Apply distance-based status if no VP match found
+        if best_state_vp == 0 and best_dist is not None:
+            best_state_vp = status_from_distance(best_dist)
+            if best_state_vp > 0:
+                distance_fallbacks += 1
+
+        out[name] = best_state_vp
+
+    if MB_VERBOSE:
+        active_stations = sum(1 for v in out.values() if v > 0)
+        vlog(f"Results: {active_stations}/{len(subset)} stations active, "
+             f"{matches_found} VP matches, {distance_fallbacks} distance fallbacks")
+
+    return JSONResponse(out)
