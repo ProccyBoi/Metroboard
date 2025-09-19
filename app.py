@@ -660,7 +660,7 @@ CHILD_TO_PARENT: dict[str, str] = {}
 
 @app.on_event("startup")
 def _startup():
-    global ROUTE_ID_TO_SHORT, STATION_INDEX
+    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT
 
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
 
@@ -699,6 +699,8 @@ def _startup():
         allowed_pairs=allowed_pairs,
     )
 
+    CHILD_TO_PARENT = build_child_to_parent("stops.txt")
+
     if not STATION_INDEX:
         raise RuntimeError("[metroboard] No stations loaded after filtering — check whitelist and GTFS files.")
 
@@ -723,6 +725,7 @@ def debug():
         "cache_sec": FEED_CACHE_SEC,
         "feeds": URLS_VP,
         "verbose_logs": MB_VERBOSE,
+        "sample_stations": list(STATION_INDEX.keys())[:20],
     }
 
 @app.get("/stations")
