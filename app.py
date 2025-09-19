@@ -338,22 +338,24 @@ def require_allowed_pairs(
     trips_path="trips.txt",
     stop_times_path="stop_times.txt",
     agency_path="agency.txt",
-    route_types_allowed=(1,2),
+    route_types_allowed=(1, 2),
     agencies_allowed: T.Set[str] = AGENCY_NAME_ALLOW,
     route_short_allow: T.Set[str] = ROUTE_SHORT_ALLOW,
     allowed_parents_for_fallback: T.Optional[set[str]] = None,
 ) -> set[tuple[str, str]]:
-    """Return set of (parent_station_id, route_short). 
-    Strict path: join stop_times→trips→routes, require T*/M*. 
-    Fallback: if zero, pair *every* allowed parent with *every* known T*/M* code.
+    """Return set of (parent_station_id, route_short).
+    Strict path: join stop_times→trips→routes, require T*/M*.
+    Fallback: if zero, pair every allowed parent with every known T*/M* code.
     """
-    # ---------- build lookups ----------
-    agency_name_by_id: dict[str,str] = {}
+
+    # agency_id -> name
+    agency_name_by_id: dict[str, str] = {}
     with open(agency_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             agency_name_by_id[(r.get("agency_id") or "").strip()] = (r.get("agency_name") or "").strip()
 
-    route_type_agency_long: dict[str, tuple[int,str,str]] = {}
+    # route_id -> (route_type, agency_name, long_name)
+    route_type_agency_long: dict[str, tuple[int, str, str]] = {}
     with open(routes_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             rid = (r.get("route_id") or "").strip()
@@ -367,12 +369,14 @@ def require_allowed_pairs(
             if rid:
                 route_type_agency_long[rid] = (rtype, agname, rlong)
 
-    trip_route: dict[str,str] = {}
+    # trip_id -> route_id
+    trip_route: dict[str, str] = {}
     with open(trips_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             trip_route[(r.get("trip_id") or "").strip()] = (r.get("route_id") or "").strip()
 
-    stops_map: dict[str,dict] = {}
+    # stops + parents
+    stops_map: dict[str, dict] = {}
     parent_ids: set[str] = set()
     with open(stops_path, newline="", encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
@@ -383,15 +387,17 @@ def require_allowed_pairs(
 
     def parent_of(sid: str) -> T.Optional[str]:
         row = stops_map.get(sid)
-        if not row: return None
+        if not row:
+            return None
         p = (row.get("parent_station") or "").strip()
-        if p: return p
+        if p:
+            return p
         return sid if sid in parent_ids else None
 
     route_id_to_short = load_route_shortnames(routes_path)
 
     # ---------- STRICT PATH ----------
-    pairs: set[tuple[str,str]] = set()
+    pairs: set[tuple[str, str]] = set()
     missing_short_seen: dict[str, int] = {}
 
     with open(stop_times_path, newline="", encoding="utf-8-sig") as f:
@@ -432,26 +438,26 @@ def require_allowed_pairs(
             known_tm &= {x.upper() for x in route_short_allow}
         if not known_tm:
             print("[metroboard] WARN: permissive fallback has no T*/M* codes to use — keeping empty pairs.")
-            # do not raise; let caller decide
             return set()
 
         if not allowed_parents_for_fallback:
-            # if not provided, derive numeric parents from stops.txt
             allowed_parents_for_fallback = {
                 sid for sid, row in stops_map.items()
                 if (row.get("location_type") or "0").strip() == "1" and is_numeric_parent_stop_id(sid)
             }
 
         fanout_pairs = {(pid, rs) for pid in allowed_parents_for_fallback for rs in known_tm}
-        print(f"[metroboard] WARN: strict pair build found 0; using permissive fallback with "
-              f"{len(known_tm)} routes × {len(allowed_parents_for_fallback)} parents = {len(fanout_pairs)} pairs")
+        print(
+            f"[metroboard] WARN: strict pair build found 0; using permissive fallback with "
+            f"{len(known_tm)} routes × {len(allowed_parents_for_fallback)} parents = {len(fanout_pairs)} pairs"
+        )
         return fanout_pairs
 
-    # ---------- HARD FAIL (explicitly disabled fallback) ----------
+    # ---------- HARD FAIL ----------
     if missing_short_seen:
         print("[metroboard] WARN: Zero station×route pairs; sample route_ids with no short code:")
         for rid, _ in list(missing_short_seen.items())[:10]:
-            meta = route_type_agency_long.get(rid, (None,"",""))
+            meta = route_type_agency_long.get(rid, (None, "", ""))
             print(f"  - rid={rid}  agency={meta[1]!r}  rtype={meta[0]}  (add to overrides)")
     raise RuntimeError(
         "[metroboard] No (station, route) pairs found. Your static GTFS lacks T*/M* short codes. "
@@ -654,7 +660,7 @@ CHILD_TO_PARENT: dict[str, str] = {}
 
 @app.on_event("startup")
 def _startup():
-    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT
+    global ROUTE_ID_TO_SHORT, STATION_INDEX
 
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
 
@@ -664,23 +670,22 @@ def _startup():
         trips_path="trips.txt",
         stop_times_path="stop_times.txt",
         agency_path="agency.txt",
-        route_types_allowed=(1,2),
+        route_types_allowed=(1, 2),  # Metro + Rail only
         agencies_allowed=AGENCY_NAME_ALLOW,
-        route_short_allow=ROUTE_SHORT_ALLOW
+        route_short_allow=ROUTE_SHORT_ALLOW,
     )
 
-        allowed_pairs = require_allowed_pairs(
+    allowed_pairs = require_allowed_pairs(
         stops_path="stops.txt",
         routes_path="routes.txt",
         trips_path="trips.txt",
         stop_times_path="stop_times.txt",
         agency_path="agency.txt",
-        route_types_allowed=(1,2),
+        route_types_allowed=(1, 2),
         agencies_allowed=AGENCY_NAME_ALLOW,
         route_short_allow=ROUTE_SHORT_ALLOW,
-        allowed_parents_for_fallback=allowed_parents,   # <— add this
+        allowed_parents_for_fallback=allowed_parents,  # ← important for fallback fanout
     )
-
 
     wl_path = os.getenv("STATION_WHITELIST_PATH", "stations_whitelist.txt")
     sid_w, name_w = load_whitelist(wl_path)
@@ -693,10 +698,10 @@ def _startup():
         allowed_parents=allowed_parents,
         allowed_pairs=allowed_pairs,
     )
+
     if not STATION_INDEX:
         raise RuntimeError("[metroboard] No stations loaded after filtering — check whitelist and GTFS files.")
 
-    CHILD_TO_PARENT = build_child_to_parent("stops.txt")
     print(f"[metroboard] Loaded {len(STATION_INDEX)} station×line entries (rail+metro only)")
 
 @app.get("/")
