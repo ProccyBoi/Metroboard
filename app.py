@@ -31,7 +31,7 @@ D_SOLID = 120
 D_NEAR  = 500
 
 # Agencies to include (empty=set() means no filter)
-AGENCY_NAME_ALLOW = {"Sydney Trains", "Sydney Metro"}
+AGENCY_NAME_ALLOW: set[str] = set()  # <- change to empty set
 # (remove "NSW TrainLink" for now — it usually has no T*/M* code)
 
 ROUTE_SHORT_OVERRIDES_JSON = os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "")
