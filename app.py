@@ -1,232 +1,284 @@
-#!/usr/bin/env python3
+# app.py
 import os
 import json
 import time
-from typing import Dict, Optional, Tuple, List
+import re
+import logging
+from typing import Dict, List, Optional, Tuple
+
 import requests
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from google.transit import gtfs_realtime_pb2  # from gtfs-realtime-bindings
 from dotenv import load_dotenv
 
-# ---------- Load env ----------
+# Load .env in local/dev (Koyeb injects env vars automatically)
 load_dotenv()
 
+# ---------- Config via ENV ----------
 TFNSW_API_TOKEN = os.getenv("TFNSW_API_TOKEN", "").strip()
 if not TFNSW_API_TOKEN:
-    raise SystemExit("Missing TFNSW_API_TOKEN")
+    raise RuntimeError("TFNSW_API_TOKEN is required")
 
-# Distance thresholds etc. (present but not used here; keep for parity with your setup)
-FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
-
-# Station/route config
-MB_PERMISSIVE_PAIRS = os.getenv("MB_PERMISSIVE_PAIRS", "1") == "1"
-ROUTE_SHORT_ALLOW = set(s.strip() for s in os.getenv("ROUTE_SHORT_ALLOW", "T1,T2,T3,T4,T5,T6,T7,T8,T9,M1").split(",") if s.strip())
-
-# Overrides – exactly the JSON you pasted in env
-# {"S_T1_MAIN":"T1","S_T1_NORTH":"T1", ... "S_M1":"M1"}
-try:
-    ROUTE_SHORT_OVERRIDES: Dict[str, str] = json.loads(os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "{}"))
-except Exception as e:
-    raise SystemExit(f"Bad ROUTE_SHORT_OVERRIDES_JSON: {e}")
-
-# Feeds
-VEHICLE_FEEDS = [
-    os.getenv("FEED_SYDNEYTRAINS_VEH", "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains"),
-    os.getenv("FEED_METRO_VEH",        "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/metro"),
+# Feeds: default to Sydney Trains + Metro; override with FEEDS (comma-separated) if you like
+FEEDS: List[str] = [
+    "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains",
+    "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/metro",
 ]
-TRIP_UPDATES_FEED = os.getenv("FEED_SYDNEYTRAINS_TRIPS", "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains")
+FEEDS_ENV = os.getenv("FEEDS", "").strip()
+if FEEDS_ENV:
+    FEEDS = [u.strip() for u in FEEDS_ENV.split(",") if u.strip()]
 
-HEADERS = {"Authorization": f"Bearer {TFNSW_API_TOKEN}"}
+FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", os.getenv("FEED_TTL_SEC", "3")))
 
-# ---------- Trip-id → route-id snapshot ----------
-_trip_to_route: Dict[str, str] = {}
+# Distance knobs (wired for future geo logic; not required for this per-route splitting)
+MB_D_SOLID = int(os.getenv("MB_D_SOLID", "300"))
+MB_D_NEAR = int(os.getenv("MB_D_NEAR", "1000"))
+MB_D_FAR = int(os.getenv("MB_D_FAR", "2000"))
+MB_FORCE_DISTANCE = os.getenv("MB_FORCE_DISTANCE", "0") in ("1", "true", "True")
+MB_PERMISSIVE_PAIRS = os.getenv("MB_PERMISSIVE_PAIRS", "1") in ("1", "true", "True")
+MB_VERBOSE = os.getenv("MB_VERBOSE", "0") in ("1", "true", "True")
 
-def refresh_trip_updates() -> None:
+# Route allow-list (short names)
+ROUTE_SHORT_ALLOW = set(
+    [s.strip() for s in os.getenv("ROUTE_SHORT_ALLOW", "T1,T2,T3,T4,T5,T6,T7,T8,T9,M1").split(",") if s.strip()]
+)
+
+# Route overrides (route_id -> short name)
+_default_overrides = {
+    "S_T1_MAIN": "T1",
+    "S_T1_NORTH": "T1",
+    "S_T2": "T2",
+    "S_T3": "T3",
+    "S_T4": "T4",
+    "S_T5": "T5",
+    "S_T6": "T6",
+    "S_T7": "T7",
+    "S_T8": "T8",
+    "S_T9": "T9",
+    "S_M1": "M1",
+}
+try:
+    ROUTE_SHORT_OVERRIDES = json.loads(os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "{}")) or {}
+except json.JSONDecodeError:
+    ROUTE_SHORT_OVERRIDES = {}
+# Ensure defaults are present but allow env to override them
+ROUTE_SHORT_OVERRIDES = {**_default_overrides, **ROUTE_SHORT_OVERRIDES}
+
+# ---------- Logging ----------
+logging.basicConfig(level=logging.DEBUG if MB_VERBOSE else logging.INFO)
+log = logging.getLogger("sydtrains")
+
+# ---------- App ----------
+app = FastAPI(title="Sydney Trains / Metro States API", version="1.0.0")
+
+# Simple in-memory cache for feed snapshots
+_cache_until: float = 0.0
+_cached_entities: List[dict] = []  # normalized train dicts
+
+
+# ---------- Helpers ----------
+ROUTE_SUFFIX = {
+    # short name -> suffix used in your states dict keys
+    # e.g., "Waterloo" + "M" => "WaterlooM", "Town Hall" + "2" => "Town Hall2"
+    "M1": "M",
+    "T1": "1",
+    "T2": "2",
+    "T3": "3",
+    "T4": "4",
+    "T5": "5",
+    "T6": "6",
+    "T7": "7",
+    "T8": "8",
+    "T9": "9",
+}
+
+station_part_re = re.compile(
+    r"""
+    ^(?P<prefix>[^.]*)\.
+    (?P<core>[A-Za-z /&\-\u2013'\.]+?)(?:\s+\d+)?      # "Town Hall", "Martin Place", "Bondi Junction", allow hyphens & slashes
+    (?:\s+Loc.*)?$                                     # trailing "Loc" etc.
+    """,
+    re.VERBOSE,
+)
+
+def extract_station_core(stop_or_parent: str) -> Optional[str]:
     """
-    Refresh _trip_to_route from TFNSW Trip Updates (Sydney Trains).
-    This is the key piece that lets vehicles with route_id=None inherit a route.
+    Extract a human station name from strings like:
+      "Sydenham.Martin Place 1 Loc" -> "Martin Place"
+      "Sydney.Town Hall 5 Loc"      -> "Town Hall"
+      "Sydenham.Bondi Junction 2 Loc" -> "Bondi Junction"
+    If no dot present, try to lightly sanitize.
     """
-    global _trip_to_route
-    feed = gtfs_realtime_pb2.FeedMessage()
-    r = requests.get(TRIP_UPDATES_FEED, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    feed.ParseFromString(r.content)
-
-    snap: Dict[str, str] = {}
-    for ent in feed.entity:
-        if not ent.HasField("trip_update"):
-            continue
-        tu = ent.trip_update
-        trip_id = tu.trip.trip_id if tu.trip and tu.trip.trip_id else None
-        route_id = tu.trip.route_id if tu.trip and tu.trip.route_id else None
-        if trip_id and route_id:
-            snap[trip_id] = route_id
-
-    _trip_to_route = snap  # swap snapshot atomically
-
-def route_id_from_trip(trip_id: Optional[str]) -> Optional[str]:
-    if not trip_id:
+    if not stop_or_parent:
         return None
-    return _trip_to_route.get(trip_id)
+    if "." in stop_or_parent:
+        m = station_part_re.match(stop_or_parent.strip())
+        if m:
+            core = m.group("core").strip()
+            # Clean accidental trailing dots
+            core = core.rstrip(".").strip()
+            return core
+    # Fallback: remove trailing tokens like " 3 Loc"
+    s = re.sub(r"\s+\d+\s+Loc.*$", "", stop_or_parent.strip())
+    return s if s else None
 
-# ---------- Vehicle fetch ----------
-def fetch_vehicle_positions(url: str) -> List[gtfs_realtime_pb2.VehiclePosition]:
-    feed = gtfs_realtime_pb2.FeedMessage()
-    r = requests.get(url, headers=HEADERS, timeout=20)
-    r.raise_for_status()
-    feed.ParseFromString(r.content)
-    out = []
-    for ent in feed.entity:
-        if ent.HasField("vehicle"):
-            out.append(ent.vehicle)
-    return out
 
-# ---------- Mapping to route_short ----------
-def default_short_from_route_id(route_id: str) -> str:
-    # If the upstream uses "S_T8" etc, strip leading "S_".
-    return route_id[2:] if route_id.startswith("S_") else route_id
-
-def station_name_from_vehicle(v: gtfs_realtime_pb2.VehiclePosition) -> Optional[str]:
+def route_to_short(route_id: Optional[str], feed_hint: Optional[str]) -> Optional[str]:
     """
-    Your app already maps track/segments to station keys.
-    Here we try best-effort from stop_id or stop_name if present.
-    Replace this with your own station resolution to match your keys,
-    e.g. "Waterloo", "Central", etc.
+    Convert a GTFS-RT route_id to short name (T1..T9, M1).
+    Uses overrides first, then heuristics (based on feed URL).
     """
-    # Try stop_id first
-    sid = v.stop_id.strip() if v.stop_id else None
-    if sid:
-        # Many TFNSW stop_ids are like "211011" – you probably already map these
-        return sid
-    # If your feed includes position + custom parent_station elsewhere, plug it here.
-    return None
-
-def guess_tline_from_station(station: str) -> Optional[str]:
-    """
-    Conservative fallback only if MB_PERMISSIVE_PAIRS is on and trip join failed.
-    Extend/replace with your CSV-based allowed pairs if you have it available here.
-    """
-    if not MB_PERMISSIVE_PAIRS:
+    if not route_id:
+        # Heuristic: if this came from the "metro" feed, consider it M1
+        if feed_hint and "metro" in feed_hint.lower():
+            return "M1"
         return None
 
-    s = station.lower()
+    if route_id in ROUTE_SHORT_OVERRIDES:
+        return ROUTE_SHORT_OVERRIDES[route_id]
 
-    # Handful of useful heuristics; add more as needed.
-    if any(s.startswith(x) for x in ["cronulla","caringbah","woolooware","gymea","miranda","kirrawee","como","jannali","sutherland"]):
-        return "T4"
-    if any(x in s for x in ["hornsby","wahroonga","warrawee","turramurra","gordon","lindfield","chatswood","wynyard","town hall","redfern","milsons point","north sydney"]):
-        return "T1"
-    if any(x in s for x in ["epping","eastwood","west ryde","rhodes","strathfield","central"]):
-        return "T9"
-    return None
-
-def route_short_for_vehicle(v: gtfs_realtime_pb2.VehiclePosition) -> Optional[str]:
-    """
-    Decide route_short for a vehicle using:
-      1) vehicle.route_id if present
-      2) join from trip_id via Trip Updates
-      3) (fallback) guess by station if allowed
-    """
-    # 1) From vehicle
-    rid = v.trip.route_id if (v.trip and v.trip.route_id) else None
-    # 2) Join from trip
-    if not rid:
-        rid = route_id_from_trip(v.trip.trip_id if v.trip else None)
-
-    # 3) Map to short
-    if rid:
-        short = ROUTE_SHORT_OVERRIDES.get(rid) or default_short_from_route_id(rid)
-        # Keep only allowed set if provided
-        if short in ROUTE_SHORT_ALLOW:
-            return short
-        # if not allowed, drop it
-        return None
-
-    # 4) Fallback by station (Sydney Trains only)
-    st = station_name_from_vehicle(v)
-    if st:
-        guess = guess_tline_from_station(st)
-        if guess and guess in ROUTE_SHORT_ALLOW:
-            return guess
+    # Fallback heuristics: common patterns
+    rid = route_id.upper()
+    if rid.startswith("S_T") and len(rid) >= 4 and rid[3].isdigit():
+        return f"T{rid[3]}"
+    if "METRO" in rid or "S_M1" in rid:
+        return "M1"
 
     return None
 
-# ---------- Counting ----------
-def station_bucket_key(station_base: str, route_short: str) -> Optional[str]:
-    """
-    Produce keys like "Waterloo8" for T8 and "WaterlooM" for M1, so M stays independent.
-    If your station keys are already of that form, you can plug your mapper here.
-    """
-    if route_short == "M1":
-        return f"{station_base}M"
-    if route_short.startswith("T") and len(route_short) == 2 and route_short[1].isdigit():
-        return f"{station_base}{route_short[1]}"
-    return None
 
-def _station_base_from_resolved(station_resolved: str) -> str:
+def fetch_all_entities() -> List[dict]:
     """
-    You likely already have exact display names ("Waterloo", "Central", etc.).
-    If you’re resolving from numeric stop_ids, replace this with your own mapping,
-    e.g. stop_id_to_name[stop_id].
+    Fetch and parse entities from all feeds, returning a normalized list:
+    {
+      "route_short": "T2"|"M1"|...,
+      "lat": float,
+      "lon": float,
+      "stop_id": str|None,
+      "parent_station": str|None,
+      "raw_stop": str|None   # best available descriptive string for station parsing
+    }
     """
-    return station_resolved
+    global _cache_until, _cached_entities
 
-def count_trains() -> Tuple[Dict[str, int], Dict[str, int]]:
-    """
-    Returns:
-      states: per-station bucket counts (Waterloo8, WaterlooM, etc.)
-      by_route: total per route_short (e.g. {"M1": 13, "T8": 42, ...})
-    """
-    states: Dict[str, int] = {}
-    by_route: Dict[str, int] = {}
+    now = time.time()
+    if now < _cache_until and _cached_entities:
+        return _cached_entities
 
-    # Refresh trip updates FIRST (critical for Sydney Trains route join)
-    refresh_trip_updates()
+    headers = {"Authorization": f"apikey {TFNSW_API_TOKEN}"}
+    all_entities: List[dict] = []
 
-    # Then collect vehicles from both feeds
-    all_vehicles: List[gtfs_realtime_pb2.VehiclePosition] = []
-    for url in VEHICLE_FEEDS:
+    for feed_url in FEEDS:
         try:
-            all_vehicles.extend(fetch_vehicle_positions(url))
+            resp = requests.get(feed_url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            feed = gtfs_realtime_pb2.FeedMessage()
+            feed.ParseFromString(resp.content)
         except Exception as e:
-            print(f"warn: vehicle feed failed {url}: {e}")
-
-    for v in all_vehicles:
-        rshort = route_short_for_vehicle(v)
-        if not rshort:
-            continue  # can't classify
-
-        by_route[rshort] = by_route.get(rshort, 0) + 1
-
-        # Resolve a station base name/key for your buckets
-        st_resolved = station_name_from_vehicle(v)
-        if not st_resolved:
+            log.warning("Failed to fetch/parse feed %s: %s", feed_url, e)
             continue
 
-        station_base = _station_base_from_resolved(st_resolved)
-        key = station_bucket_key(station_base, rshort)
-        if not key:
+        for ent in feed.entity:
+            if not ent.HasField("vehicle"):
+                continue
+            veh = ent.vehicle
+
+            # route short name
+            route_short = None
+            if veh.trip.route_id:
+                route_short = route_to_short(veh.trip.route_id, feed_url)
+            else:
+                route_short = route_to_short(None, feed_url)
+
+            # filter to allow-list
+            if not route_short or route_short not in ROUTE_SHORT_ALLOW:
+                continue
+
+            lat = veh.position.latitude if veh.position and veh.position.latitude else None
+            lon = veh.position.longitude if veh.position and veh.position.longitude else None
+            stop_id = veh.stop_id if veh.stop_id else None
+
+            # In TfNSW strings you often see more descriptive parent-ish text in stop_id itself.
+            # If there’s an extra descriptive field in your pipeline, add it here.
+            raw_stop = stop_id
+
+            all_entities.append(
+                {
+                    "route_short": route_short,
+                    "lat": float(lat) if lat is not None else None,
+                    "lon": float(lon) if lon is not None else None,
+                    "stop_id": stop_id,
+                    "parent_station": None,  # kept for compatibility
+                    "raw_stop": raw_stop,
+                    "feed": feed_url,
+                }
+            )
+
+    _cached_entities = all_entities
+    _cache_until = time.time() + FEED_CACHE_SEC
+    return _cached_entities
+
+
+def build_states() -> Dict[str, int]:
+    """
+    Produce a states dict like:
+      {"Town HallM": 2, "Town Hall2": 1, "WaterlooM": 1, "Waterloo8": 0, ...}
+    Note: We only output keys for stations we actually see. This keeps things dynamic and simple.
+    """
+    entities = fetch_all_entities()
+    counts: Dict[str, int] = {}
+
+    for e in entities:
+        route_short = e["route_short"]
+        suffix = ROUTE_SUFFIX.get(route_short)
+        if not suffix:
             continue
 
-        states[key] = states.get(key, 0) + 1
+        station_raw = e.get("raw_stop") or e.get("stop_id") or e.get("parent_station")
+        station_core = extract_station_core(station_raw or "")
+        if not station_core:
+            # If we have no station name, skip counting — avoids bad keys
+            if MB_VERBOSE:
+                log.debug("Skip entity without parsable station: %r", e)
+            continue
 
-    return states, by_route
+        key = f"{station_core}{suffix}"
+        counts[key] = counts.get(key, 0) + 1
 
-# ---------- Demo main ----------
+    return counts
+
+
+# ---------- Routes ----------
+@app.get("/trains")
+def get_trains():
+    """
+    Returns a snapshot of normalized vehicle entities (debug-friendly).
+    """
+    ents = fetch_all_entities()
+    sample = ents[:50]
+    return JSONResponse(
+        {
+            "feed_age_seconds": 0.0,  # we don't track precise age; cache TTL keeps this fresh
+            "total_trains": len(ents),
+            "sample_trains": sample,
+        }
+    )
+
+
+@app.get("/states")
+def get_states():
+    """
+    Returns the states map for stations encountered in the feeds, with
+    route-specific suffixes: M1 -> 'M', Tn -> 'n'.
+    """
+    s = build_states()
+    return JSONResponse(s)
+
+
+# ---------- Local run (Koyeb will launch via Procfile/Entrypoint) ----------
 if __name__ == "__main__":
-    # Simple loop to show it working; integrate this into your server loop/ESP bridge.
-    while True:
-        try:
-            states, by_route = count_trains()
+    import uvicorn
 
-            total = sum(by_route.values())
-            print(json.dumps({
-                "feed_age_seconds": 0.0,  # you can fill with your cache age if you track it
-                "total_trains": total,
-                "by_route": by_route,
-                "sample_of_states": dict(list(states.items())[:20])  # log a small slice
-            }, ensure_ascii=False))
-
-        except Exception as e:
-            print(f"error: {e}")
-
-        time.sleep(FEED_CACHE_SEC)
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=os.getenv("RELOAD", "0") == "1")
