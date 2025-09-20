@@ -1,371 +1,772 @@
-# app.py
+# app.py — Metroboard backend (Rail + Metro)
+# - Uses static GTFS (stops.txt, routes.txt, trips.txt, stop_times.txt, agency.txt)
+# - Filters to route_type in (1=subway/metro, 2=rail); optional agency allow-list
+# - Builds station×route keys like "Central1" (T1) and "CentralM" (M1)
+# - GTFS-RT from TfNSW: Sydney Trains + Sydney Metro vehicle positions
+# - States logic: prefer VP.stop_id -> parent match; fallback to distance thresholds
+# - Endpoints: /, /healthz, /debug, /stations, /states, /trains
+
 import os
+import time
 import csv
 import json
-import time
-import math
 import re
-import logging
-from typing import Dict, List, Optional, Tuple
-from threading import Thread
+import random
+import typing as T
 
 import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
-from google.transit import gtfs_realtime_pb2  # pip install gtfs-realtime-bindings
-from dotenv import load_dotenv
+from fastapi.middleware.cors import CORSMiddleware
+from google.transit import gtfs_realtime_pb2 as rt
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
-# -------------------- env --------------------
-load_dotenv()
+# ---------------- Config ----------------
+API_TOKEN = os.environ["TFNSW_API_TOKEN"]
 
-TFNSW_API_TOKEN = os.getenv("TFNSW_API_TOKEN", "").strip()
-if not TFNSW_API_TOKEN:
-    raise RuntimeError("TFNSW_API_TOKEN is required")
+# Allow override via FEEDS env (comma-separated); default to both feeds
+_FEEDS_ENV = os.getenv("FEEDS", "").strip()
+if _FEEDS_ENV:
+    URLS_VP = [u.strip() for u in _FEEDS_ENV.split(",") if u.strip()]
+else:
+    URLS_VP = [
+        "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains",
+        "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/metro",
+    ]
 
-FEEDS: List[str] = [
-    "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains",
-    "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/metro",
-]
-FEEDS_ENV = os.getenv("FEEDS", "").strip()
-if FEEDS_ENV:
-    FEEDS = [u.strip() for u in FEEDS_ENV.split(",") if u.strip()]
+# Distance thresholds (meters) for fallback
+D_SOLID = int(os.getenv("MB_D_SOLID", "200"))
+D_NEAR  = int(os.getenv("MB_D_NEAR",  "800"))
+D_FAR   = int(os.getenv("MB_D_FAR",   "1500"))
 
-FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", os.getenv("FEED_TTL_SEC", "3")))
-MB_VERBOSE = os.getenv("MB_VERBOSE", "0").lower() in ("1", "true", "yes")
-GTFS_DIR = os.getenv("GTFS_DIR", ".")  # directory containing stops.txt
+# Allowlists (empty=set() means all)
+AGENCY_NAME_ALLOW: set[str] = {a.strip() for a in os.getenv("MB_AGENCIES", "").split(",") if a.strip()}
+ROUTE_SHORT_ALLOW: set[str] = {s.strip().upper() for s in os.getenv("MB_ROUTE_SHORT_ALLOW", "").split(",") if s.strip()}
 
-ROUTE_SHORT_ALLOW = set(
-    s.strip() for s in os.getenv("ROUTE_SHORT_ALLOW", "T1,T2,T3,T4,T5,T6,T7,T8,T9,M1").split(",") if s.strip()
-)
+# Route short-name overrides
+ROUTE_SHORT_OVERRIDES_PATH = os.getenv("ROUTE_SHORT_OVERRIDES_PATH", "route_overrides.csv")
+ROUTE_SHORT_OVERRIDES_JSON = os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "")
 
-_default_overrides = {
-    "S_T1_MAIN": "T1",
-    "S_T1_NORTH": "T1",
-    "S_T2": "T2",
-    "S_T3": "T3",
-    "S_T4": "T4",
-    "S_T5": "T5",
-    "S_T6": "T6",
-    "S_T7": "T7",
-    "S_T8": "T8",
-    "S_T9": "T9",
-    "S_M1": "M1",
-}
-try:
-    ROUTE_SHORT_OVERRIDES = json.loads(os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "{}")) or {}
-except json.JSONDecodeError:
-    ROUTE_SHORT_OVERRIDES = {}
-ROUTE_SHORT_OVERRIDES = {**_default_overrides, **ROUTE_SHORT_OVERRIDES}
+# Caching/CORS/logging
+FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
+CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN")
+MB_VERBOSE = os.getenv("MB_VERBOSE", "1") == "1"
+MB_FORCE_DISTANCE = os.getenv("MB_FORCE_DISTANCE", "0") == "1"
 
-logging.basicConfig(level=logging.DEBUG if MB_VERBOSE else logging.INFO)
-log = logging.getLogger("sydtrains")
-
-# -------------------- app & globals --------------------
-app = FastAPI(title="Sydney Trains / Metro States API", version="1.3.0")
-
-# live snapshot (what the ESP polls)
-STATES: Dict[str, int] = {}
-
-# small entity cache (to respect FEED_CACHE_SEC)
-_cache_until: float = 0.0
-_cached_entities: List[dict] = []
-
-# GTFS lookups
-STOP_NAME_BY_ID: Dict[str, str] = {}           # stop_id -> canonical station name (parent-resolved)
-STOP_PARENT: Dict[str, str] = {}               # stop_id -> parent_station (if any)
-STATION_POINTS: Dict[str, Tuple[float, float]] = {}  # station_name -> (lat, lon)
-
-# -------------------- helpers --------------------
-ROUTE_SUFFIX = {"M1": "M", "T1": "1", "T2": "2", "T3": "3", "T4": "4", "T5": "5", "T6": "6", "T7": "7", "T8": "8", "T9": "9"}
-
-# permissive route-id sniffers (covers "S_T2", "T9", "T1 NORTH", etc.)
-_RE_T = re.compile(r"\bT\s*([1-9])\b", re.IGNORECASE)
-_RE_M = re.compile(r"\bM\s*([1-9])\b", re.IGNORECASE)
-
-# Sydney Trains descriptive stop_id parser: "Sydney.Town Hall 5 Loc" -> "Town Hall"
-_station_part_re = re.compile(
-    r"""
-    ^[^.]*\.
-    (?P<core>[A-Za-z /&\-\u2013'\.]+?)      # station words
-    (?:\s+\d+)?                             # platform numbers
-    (?:\s+Loc.*)?\s*$                       # trailing "Loc" noise
-    """,
-    re.VERBOSE,
-)
-
-def _sanitize_name(s: str) -> str:
-    s = s.strip().strip("\ufeff")
-    # remove trailing " 3 Loc ..."
-    s = re.sub(r"\s+\d+\s+Loc.*$", "", s)
-    return s.strip().rstrip(".")
-
-def extract_station_core(stop_or_parent: Optional[str]) -> Optional[str]:
-    if not stop_or_parent:
+# BBox guardrail (None disables)
+DEFAULT_SYD_BBOX = (-34.2, 150.5, -33.4, 151.4)
+def _bbox_env() -> T.Optional[tuple[float, float, float, float]]:
+    if os.getenv("SYD_BBOX_DISABLE") == "1":
         return None
-    txt = stop_or_parent.strip()
-    if "." in txt:
-        m = _station_part_re.match(txt)
+    s = os.getenv("SYD_BBOX")
+    if not s:
+        return DEFAULT_SYD_BBOX
+    try:
+        a, b, c, d = [float(x) for x in s.split(",")]
+        return (a, b, c, d)
+    except Exception:
+        return DEFAULT_SYD_BBOX
+
+SYD_BBOX = _bbox_env()
+
+def vlog(*a):
+    if MB_VERBOSE:
+        print("[metroboard]", *a)
+
+EXCLUDE_SUB = ("wharf", "light rail", "b-line", "interchange", "motorway", " m2")
+SHORT_RE = re.compile(r"\b([TM]\d{1,2})\b", re.I)
+
+# ---------------- Small helpers ----------------
+def _session() -> requests.Session:
+    s = requests.Session()
+    retry = Retry(
+        total=4,
+        backoff_factor=0.6,
+        status_forcelist=(500, 502, 503, 504),
+        allowed_methods=frozenset(["GET"]),
+        raise_on_status=False,
+    )
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    return s
+
+def _valid_ll(x: float, y: float) -> bool:
+    try:
+        x = float(x); y = float(y)
+    except Exception:
+        return False
+    return -90 <= x <= 90 and -180 <= y <= 180
+
+def hav_m(a: float, b: float, c: float, d: float) -> float:
+    try:
+        a = float(a); b = float(b); c = float(c); d = float(d)
+    except Exception:
+        return float("inf")
+    if not (_valid_ll(a, b) and _valid_ll(c, d)):
+        return float("inf")
+    from math import radians, sin, cos, asin, sqrt
+    R = 6371000.0
+    da = radians(c - a)
+    db = radians(d - b)
+    t = sin(da / 2) ** 2 + cos(radians(a)) * cos(radians(c)) * sin(db / 2) ** 2
+    return 2 * R * asin(sqrt(max(0.0, min(1.0, t))))
+
+def within_bbox(lat: float, lon: float, bbox: tuple[float, float, float, float]) -> bool:
+    S, W, N, E = bbox
+    return (S <= lat <= N) and (W <= lon <= E)
+
+def is_num_parent(s: str) -> bool:
+    return s.isdigit()
+
+def status_from_dist(m: T.Optional[float]) -> int:
+    if m is None:
+        return 0
+    if m <= D_SOLID:
+        return 3  # solid/stopped
+    if m <= D_NEAR:
+        return 2  # approaching/medium
+    if m <= D_FAR:
+        return 1  # in area/dim
+    return 0
+
+def clean_name(n: str) -> str:
+    n = (n or "").strip()
+    for suf in (" Station", " Railway Station"):
+        if n.endswith(suf):
+            n = n[: -len(suf)]
+    return n
+
+def _is_stationish(n: str) -> bool:
+    n = (n or "").strip().lower()
+    if any(s in n for s in EXCLUDE_SUB):
+        return False
+    return n.endswith(" station") or n.endswith(" railway station")
+
+def load_whitelist(path: str) -> tuple[set[str], set[str]]:
+    sid_w: set[str] = set()
+    name_w: set[str] = set()
+    if not path or not os.path.exists(path):
+        return sid_w, name_w
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.split("#", 1)[0].strip()
+            if not line:
+                continue
+            token = line.split(",", 1)[0].strip()
+            if token.isdigit():
+                sid_w.add(token)
+            else:
+                name_w.add(clean_name(token).lower())
+    return sid_w, name_w
+
+# ---------------- Route short names (with overrides) ----------------
+def derive_route_short(route_short_name: str | None, route_long_name: str | None) -> str:
+    rs = (route_short_name or "").strip()
+    if rs:
+        return rs.upper()
+    rl = (route_long_name or "").strip()
+    if rl:
+        m = SHORT_RE.search(rl)
         if m:
-            return _sanitize_name(m.group("core"))
-    return _sanitize_name(txt) if txt else None
+            return m.group(1).upper()
+    return ""
 
-def route_to_short(route_id: Optional[str], feed_url: Optional[str]) -> Optional[str]:
-    # explicit overrides first
-    if route_id and route_id in ROUTE_SHORT_OVERRIDES:
-        return ROUTE_SHORT_OVERRIDES[route_id]
+def load_route_overrides(path: str, env_json: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    # CSV file
+    try:
+        if path and os.path.exists(path):
+            with open(path, newline="", encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    rid = (row.get("route_id") or "").strip()
+                    rs = (row.get("route_short_name") or "").strip().upper()
+                    if rid and rs:
+                        out[rid] = rs
+            vlog(f"route_overrides: loaded {len(out)} from file")
+    except Exception as e:
+        vlog(f"WARN: override file: {e}")
+    # Env JSON
+    if env_json:
+        try:
+            obj = json.loads(env_json)
+            if isinstance(obj, dict):
+                for k, v in obj.items():
+                    k = (k or "").strip()
+                    v = (v or "").strip().upper()
+                    if k and v:
+                        out[k] = v
+            vlog("route_overrides: merged env JSON")
+        except Exception as e:
+            vlog(f"WARN: override env: {e}")
+    return out
 
-    # permissive regex sniffing
-    if route_id:
-        rid = route_id.strip().upper().replace("_", " ").replace("-", " ")
-        m = _RE_T.search(rid)
-        if m:
-            return f"T{m.group(1)}"
-        m = _RE_M.search(rid)
-        if m:
-            return f"M{m.group(1)}"
-        if "METRO" in rid:
-            return "M1"
+def load_route_shortnames(routes_path: str = "routes.txt") -> dict[str, str]:
+    ov = load_route_overrides(ROUTE_SHORT_OVERRIDES_PATH, ROUTE_SHORT_OVERRIDES_JSON)
+    out: dict[str, str] = {}
+    with open(routes_path, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            rid = (r.get("route_id") or "").strip()
+            if not rid:
+                continue
+            rs = ov.get(rid) or derive_route_short(r.get("route_short_name"), r.get("route_long_name"))
+            if rs:
+                out[rid] = rs
+    vlog(f"route_short: {len(out)} (ov={len(ov)})")
+    return out
 
-    # feed hint
-    if feed_url and "metro" in feed_url.lower():
-        return "M1"
-    return None
+# ---------------- Static GTFS filters: allowed parents & pairs ----------------
+def require_allowed_parents(
+    stops="stops.txt",
+    routes="routes.txt",
+    trips="trips.txt",
+    stop_times="stop_times.txt",
+    agency="agency.txt",
+    types=(1, 2),
+    agencies_allowed: set[str] = AGENCY_NAME_ALLOW,
+    route_short_allow: set[str] = ROUTE_SHORT_ALLOW,
+) -> set[str]:
+    missing = [p for p in (stops, routes, trips, stop_times, agency) if not os.path.exists(p)]
+    if missing:
+        raise RuntimeError("Missing GTFS: " + ", ".join(missing))
 
-# cheap-ish spherical distance (no heavy geodesy needed here)
-def _dist2(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    # equirectangular approximation
-    rlat = math.radians((lat1 + lat2) * 0.5)
-    dx = (lon2 - lon1) * math.cos(rlat)
-    dy = (lat2 - lat1)
-    return dx * dx + dy * dy
+    ag_name: dict[str, str] = {}
+    with open(agency, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            ag_name[(r.get("agency_id") or "").strip()] = (r.get("agency_name") or "").strip()
 
-def nearest_station_name(lat: Optional[float], lon: Optional[float]) -> Optional[str]:
-    if lat is None or lon is None or not STATION_POINTS:
-        return None
-    best_name, best_d2 = None, float("inf")
-    for name, (slat, slon) in STATION_POINTS.items():
-        if slat is None or slon is None:
+    route_meta: dict[str, tuple[int, str, str]] = {}
+    with open(routes, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            rid = (r.get("route_id") or "").strip()
+            try:
+                rtype = int((r.get("route_type") or "3").strip() or "3")
+            except Exception:
+                rtype = 3
+            rshort = (r.get("route_short_name") or "").strip()
+            agid = (r.get("agency_id") or "").strip()
+            route_meta[rid] = (rtype, rshort, ag_name.get(agid, ""))
+
+    trip_route: dict[str, str] = {}
+    with open(trips, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            trip_route[(r.get("trip_id") or "").strip()] = (r.get("route_id") or "").strip()
+
+    stops_map: dict[str, dict] = {}
+    parents: set[str] = set()
+    with open(stops, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            sid = (r.get("stop_id") or "").strip()
+            stops_map[sid] = r
+            if (r.get("location_type") or "0").strip() == "1":
+                parents.add(sid)
+
+    def parent_of(sid: str) -> T.Optional[str]:
+        row = stops_map.get(sid)
+        if not row:
+            return None
+        p = (row.get("parent_station") or "").strip()
+        if p:
+            return p
+        return sid if sid in parents else None
+
+    allowed: set[str] = set()
+    seen_types, seen_ag = set(), set()
+    with open(stop_times, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            rid = trip_route.get((r.get("trip_id") or "").strip(), "")
+            rtype, rshort, ag = route_meta.get(rid, (None, "", ""))
+            if rtype is None:
+                continue
+            seen_types.add(rtype); seen_ag.add(ag)
+            if types and rtype not in types:
+                continue
+            if agencies_allowed and ag not in agencies_allowed:
+                continue
+            if route_short_allow and rshort and rshort.upper() not in route_short_allow:
+                continue
+            p = parent_of((r.get("stop_id") or "").strip())
+            if p and is_num_parent(p):
+                allowed.add(p)
+
+    vlog("routes types seen", sorted(seen_types), "agencies", sorted(seen_ag))
+    if allowed:
+        vlog(f"parents by trips: {len(allowed)}")
+        return allowed
+
+    # fallback: names
+    fb: set[str] = set()
+    with open(stops, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            if (r.get("location_type") or "0").strip() != "1":
+                continue
+            pid = (r.get("stop_id") or "").strip()
+            if not is_num_parent(pid):
+                continue
+            if _is_stationish((r.get("stop_name") or "")):
+                fb.add(pid)
+    if not fb:
+        raise RuntimeError("No parent stations via fallback.")
+    vlog(f"parents by names: {len(fb)}")
+    return fb
+
+def _known_tm(route_id_to_short: dict[str, str]) -> set[str]:
+    out: set[str] = set()
+    for rs in route_id_to_short.values():
+        u = (rs or "").upper().strip()
+        if re.fullmatch(r"[TM]\d{1,2}", u):
+            out.add(u)
+    return out
+
+def require_allowed_pairs(
+    stops="stops.txt",
+    routes="routes.txt",
+    trips="trips.txt",
+    stop_times="stop_times.txt",
+    agency="agency.txt",
+    types=(1, 2),
+    agencies_allowed: set[str] = AGENCY_NAME_ALLOW,
+    route_short_allow: set[str] = ROUTE_SHORT_ALLOW,
+    allowed_parents_for_fallback: T.Optional[set[str]] = None,
+) -> set[tuple[str, str]]:
+    ag_name: dict[str, str] = {}
+    with open(agency, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            ag_name[(r.get("agency_id") or "").strip()] = (r.get("agency_name") or "").strip()
+
+    rt_meta: dict[str, tuple[int, str, str]] = {}
+    with open(routes, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            rid = (r.get("route_id") or "").strip()
+            try:
+                rtype = int((r.get("route_type") or "3").strip() or "3")
+            except Exception:
+                rtype = 3
+            agid = (r.get("agency_id") or "").strip()
+            ag = ag_name.get(agid, "")
+            rlong = (r.get("route_long_name") or "").strip()
+            rt_meta[rid] = (rtype, ag, rlong)
+
+    trip_route: dict[str, str] = {}
+    with open(trips, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            trip_route[(r.get("trip_id") or "").strip()] = (r.get("route_id") or "").strip()
+
+    stops_map: dict[str, dict] = {}
+    parents: set[str] = set()
+    with open(stops, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            sid = (r.get("stop_id") or "").strip()
+            stops_map[sid] = r
+            if (r.get("location_type") or "0").strip() == "1":
+                parents.add(sid)
+
+    def parent_of(sid: str) -> T.Optional[str]:
+        row = stops_map.get(sid)
+        if not row:
+            return None
+        p = (row.get("parent_station") or "").strip()
+        if p:
+            return p
+        return sid if sid in parents else None
+
+    route_id_to_short = load_route_shortnames(routes)
+
+    pairs: set[tuple[str, str]] = set()
+    missing_short_seen: dict[str, int] = {}
+
+    with open(stop_times, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            rid = trip_route.get((r.get("trip_id") or "").strip(), "")
+            rtype, ag, _ = rt_meta.get(rid, (None, "", ""))
+            if rtype is None:
+                continue
+            if types and rtype not in types:
+                continue
+            if agencies_allowed and ag not in agencies_allowed:
+                continue
+            rshort = (route_id_to_short.get(rid, "") or "").upper()
+            if not rshort:
+                if len(missing_short_seen) < 20:
+                    missing_short_seen[rid] = missing_short_seen.get(rid, 0) + 1
+                continue
+            if route_short_allow and rshort not in route_short_allow:
+                continue
+            p = parent_of((r.get("stop_id") or "").strip())
+            if p and is_num_parent(p):
+                pairs.add((p, rshort))
+
+    if pairs:
+        vlog(f"pairs strict: {len(pairs)}")
+        return pairs
+
+    # permissive fallback
+    if os.getenv("MB_PERMISSIVE_PAIRS", "1") != "0":
+        known = _known_tm(route_id_to_short)
+        if route_short_allow:
+            known &= {x.upper() for x in route_short_allow}
+        if not known:
+            vlog("WARN: no T*/M* for fallback")
+            return set()
+        if not allowed_parents_for_fallback:
+            allowed_parents_for_fallback = {
+                sid for sid, row in stops_map.items()
+                if (row.get("location_type") or "0").strip() == "1" and is_num_parent(sid)
+            }
+        fan = {(pid, rs) for pid in allowed_parents_for_fallback for rs in known}
+        vlog(f"pairs fallback: {len(fan)}")
+        return fan
+
+    if missing_short_seen:
+        vlog("WARN: zero pairs; sample route_ids with no short code:")
+        for rid in list(missing_short_seen.keys())[:10]:
+            meta = rt_meta.get(rid, (None, "", ""))
+            vlog(f"  - rid={rid}  agency={meta[1]!r}  rtype={meta[0]} (add override)")
+    raise RuntimeError("No station×route pairs; supply overrides or enable fallback.")
+
+# ---------------- Build station index (per station × route) ----------------
+def route_suffix(rs: str) -> str:
+    rs = (rs or "").upper()
+    if rs.startswith("T") and len(rs) >= 2:
+        return rs[1:]
+    if rs.startswith("M"):
+        return "M"
+    return rs or "?"
+
+def load_station_index(
+    stops="stops.txt",
+    bbox: T.Optional[tuple[float, float, float, float]] = SYD_BBOX,
+    sid_whitelist: set[str] = set(),
+    name_whitelist: set[str] = set(),
+    allowed_parents: T.Optional[set[str]] = None,
+    allowed_pairs: T.Optional[set[tuple[str, str]]] = None,
+) -> dict[str, dict]:
+    if allowed_parents is None or allowed_pairs is None:
+        raise RuntimeError("allowed_parents and allowed_pairs are required")
+
+    parents: dict[str, dict] = {}
+    kids: dict[str, list[tuple[float, float]]] = {}
+
+    with open(stops, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            lt = (r.get("location_type") or "0").strip()
+            sid = (r.get("stop_id") or "").strip()
+            parent = (r.get("parent_station") or "").strip()
+            name_raw = (r.get("stop_name") or "").strip()
+            lat_s, lon_s = r.get("stop_lat"), r.get("stop_lon")
+            lat = float(lat_s) if lat_s else None
+            lon = float(lon_s) if lon_s else None
+
+            if lt == "1":
+                if is_num_parent(sid) and sid in allowed_parents and not any(x in name_raw.lower() for x in EXCLUDE_SUB):
+                    parents[sid] = {"name": name_raw, "lat": lat, "lon": lon}
+            else:
+                if parent and lat is not None and lon is not None:
+                    if (bbox is None) or within_bbox(lat, lon, bbox):
+                        kids.setdefault(parent, []).append((lat, lon))
+
+    by_parent: dict[str, set[str]] = {}
+    for pid, rs in allowed_pairs:
+        by_parent.setdefault(pid, set()).add(rs)
+
+    idx: dict[str, dict] = {}
+    for pid, meta in parents.items():
+        base = clean_name(meta["name"])
+        lat, lon = meta["lat"], meta["lon"]
+        if (lat is None or lon is None) and pid in kids and kids[pid]:
+            lat = sum(t[0] for t in kids[pid]) / len(kids[pid])
+            lon = sum(t[1] for t in kids[pid]) / len(kids[pid])
+        if lat is None or lon is None:
             continue
-        d2 = _dist2(lat, lon, slat, slon)
-        if d2 < best_d2:
-            best_name, best_d2 = name, d2
-    return best_name
+        if (sid_whitelist or name_whitelist):
+            if not (pid in sid_whitelist or base.lower() in name_whitelist):
+                continue
+        if SYD_BBOX is not None and not within_bbox(lat, lon, SYD_BBOX) and pid not in kids:
+            continue
 
-def _load_stops():
-    """Load stops.txt once; resolve child->parent station names and build a station centroid map."""
-    global STOP_NAME_BY_ID, STOP_PARENT, STATION_POINTS
+        for rs in sorted(by_parent.get(pid, set())):
+            suf = route_suffix(rs)
+            key = f"{base}{suf}"
+            if key in idx:
+                key = f"{base}{suf} ({pid})"
+            idx[key] = {"stop_id": pid, "name": key, "lat": lat, "lon": lon, "route_short": rs, "base_name": base}
 
-    path = os.path.join(GTFS_DIR, "stops.txt")
-    if not os.path.exists(path):
-        log.warning("stops.txt not found at %s — geo fallback limited; Sydney Trains will still parse descriptive stop_ids.", path)
-        STOP_NAME_BY_ID = {}
-        STOP_PARENT = {}
-        STATION_POINTS = {}
-        return
+    return idx
 
-    with open(path, "r", encoding="utf-8-sig", newline="") as f:
-        rdr = csv.DictReader(f)
-        rows = [r for r in rdr]
+# ---------------- Child→Parent map for VP.stop_id resolution ----------------
+def build_child_to_parent(stops="stops.txt") -> dict[str, str]:
+    out: dict[str, str] = {}
+    with open(stops, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            sid = (r.get("stop_id") or "").strip()
+            pid = (r.get("parent_station") or "").strip()
+            lt = (r.get("location_type") or "0").strip()
+            if sid and pid and is_num_parent(pid):
+                out[sid] = pid
+            if sid and lt == "1" and is_num_parent(sid):
+                out.setdefault(sid, sid)
+    vlog(f"child→parent: {len(out)}")
+    return out
 
-    name_raw: Dict[str, str] = {}
-    parent_of: Dict[str, str] = {}
-    coords: Dict[str, Tuple[Optional[float], Optional[float]]] = {}
+# ---------------- GTFS-RT: fetch & parse ----------------
+_FEED_CACHE: T.Optional[rt.FeedMessage] = None
+_FEED_TS = 0.0
 
-    for r in rows:
-        sid = (r.get("stop_id") or "").strip()
-        nm = _sanitize_name(r.get("stop_name") or "") or sid
-        parent = (r.get("parent_station") or "").strip()
-        lat = r.get("stop_lat")
-        lon = r.get("stop_lon")
-        flat = float(lat) if lat not in (None, "",) else None
-        flon = float(lon) if lon not in (None, "",) else None
-        if sid:
-            name_raw[sid] = nm
-            coords[sid] = (flat, flon)
-            if parent:
-                parent_of[sid] = parent
-
-    # resolve to parent/root id
-    def root_id(sid: str) -> str:
-        seen = set()
-        cur = sid
-        for _ in range(6):
-            if cur in seen:
-                break
-            seen.add(cur)
-            p = parent_of.get(cur, "")
-            if not p:
-                break
-            cur = p
-        return cur
-
-    STOP_PARENT = parent_of
-    STOP_NAME_BY_ID = {sid: name_raw.get(root_id(sid), name_raw.get(sid, sid)) for sid in name_raw.keys()}
-
-    # build station points (choose the first available coord for a root name)
-    STATION_POINTS = {}
-    for sid, nm in STOP_NAME_BY_ID.items():
-        lat, lon = coords.get(sid, (None, None))
-        if nm not in STATION_POINTS and lat is not None and lon is not None:
-            STATION_POINTS[nm] = (lat, lon)
-
-    log.info("Loaded %d GTFS stops with coords", len(STOP_NAME_BY_ID))
-
-def station_name_from_stop_id(stop_id: Optional[str]) -> Optional[str]:
-    if not stop_id:
-        return None
-    # 1) direct id → parent-resolved station name
-    nm = STOP_NAME_BY_ID.get(stop_id)
-    if nm:
-        return nm
-    # 2) Sydney Trains descriptive strings like "Sydney.Town Hall 5 Loc"
-    nm = extract_station_core(stop_id)
-    if nm:
-        return nm
-    # 3) parent id direct (sometimes feeds use parent ids)
-    parent = STOP_PARENT.get(stop_id)
-    if parent:
-        return STOP_NAME_BY_ID.get(parent, parent)
-    return None
-
-# -------------------- feed fetch --------------------
-def fetch_all_entities() -> List[dict]:
-    """Fetch both feeds; return normalized vehicle dicts with best-effort route + station derivation."""
-    global _cache_until, _cached_entities
-
+def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
+    global _FEED_CACHE, _FEED_TS
     now = time.time()
-    if _cached_entities and now < _cache_until:
-        return _cached_entities
+    if _FEED_CACHE is not None and (now - _FEED_TS) < FEED_CACHE_SEC:
+        return _FEED_CACHE, (now - _FEED_TS)
 
-    headers = {
-        "Authorization": f"apikey {TFNSW_API_TOKEN}",
+    hdr = {
+        "Authorization": f"apikey {API_TOKEN}",
         "Accept": "application/x-protobuf",
         "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
+        "User-Agent": "metroboard/1.0",
     }
+    s = _session()
+    time.sleep(random.uniform(0, 0.25))  # stagger
 
-    out: List[dict] = []
+    merged = rt.FeedMessage()
+    merged.header.gtfs_realtime_version = "2.0"
+    total = 0
 
-    for feed_url in FEEDS:
-        per_feed = 0
+    for url in URLS_VP:
         try:
-            resp = requests.get(feed_url, headers=headers, timeout=15)
-            resp.raise_for_status()
-            feed = gtfs_realtime_pb2.FeedMessage()
-            feed.ParseFromString(resp.content)
+            r = s.get(url, headers=hdr, timeout=20)
+            r.raise_for_status()
+            feed = rt.FeedMessage()
+            feed.ParseFromString(r.content)
+            veh = sum(1 for e in feed.entity if e.HasField("vehicle"))
+            merged.entity.extend(feed.entity)
+            total += veh
+            vlog(f"fetched {url}: vehicles={veh}")
         except Exception as e:
-            log.warning("Feed fetch/parse failed for %s: %s", feed_url, e)
+            vlog("WARN fetch", url, e)
+
+    _FEED_CACHE = merged
+    _FEED_TS = now
+    vlog("feed merged vehicles", total)
+    return merged, 0.0
+
+def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> tuple[list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]], dict[str, int]]:
+    """Return [(lat,lon,route_short_or_None,child_stop_id,status)], plus counts by route_short."""
+    trains: list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]] = []
+    by_route: dict[str, int] = {}
+
+    for e in feed.entity:
+        if not e.HasField("vehicle"):
+            continue
+        v = e.vehicle
+        rid = v.trip.route_id if v.HasField("trip") else ""
+        rs = (route_id_to_short.get(rid, "") or "").upper() or None
+        if rs and ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW:
             continue
 
-        for ent in feed.entity:
-            if not ent.HasField("vehicle"):
-                continue
-            veh = ent.vehicle
+        sid = getattr(v, "stop_id", "")
+        status = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
+        lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
+        lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
 
-            route_short = route_to_short(
-                veh.trip.route_id if (veh.trip and veh.trip.route_id) else None,
-                feed_url,
-            )
-            # If we *still* can't map a route for Sydney Trains, skip — we can't make a correct suffix.
-            if not route_short or route_short not in ROUTE_SHORT_ALLOW:
-                continue
+        trains.append((lat, lon, rs, sid, status))
+        if rs:
+            by_route[rs] = by_route.get(rs, 0) + 1
 
-            lat = float(veh.position.latitude) if (veh.position and veh.position.latitude) else None
-            lon = float(veh.position.longitude) if (veh.position and veh.position.longitude) else None
-            raw_stop_id = veh.stop_id if veh.stop_id else None
+    vlog(f"collect_trains kept={len(trains)}")
+    return trains, by_route
 
-            out.append(
-                {
-                    "route_short": route_short,
-                    "stop_id": raw_stop_id,
-                    "lat": lat,
-                    "lon": lon,
-                    "feed": feed_url,
-                }
-            )
-            per_feed += 1
+# ---------------- FastAPI app ----------------
+app = FastAPI()
 
-        if MB_VERBOSE:
-            log.info("Parsed %d vehicles from %s", per_feed, feed_url)
+if CORS_ALLOW_ORIGIN:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=[o.strip() for o in CORS_ALLOW_ORIGIN.split(",")],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-    _cached_entities = out
-    _cache_until = time.time() + FEED_CACHE_SEC
-    return _cached_entities
+ROUTE_ID_TO_SHORT: dict[str, str] = {}
+STATION_INDEX: dict[str, dict] = {}
+CHILD_TO_PARENT: dict[str, str] = {}
 
-# -------------------- states build --------------------
-def build_states_snapshot() -> Dict[str, int]:
-    entities = fetch_all_entities()
-    counts: Dict[str, int] = {}
-
-    for e in entities:
-        short = e["route_short"]
-        suf = ROUTE_SUFFIX.get(short)
-        if not suf:
-            continue
-
-        # station name priority:
-        # 1) map stop_id via GTFS (works for Metro & some Sydney Trains)
-        # 2) parse descriptive stop_id text (Sydney Trains: "Sydney.Town Hall 5 Loc")
-        # 3) geo fallback (nearest station)
-        station_name = station_name_from_stop_id(e.get("stop_id"))
-        if not station_name:
-            station_name = nearest_station_name(e.get("lat"), e.get("lon"))
-        if not station_name:
-            continue
-
-        key = f"{station_name}{suf}"
-        counts[key] = counts.get(key, 0) + 1
-
-    return counts
-
-# -------------------- refresher thread --------------------
-def _refresh_loop():
-    global STATES
-    interval = max(5, FEED_CACHE_SEC)  # at least every 5s
-    while True:
-        try:
-            STATES = build_states_snapshot()
-            if MB_VERBOSE:
-                log.info("STATES refreshed: %d keys", len(STATES))
-        except Exception:
-            log.exception("Error while refreshing STATES")
-        time.sleep(interval)
-
-# -------------------- endpoints --------------------
 @app.on_event("startup")
-def _on_start():
-    _load_stops()
-    t = Thread(target=_refresh_loop, daemon=True)
-    t.start()
+def _startup():
+    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT
+
+    ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
+
+    allowed_parents = require_allowed_parents(
+        stops="stops.txt",
+        routes="routes.txt",
+        trips="trips.txt",
+        stop_times="stop_times.txt",
+        agency="agency.txt",
+        types=(1, 2),
+        agencies_allowed=AGENCY_NAME_ALLOW,
+        route_short_allow=ROUTE_SHORT_ALLOW,
+    )
+
+    allowed_pairs = require_allowed_pairs(
+        stops="stops.txt",
+        routes="routes.txt",
+        trips="trips.txt",
+        stop_times="stop_times.txt",
+        agency="agency.txt",
+        types=(1, 2),
+        agencies_allowed=AGENCY_NAME_ALLOW,
+        route_short_allow=ROUTE_SHORT_ALLOW,
+        allowed_parents_for_fallback=allowed_parents,
+    )
+
+    wl_path = os.getenv("STATION_WHITELIST_PATH", "stations_whitelist.txt")
+    sid_w, name_w = load_whitelist(wl_path)
+
+    STATION_INDEX = load_station_index(
+        "stops.txt",
+        bbox=SYD_BBOX,
+        sid_whitelist=sid_w,
+        name_whitelist=name_w,
+        allowed_parents=allowed_parents,
+        allowed_pairs=allowed_pairs,
+    )
+
+    CHILD_TO_PARENT = build_child_to_parent("stops.txt")
+
+    if not STATION_INDEX:
+        raise RuntimeError("No stations after filtering")
+    vlog(f"stations loaded: {len(STATION_INDEX)}")
+
+@app.get("/")
+def root():
+    return {"ok": True, "endpoints": ["/states", "/stations", "/healthz", "/debug", "/trains"]}
+
+@app.get("/healthz")
+def healthz():
+    age = None if _FEED_TS == 0 else (time.time() - _FEED_TS)
+    return {"status": "ok", "stations": len(STATION_INDEX), "trains_last_fetch_s": age}
 
 @app.get("/debug")
 def debug():
-    ents = fetch_all_entities()
+    feed, _ = fetch_vp_cached()
+    trains, by_route = collect_trains(feed, ROUTE_ID_TO_SHORT)
     return {
-        "feeds": [{"feed": u, "ok": True, "status": 200} for u in FEEDS],
-        "last_build": {"entities": len(ents), "keys": len(STATES), "when": int(time.time())},
-        "states_keys": len(STATES),
-        "routes_allowed": sorted(list(ROUTE_SHORT_ALLOW)),
-        "feeds_config": FEEDS,
+        "stations_count": len(STATION_INDEX),
+        "bbox": list(SYD_BBOX) if SYD_BBOX else None,
+        "allowed_routes": sorted(ROUTE_SHORT_ALLOW) if ROUTE_SHORT_ALLOW else "all",
+        "allowed_agencies": sorted(AGENCY_NAME_ALLOW) if AGENCY_NAME_ALLOW else "all",
         "cache_sec": FEED_CACHE_SEC,
-        "stops_indexed": len(STOP_NAME_BY_ID),
-        "token_present": bool(TFNSW_API_TOKEN),
-        "verbose": MB_VERBOSE,
+        "feeds": URLS_VP,
+        "verbose_logs": MB_VERBOSE,
+        "force_distance_mode": MB_FORCE_DISTANCE,
+        "distance_thresholds": {"solid": D_SOLID, "near": D_NEAR, "far": D_FAR},
+        "sample_stations": list(STATION_INDEX.keys())[:10],
+        "current_trains": {
+            "total": len(trains),
+            "by_route": by_route,
+        },
     }
 
 @app.get("/trains")
-def get_trains():
-    ents = fetch_all_entities()
-    return JSONResponse({"total_trains": len(ents), "sample_trains": ents[:50]})
+def trains():
+    """Debug endpoint to see raw train data"""
+    feed, age = fetch_vp_cached()
+    trains, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
+
+    # rt.VehiclePosition.VehicleStopStatus:
+    # INCOMING_AT=0, STOPPED_AT=1, IN_TRANSIT_TO=2
+    def status_name(st: int) -> str:
+        return {0: "INCOMING_AT", 1: "STOPPED_AT", 2: "IN_TRANSIT_TO"}.get(st, "?")
+
+    out = []
+    for lat, lon, rs, sid, st in trains[:50]:
+        out.append({
+            "route": rs,
+            "lat": lat,
+            "lon": lon,
+            "stop_id": sid,
+            "status": status_name(st),
+            "parent_station": CHILD_TO_PARENT.get(sid, sid) if sid else None,
+        })
+
+    return {"feed_age_seconds": age, "total_trains": len(trains), "sample_trains": out}
+
+@app.get("/stations")
+def stations():
+    # Sorted by name for stable UI
+    return JSONResponse([STATION_INDEX[k] for k in sorted(STATION_INDEX.keys())])
 
 @app.get("/states")
-def get_states(only: Optional[str] = Query(None, description="Comma-separated keys")):
+def states(only: T.Optional[str] = Query(None, description="Comma-separated station names")):
+    subset = STATION_INDEX
     if only:
-        wanted = [x.strip() for x in (only or "").split(",") if x.strip()]
-        return {"states": {k: int(STATES.get(k, 0)) for k in wanted}}
-    return {"states": {k: int(v) for k, v in STATES.items()}}
+        wanted = [x.strip() for x in only.split(",") if x.strip()]
+        subset = {n: STATION_INDEX[n] for n in wanted if n in STATION_INDEX}
+        if not subset:
+            return JSONResponse({})
 
-# -------------------- local run --------------------
+    feed, _ = fetch_vp_cached()
+    trains, _by_route = collect_trains(feed, ROUTE_ID_TO_SHORT)
+
+    if MB_VERBOSE:
+        vlog(f"processing trains={len(trains)} stations={len(subset)}")
+
+    if not trains:
+        return JSONResponse({k: 0 for k in subset.keys()})
+
+    # group by route (and keep None bucket for distance-only trains)
+    grouped: dict[T.Optional[str], list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]]] = {}
+    for t in trains:
+        grouped.setdefault(t[2], []).append(t)
+
+    VP_INCOMING = rt.VehiclePosition.INCOMING_AT
+    VP_STOPPED  = rt.VehiclePosition.STOPPED_AT
+
+    out: dict[str, int] = {}
+    matches = 0
+    dist_fb = 0
+
+    for name, meta in subset.items():
+        pid = meta["stop_id"]
+        slat, slon = meta["lat"], meta["lon"]
+        rs = (meta.get("route_short") or "").upper()
+
+        best = 0
+        best_d = None
+
+        # look at trains on this route, plus the None bucket (unknown route)
+        for (tlat, tlon, trs, child_sid, st) in grouped.get(rs, []) + grouped.get(None, []):
+            # VP match first (unless forced distance)
+            if not MB_FORCE_DISTANCE and child_sid:
+                parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
+                if parent == pid:
+                    if st == VP_STOPPED:
+                        best = 3
+                        matches += 1
+                        break
+                    elif st == VP_INCOMING:
+                        best = max(best, 2)
+                        matches += 1
+
+            if best < 3 and tlat is not None and tlon is not None:
+                d = hav_m(slat, slon, tlat, tlon)
+                if best_d is None or d < best_d:
+                    best_d = d
+
+        if best == 0 and best_d is not None:
+            best = status_from_dist(best_d)
+            if best > 0:
+                dist_fb += 1
+
+        out[name] = best
+
+    if MB_VERBOSE:
+        act = sum(1 for v in out.values() if v > 0)
+        vlog(f"result active={act}/{len(subset)} matches={matches} distance_fb={dist_fb}")
+
+    return JSONResponse(out)
+
+# ---------------- run (dev) ----------------
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=os.getenv("RELOAD", "0") == "1")
