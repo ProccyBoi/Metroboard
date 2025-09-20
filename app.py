@@ -109,19 +109,35 @@ def extract_station_core(stop_or_parent: str) -> Optional[str]:
     s = re.sub(r"\s+\d+\s+Loc.*$", "", stop_or_parent.strip())
     return s if s else None
 
-def route_to_short(route_id: Optional[str], feed_hint: Optional[str]) -> Optional[str]:
-    if not route_id:
-        if feed_hint and "metro" in feed_hint.lower():
-            return "M1"
-        return None
-    if route_id in ROUTE_SHORT_OVERRIDES:
-        return ROUTE_SHORT_OVERRIDES[route_id]
-    rid = route_id.upper()
-    if rid.startswith("S_T") and len(rid) >= 4 and rid[3].isdigit():
-        return f"T{rid[3]}"
-    if "METRO" in rid or "S_M1" in rid:
+ROUTE_REGEX = re.compile(r'\b(T[1-9])\b', re.IGNORECASE)
+
+def route_to_short(route_id: Optional[str], feed_hint: Optional[str], veh_label: Optional[str]) -> Optional[str]:
+    """
+    Best-effort mapping to T1..T9 or M1.
+    Order: overrides -> Metro feed -> regex(T#) in route_id/label.
+    """
+    # Metro feed heuristic
+    if feed_hint and "metro" in feed_hint.lower():
         return "M1"
+
+    # Overrides
+    if route_id and route_id in ROUTE_SHORT_OVERRIDES:
+        return ROUTE_SHORT_OVERRIDES[route_id]
+
+    # Regex fallback on route_id
+    if route_id:
+        m = ROUTE_REGEX.search(route_id)
+        if m:
+            return m.group(1).upper()
+
+    # Regex fallback on vehicle label (often contains "T8", etc.)
+    if veh_label:
+        m = ROUTE_REGEX.search(veh_label)
+        if m:
+            return m.group(1).upper()
+
     return None
+
 
 def fetch_all_entities() -> List[dict]:
     """
@@ -158,7 +174,9 @@ def fetch_all_entities() -> List[dict]:
                     continue
                 veh = ent.vehicle
 
-                route_short = route_to_short(veh.trip.route_id if veh.trip.route_id else None, feed_url)
+                trip_rid = veh.trip.route_id if hasattr(veh, "trip") and veh.trip.route_id else None
+                veh_label = veh.vehicle.label if hasattr(veh, "vehicle") and veh.vehicle.label else None
+                route_short = route_to_short(trip_rid, feed_url, veh_label)
                 if not route_short or route_short not in ROUTE_SHORT_ALLOW:
                     continue
 
@@ -197,18 +215,24 @@ def fetch_all_entities() -> List[dict]:
 def build_states() -> Dict[str, int]:
     global _last_build
     entities = fetch_all_entities()
-    counts: Dict[str, int] = {}
+    out: Dict[str, int] = {}
+
     for e in entities:
         suffix = ROUTE_SUFFIX.get(e["route_short"])
         if not suffix:
             continue
-        station_core = extract_station_core((e.get("raw_stop") or e.get("stop_id") or e.get("parent_station") or ""))
+
+        station_raw = e.get("raw_stop") or e.get("stop_id") or e.get("parent_station")
+        station_core = extract_station_core(station_raw or "")
         if not station_core:
             continue
+
         key = f"{station_core}{suffix}"
-        counts[key] = counts.get(key, 0) + 1
-    _last_build = {"entities": len(entities), "keys": len(counts), "when": int(time.time())}
-    return counts
+        out[key] = 3  # solid-at-station
+
+    _last_build = {"entities": len(entities), "keys": len(out), "when": int(time.time())}
+    return out
+
 
 def _refresh_loop():
     global STATES
