@@ -11,9 +11,12 @@ from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from google.transit import gtfs_realtime_pb2  # from gtfs-realtime-bindings
 from dotenv import load_dotenv
+from threading import Thread
 
 # Load .env in local/dev (Koyeb injects env vars automatically)
 load_dotenv()
+
+STATES: Dict[str, int] = {}   # <-- define the global snapshot
 
 # ---------- Config via ENV ----------
 TFNSW_API_TOKEN = os.getenv("TFNSW_API_TOKEN", "").strip()
@@ -101,6 +104,19 @@ station_part_re = re.compile(
     """,
     re.VERBOSE,
 )
+
+def _refresh_loop():
+    """Background loop to keep STATES fresh."""
+    global STATES
+    interval = max(5, FEED_CACHE_SEC)   # poll at least every 5s
+    while True:
+        try:
+            STATES = build_states()
+            if MB_VERBOSE:
+                log.info("Refreshed STATES: %d keys", len(STATES))
+        except Exception:
+            log.exception("Error refreshing STATES")
+        time.sleep(interval)
 
 def extract_station_core(stop_or_parent: str) -> Optional[str]:
     """
@@ -250,6 +266,12 @@ def build_states() -> Dict[str, int]:
 
 
 # ---------- Routes ----------
+@app.on_event("startup")
+def _start_refresher():
+    # kick off the refresher thread
+    t = Thread(target=_refresh_loop, daemon=True)
+    t.start()
+
 @app.get("/trains")
 def get_trains():
     """
