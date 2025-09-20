@@ -1,12 +1,12 @@
 # app.py
-import os, json, time, re, logging
+import os, csv, json, time, re, logging
 from typing import Dict, List, Optional
 from threading import Thread
 
 import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
-from google.transit import gtfs_realtime_pb2  # pip: gtfs-realtime-bindings
+from google.transit import gtfs_realtime_pb2
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -25,6 +25,7 @@ if os.getenv("FEEDS"):
 
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", os.getenv("FEED_TTL_SEC", "3")))
 MB_VERBOSE = os.getenv("MB_VERBOSE", "0") in ("1", "true", "True")
+GTFS_DIR = os.getenv("GTFS_DIR", ".")  # where stops.txt is located
 
 ROUTE_SHORT_ALLOW = set(
     [s.strip() for s in os.getenv("ROUTE_SHORT_ALLOW", "T1,T2,T3,T4,T5,T6,T7,T8,T9,M1").split(",") if s.strip()]
@@ -53,7 +54,7 @@ logging.basicConfig(level=logging.DEBUG if MB_VERBOSE else logging.INFO)
 log = logging.getLogger("sydtrains")
 
 # -------------------- App & global state --------------------
-app = FastAPI(title="Sydney Trains / Metro States API", version="1.2.0")
+app = FastAPI(title="Sydney Trains / Metro States API", version="1.3.0")
 
 STATES: Dict[str, int] = {}
 STOP_NAME_BY_ID: Dict[str, str] = {}
@@ -62,27 +63,10 @@ _cache_until: float = 0.0
 _cached_entities: List[dict] = []
 
 # -------------------- Helpers --------------------
-ROUTE_SUFFIX = {"M1": "M", "T1": "1", "T2": "2", "T3": "3", "T4": "4", "T5": "5", "T6": "6", "T7": "7", "T8": "8", "T9": "9"}
-
-station_part_re = re.compile(
-    r"""
-    ^(?P<prefix>[^.]*)\.
-    (?P<core>[A-Za-z /&\-\u2013'\.]+?)(?:\s+\d+)?   # "Town Hall", "Martin Place"
-    (?:\s+Loc.*)?$
-    """,
-    re.VERBOSE,
-)
-
-def extract_station_core(stop_or_parent: str) -> Optional[str]:
-    """Extract clean station names like 'Town Hall' from 'Sydney.Town Hall 3 Loc'."""
-    if not stop_or_parent:
-        return None
-    if "." in stop_or_parent:
-        m = station_part_re.match(stop_or_parent.strip())
-        if m:
-            return m.group("core").strip().rstrip(".")
-    # fallback: strip trailing " 3 Loc"
-    return re.sub(r"\s+\d+\s+Loc.*$", "", stop_or_parent.strip())
+ROUTE_SUFFIX = {
+    "M1": "M", "T1": "1", "T2": "2", "T3": "3", "T4": "4",
+    "T5": "5", "T6": "6", "T7": "7", "T8": "8", "T9": "9"
+}
 
 def route_to_short(route_id: Optional[str], feed_hint: Optional[str]) -> Optional[str]:
     feed_fallback = "M1" if (feed_hint and "metro" in feed_hint.lower()) else None
@@ -95,6 +79,57 @@ def route_to_short(route_id: Optional[str], feed_hint: Optional[str]) -> Optiona
         if rid.startswith("S_M1") or "METRO" in rid:
             return "M1"
     return feed_fallback
+
+def sanitize_name(s: str) -> str:
+    return re.sub(r"\s+\d+\s+Loc.*$", "", s.strip().strip("\ufeff"))
+
+def _load_stops():
+    """Load GTFS stops.txt → STOP_NAME_BY_ID"""
+    global STOP_NAME_BY_ID, STOP_PARENT
+    path = os.path.join(GTFS_DIR, "stops.txt")
+    if not os.path.exists(path):
+        log.error("stops.txt not found at %s", path)
+        STOP_NAME_BY_ID, STOP_PARENT = {}, {}
+        return
+
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        rdr = csv.DictReader(f)
+        rows = [r for r in rdr]
+
+    name_raw: Dict[str, str] = {}
+    parent_of: Dict[str, str] = {}
+    for r in rows:
+        sid = (r.get("stop_id") or "").strip()
+        nm = sanitize_name(r.get("stop_name") or "")
+        parent = (r.get("parent_station") or "").strip()
+        if sid:
+            name_raw[sid] = nm or sid
+            if parent:
+                parent_of[sid] = parent
+
+    def root_name(sid: str) -> str:
+        seen = set()
+        cur = sid
+        for _ in range(5):
+            if cur in seen: break
+            seen.add(cur)
+            parent = parent_of.get(cur, "")
+            if not parent: break
+            cur = parent
+        return name_raw.get(cur, cur)
+
+    STOP_PARENT = parent_of
+    STOP_NAME_BY_ID = {sid: root_name(sid) for sid in name_raw.keys()}
+    log.info("Loaded %d GTFS stops", len(STOP_NAME_BY_ID))
+
+def station_name_from_stop_id(stop_id: Optional[str]) -> Optional[str]:
+    if not stop_id: return None
+    nm = STOP_NAME_BY_ID.get(stop_id)
+    if nm: return nm
+    parent = STOP_PARENT.get(stop_id)
+    if parent and parent in STOP_NAME_BY_ID:
+        return STOP_NAME_BY_ID[parent]
+    return stop_id  # fallback: numeric ID
 
 def fetch_all_entities() -> List[dict]:
     global _cache_until, _cached_entities
@@ -122,15 +157,14 @@ def fetch_all_entities() -> List[dict]:
             short = route_to_short(veh.trip.route_id if veh.trip and veh.trip.route_id else None, feed_url)
             if not short or short not in ROUTE_SHORT_ALLOW:
                 continue
-            out.append(
-                {
-                    "route_short": short,
-                    "stop_id": veh.stop_id if veh.stop_id else None,
-                    "feed": feed_url,
-                    "lat": float(veh.position.latitude) if veh.position and veh.position.latitude else None,
-                    "lon": float(veh.position.longitude) if veh.position and veh.position.longitude else None,
-                }
-            )
+            out.append({
+                "route_short": short,
+                "stop_id": veh.stop_id if veh.stop_id else None,
+                "feed": feed_url,
+                "lat": float(veh.position.latitude) if veh.position and veh.position.latitude else None,
+                "lon": float(veh.position.longitude) if veh.position and veh.position.longitude else None,
+            })
+
     _cached_entities = out
     _cache_until = time.time() + FEED_CACHE_SEC
     return _cached_entities
@@ -138,24 +172,15 @@ def fetch_all_entities() -> List[dict]:
 def build_states_snapshot() -> Dict[str, int]:
     entities = fetch_all_entities()
     counts: Dict[str, int] = {}
-
     for e in entities:
         short = e["route_short"]
         suf = ROUTE_SUFFIX.get(short)
-        if not suf:
-            continue
-
-        # Map stop_id → station name (via stops.txt)
-        sid = e.get("stop_id")
-        station_name = STOP_NAME_BY_ID.get(sid) if sid else None
-        if not station_name:
-            continue
-
+        if not suf: continue
+        station_name = station_name_from_stop_id(e.get("stop_id"))
+        if not station_name: continue
         key = f"{station_name}{suf}"
         counts[key] = counts.get(key, 0) + 1
-
     return counts
-
 
 # -------------------- background refresher --------------------
 def _refresh_loop():
@@ -167,12 +192,13 @@ def _refresh_loop():
             if MB_VERBOSE:
                 log.info("STATES refreshed: %d keys", len(STATES))
         except Exception:
-            log.exception("Error while refreshing STATES")
+            log.exception("Error refreshing STATES")
         time.sleep(interval)
 
 # -------------------- endpoints --------------------
 @app.on_event("startup")
 def _on_start():
+    _load_stops()
     t = Thread(target=_refresh_loop, daemon=True)
     t.start()
 
@@ -186,6 +212,7 @@ def debug():
         "routes_allowed": sorted(list(ROUTE_SHORT_ALLOW)),
         "feeds_config": FEEDS,
         "cache_sec": FEED_CACHE_SEC,
+        "stops_indexed": len(STOP_NAME_BY_ID),
         "token_present": bool(TFNSW_API_TOKEN),
         "verbose": MB_VERBOSE,
     }
