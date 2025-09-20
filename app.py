@@ -7,7 +7,7 @@ import logging
 from typing import Dict, List, Optional, Tuple
 
 import requests
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from google.transit import gtfs_realtime_pb2  # from gtfs-realtime-bindings
 from dotenv import load_dotenv
@@ -267,13 +267,20 @@ def get_trains():
 
 
 @app.get("/states")
-def get_states():
+def get_states(only: Optional[str] = Query(default=None, description="Comma-separated keys to return")):
     """
-    Returns the states map for stations encountered in the feeds, with
-    route-specific suffixes: M1 -> 'M', Tn -> 'n'.
+    Returns the states map with route-specific suffixes (M,1..9).
+    If ?only= is provided, returns exactly those keys; missing ones are 0.
     """
     s = build_states()
-    return JSONResponse(s)
+
+    if not only:
+        return JSONResponse(s)
+
+    # Parse the requested keys and build a filtered dict, defaulting to 0
+    requested = [k.strip() for k in only.split(",") if k.strip()]
+    filtered = {k: int(s.get(k, 0)) for k in requested}
+    return JSONResponse(filtered)
 
 
 # ---------- Local run (Koyeb will launch via Procfile/Entrypoint) ----------
