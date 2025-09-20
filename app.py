@@ -7,6 +7,11 @@ from google.transit import gtfs_realtime_pb2 as rt
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+ROUTE_ID_TO_SHORT = {}
+TRIP_TO_SHORT = {}   # NEW: trip_id -> route_short
+STATION_INDEX = {}
+CHILD_TO_PARENT = {}
+
 API_TOKEN=os.environ["TFNSW_API_TOKEN"]
 URLS_VP=[ # v2 endpoints
   "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains",
@@ -28,6 +33,21 @@ CORS_ALLOW_ORIGIN=os.getenv("CORS_ALLOW_ORIGIN")
 MB_VERBOSE=os.getenv("MB_VERBOSE","1")=="1"
 MB_FORCE_DISTANCE=os.getenv("MB_FORCE_DISTANCE","0")=="1"
 # BBox guardrail (None disables)
+
+def build_trip_to_short(routes_path="routes.txt", trips_path="trips.txt") -> dict[str, str]:
+    """Map trip_id -> route_short (T1/T2/.../M1) using static GTFS."""
+    rshort = load_route_shortnames(routes_path)
+    trip_to_short = {}
+    with open(trips_path, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            tid = (r.get("trip_id") or "").strip()
+            rid = (r.get("route_id") or "").strip()
+            rs = (rshort.get(rid, "") or "").upper()
+            if tid and rs:
+                trip_to_short[tid] = rs
+    vlog(f"trip->short: {len(trip_to_short)}")
+    return trip_to_short
+
 def _bbox_env():
   if os.getenv("SYD_BBOX_DISABLE")=="1": return None
   s=os.getenv("SYD_BBOX"); 
@@ -332,24 +352,38 @@ def fetch_vp_cached():
     except Exception as e: vlog("WARN fetch",url,e)
   _FEED_CACHE=merged; _FEED_TS=now; vlog("feed merged vehicles",total); return merged,0.0
 
-def collect_trains(feed,route_id_to_short:dict[str,str]):
-  VP_INCOMING=rt.VehiclePosition.INCOMING_AT; VP_STOPPED=rt.VehiclePosition.STOPPED_AT
-  trains=[]; by_route={}
-  total=0
+def collect_trains(feed, route_id_to_short: dict[str, str]):
+  VP_INCOMING = rt.VehiclePosition.INCOMING_AT
+  VP_STOPPED  = rt.VehiclePosition.STOPPED_AT
+  trains = []; by_route = {}; total = 0
   for e in feed.entity:
     if not e.HasField("vehicle"): continue
-    total+=1; v=e.vehicle
-    rid=v.trip.route_id if v.HasField("trip") else ""
-    rs=(route_id_to_short.get(rid,"") or "").upper() or None
-    if ROUTE_SHORT_ALLOW and rs and rs not in ROUTE_SHORT_ALLOW: continue
-    sid=getattr(v,"stop_id","")
-    st=int(getattr(v,"current_status",rt.VehiclePosition.IN_TRANSIT_TO))
-    lat=getattr(v.position,"latitude",None) if v.HasField("position") else None
-    lon=getattr(v.position,"longitude",None) if v.HasField("position") else None
-    trains.append((lat,lon,rs,sid,st))
-    if rs: by_route[rs]=by_route.get(rs,0)+1
+    total += 1; v = e.vehicle
+
+    rid = v.trip.route_id if v.HasField("trip") else ""
+    rs = (route_id_to_short.get(rid, "") or "").upper()
+
+    # NEW: fallback via trip_id -> route_short when route_id missing
+    if not rs and v.HasField("trip"):
+        tid = (v.trip.trip_id or "").strip()
+        rs = (TRIP_TO_SHORT.get(tid, "") or "").upper()
+
+    if ROUTE_SHORT_ALLOW and rs and rs not in ROUTE_SHORT_ALLOW: 
+        continue
+
+    sid = getattr(v, "stop_id", "")
+    st  = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
+    lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
+    lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
+    rs_or_none = rs or None
+
+    trains.append((lat, lon, rs_or_none, sid, st))
+    if rs:
+        by_route[rs] = by_route.get(rs, 0) + 1
+
   vlog(f"collect_trains kept={len(trains)} entities={total}")
-  return trains,by_route
+  return trains, by_route
+
 
 app=FastAPI()
 if CORS_ALLOW_ORIGIN:
@@ -358,14 +392,15 @@ if CORS_ALLOW_ORIGIN:
 ROUTE_ID_TO_SHORT={}; STATION_INDEX={}; CHILD_TO_PARENT={}
 @app.on_event("startup")
 def _startup():
-  global ROUTE_ID_TO_SHORT,STATION_INDEX,CHILD_TO_PARENT
-  ROUTE_ID_TO_SHORT=load_route_shortnames("routes.txt")
-  allowed_parents=require_allowed_parents()
-  allowed_pairs=require_allowed_pairs(allowed_parents_for_fallback=allowed_parents)
-  STATION_INDEX=load_station_index(allowed_parents=allowed_parents,allowed_pairs=allowed_pairs)
-  CHILD_TO_PARENT=build_child_to_parent("stops.txt")
-  if not STATION_INDEX: raise RuntimeError("No stations after filtering")
-  vlog(f"stations loaded: {len(STATION_INDEX)}")
+  global ROUTE_ID_TO_SHORT, TRIP_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT
+  ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
+  TRIP_TO_SHORT = build_trip_to_short("routes.txt","trips.txt")  # NEW
+  allowed_parents = require_allowed_parents()
+  allowed_pairs = require_allowed_pairs(allowed_parents_for_fallback=allowed_parents)
+  STATION_INDEX = load_station_index(allowed_parents=allowed_parents, allowed_pairs=allowed_pairs)
+  CHILD_TO_PARENT = build_child_to_parent("stops.txt")
+  ...
+
 
 @app.get("/")
 def root(): return {"ok":True,"endpoints":["/states","/stations","/healthz","/debug","/trains"]}
