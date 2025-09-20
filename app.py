@@ -267,20 +267,24 @@ def get_trains():
 
 
 @app.get("/states")
-def get_states(only: Optional[str] = Query(default=None, description="Comma-separated keys to return")):
+def get_states(only: Optional[str] = Query(None, description="Comma-separated list of station keys")):
     """
-    Returns the states map with route-specific suffixes (M,1..9).
-    If ?only= is provided, returns exactly those keys; missing ones are 0.
+    - If ?only= is provided, return just those keys (missing keys default to 0).
+    - If not provided, return the FULL snapshot.
+    Response shape is always: {"states": {...}}
     """
-    s = build_states()
+    # Make sure STATES exists; if you named it differently, update accordingly.
+    global STATES
 
-    if not only:
-        return JSONResponse(s)
+    if only:
+        # split + decode each key; keep it simple (ESP already URL-encodes)
+        wanted = [x.strip() for x in only.split(",") if x.strip()]
+        out = {k: int(STATES.get(k, 0)) for k in wanted}
+    else:
+        # full snapshot
+        out = {k: int(v) for k, v in STATES.items()}
 
-    # Parse the requested keys and build a filtered dict, defaulting to 0
-    requested = [k.strip() for k in only.split(",") if k.strip()]
-    filtered = {k: int(s.get(k, 0)) for k in requested}
-    return JSONResponse(filtered)
+    return {"states": out}
 
 
 # ---------- Local run (Koyeb will launch via Procfile/Entrypoint) ----------
