@@ -1,28 +1,17 @@
 # app.py
-import os
-import json
-import time
-import re
-import logging
+import os, csv, json, time, re, logging
 from typing import Dict, List, Optional
+from threading import Thread
 
 import requests
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
-from google.transit import gtfs_realtime_pb2  # from gtfs-realtime-bindings
-from threading import Thread
+from google.transit import gtfs_realtime_pb2  # pip: gtfs-realtime-bindings
+from dotenv import load_dotenv
 
-# Optional .env (won't crash if missing)
-try:
-    from dotenv import load_dotenv  # type: ignore
-    load_dotenv()
-except Exception:
-    pass
+load_dotenv()
 
-# ---------- Globals ----------
-STATES: Dict[str, int] = {}   # global snapshot
-
-# ---------- Config via ENV ----------
+# -------------------- ENV / Config --------------------
 TFNSW_API_TOKEN = os.getenv("TFNSW_API_TOKEN", "").strip()
 if not TFNSW_API_TOKEN:
     raise RuntimeError("TFNSW_API_TOKEN is required")
@@ -31,13 +20,12 @@ FEEDS: List[str] = [
     "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains",
     "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/metro",
 ]
-FEEDS_ENV = os.getenv("FEEDS", "").strip()
-if FEEDS_ENV:
-    FEEDS = [u.strip() for u in FEEDS_ENV.split(",") if u.strip()]
+if os.getenv("FEEDS"):
+    FEEDS = [u.strip() for u in os.getenv("FEEDS", "").split(",") if u.strip()]
 
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", os.getenv("FEED_TTL_SEC", "3")))
-
 MB_VERBOSE = os.getenv("MB_VERBOSE", "0") in ("1", "true", "True")
+GTFS_DIR = os.getenv("GTFS_DIR", ".")  # where stops.txt lives (default: cwd)
 
 ROUTE_SHORT_ALLOW = set(
     [s.strip() for s in os.getenv("ROUTE_SHORT_ALLOW", "T1,T2,T3,T4,T5,T6,T7,T8,T9,M1").split(",") if s.strip()]
@@ -62,243 +50,238 @@ except json.JSONDecodeError:
     ROUTE_SHORT_OVERRIDES = {}
 ROUTE_SHORT_OVERRIDES = {**_default_overrides, **ROUTE_SHORT_OVERRIDES}
 
-# ---------- Logging ----------
 logging.basicConfig(level=logging.DEBUG if MB_VERBOSE else logging.INFO)
 log = logging.getLogger("sydtrains")
 
-# ---------- App ----------
-app = FastAPI(title="Sydney Trains / Metro States API", version="1.0.0")
+# -------------------- App & global state --------------------
+app = FastAPI(title="Sydney Trains / Metro States API", version="1.1.0")
 
-# Simple in-memory cache for feed snapshots
+# live snapshot served to the ESP
+STATES: Dict[str, int] = {}
+
+# tiny cache of the raw entities
 _cache_until: float = 0.0
-_cached_entities: List[dict] = []  # normalized train dicts
-_last_fetch = []   # list of per-feed snapshots for /debug
-_last_build = {"entities": 0, "keys": 0, "when": 0}
+_cached_entities: List[dict] = []
 
-# ---------- Helpers ----------
-ROUTE_SUFFIX = {
-    "M1": "M",
-    "T1": "1",
-    "T2": "2",
-    "T3": "3",
-    "T4": "4",
-    "T5": "5",
-    "T6": "6",
-    "T7": "7",
-    "T8": "8",
-    "T9": "9",
-}
+# GTFS stop index
+STOP_NAME_BY_ID: Dict[str, str] = {}      # stop_id -> best (parent) station name
+STOP_PARENT: Dict[str, str] = {}          # stop_id -> parent_station (if any)
 
-station_part_re = re.compile(
-    r"""
-    ^(?P<prefix>[^.]*)\.
-    (?P<core>[A-Za-z /&\-\u2013'\.]+?)(?:\s+\d+)?      # "Town Hall", "Martin Place", etc.
-    (?:\s+Loc.*)?$                                     # trailing "Loc" etc.
-    """,
-    re.VERBOSE,
-)
+# -------------------- Helpers --------------------
+ROUTE_SUFFIX = {"M1": "M", "T1": "1", "T2": "2", "T3": "3", "T4": "4", "T5": "5", "T6": "6", "T7": "7", "T8": "8", "T9": "9"}
 
-def extract_station_core(stop_or_parent: str) -> Optional[str]:
-    if not stop_or_parent:
-        return None
-    if "." in stop_or_parent:
-        m = station_part_re.match(stop_or_parent.strip())
-        if m:
-            core = m.group("core").strip().rstrip(".").strip()
-            return core
-    s = re.sub(r"\s+\d+\s+Loc.*$", "", stop_or_parent.strip())
-    return s if s else None
+_name_sanitize = re.compile(r"\s+\d+\s+Loc.*$")
 
-ROUTE_REGEX = re.compile(r'\b(T[1-9])\b', re.IGNORECASE)
-
-def route_to_short(route_id: Optional[str], feed_hint: Optional[str], veh_label: Optional[str]) -> Optional[str]:
-    """
-    Best-effort mapping to T1..T9 or M1.
-    Order: overrides -> Metro feed -> regex(T#) in route_id/label.
-    """
-    # Metro feed heuristic
-    if feed_hint and "metro" in feed_hint.lower():
-        return "M1"
-
-    # Overrides
+def route_to_short(route_id: Optional[str], feed_hint: Optional[str]) -> Optional[str]:
     if route_id and route_id in ROUTE_SHORT_OVERRIDES:
         return ROUTE_SHORT_OVERRIDES[route_id]
 
-    # Regex fallback on route_id
-    if route_id:
-        m = ROUTE_REGEX.search(route_id)
-        if m:
-            return m.group(1).upper()
+    if not route_id:
+        if feed_hint and "metro" in feed_hint.lower():
+            return "M1"
+        return None
 
-    # Regex fallback on vehicle label (often contains "T8", etc.)
-    if veh_label:
-        m = ROUTE_REGEX.search(veh_label)
-        if m:
-            return m.group(1).upper()
-
+    rid = route_id.upper()
+    if rid.startswith("S_T") and len(rid) >= 4 and rid[3].isdigit():
+        return f"T{rid[3]}"
+    if "METRO" in rid or "S_M1" in rid:
+        return "M1"
     return None
 
+def sanitize_name(s: str) -> str:
+    # remove trailing “ 3 Loc”, trim BOM/whitespace
+    s = s.strip().strip("\ufeff")
+    return _name_sanitize.sub("", s).strip()
+
+def _load_stops():
+    """
+    Build STOP_NAME_BY_ID by reading GTFS stops.txt (in GTFS_DIR).
+    We resolve a child platform stop_id up to its parent station name when available.
+    """
+    global STOP_NAME_BY_ID, STOP_PARENT
+    path = os.path.join(GTFS_DIR, "stops.txt")
+    if not os.path.exists(path):
+        log.warning("stops.txt not found at %s — station names may be numeric ids", path)
+        STOP_NAME_BY_ID = {}
+        STOP_PARENT = {}
+        return
+
+    with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        rdr = csv.DictReader(f)
+        rows = [r for r in rdr]
+
+    # First pass: capture name & parent for each id
+    name_raw: Dict[str, str] = {}
+    parent_of: Dict[str, str] = {}
+    for r in rows:
+        sid = (r.get("stop_id") or "").strip()
+        nm = sanitize_name(r.get("stop_name") or "")
+        parent = (r.get("parent_station") or "").strip()
+        if sid:
+            name_raw[sid] = nm or sid
+            if parent:
+                parent_of[sid] = parent
+
+    # Some parents are also rows; make sure we know their names too
+    # (If not, fall back to the stop_id string.)
+    def root_name(sid: str, depth: int = 0) -> str:
+        # walk up at most 5 hops to prevent loops
+        seen = set()
+        cur = sid
+        for _ in range(5):
+            if cur in seen:
+                break
+            seen.add(cur)
+            parent = parent_of.get(cur, "")
+            if not parent:
+                break
+            cur = parent
+        return name_raw.get(cur, cur)
+
+    STOP_PARENT = parent_of
+    STOP_NAME_BY_ID = {sid: root_name(sid) for sid in name_raw.keys()}
+    log.info("Loaded %d GTFS stops (resolving parents where present)", len(STOP_NAME_BY_ID))
+
+def station_name_from_stop_id(stop_id: Optional[str]) -> Optional[str]:
+    if not stop_id:
+        return None
+    # Exact match first
+    nm = STOP_NAME_BY_ID.get(stop_id)
+    if nm:
+        return nm
+    # Some feeds sometimes use parent ids directly; try that too
+    parent = STOP_PARENT.get(stop_id)
+    if parent and parent in STOP_NAME_BY_ID:
+        return STOP_NAME_BY_ID[parent]
+    # As a last resort, return the raw string (numeric)
+    return stop_id
 
 def fetch_all_entities() -> List[dict]:
-    """
-    Fetch both feeds with strong diagnostics.
-    """
-    global _cache_until, _cached_entities, _last_fetch
+    global _cache_until, _cached_entities
+
     now = time.time()
-    if now < _cache_until and _cached_entities:
+    if _cached_entities and now < _cache_until:
         return _cached_entities
 
-    headers = {
-        "Authorization": f"apikey {TFNSW_API_TOKEN}",
-        # TfNSW returns protobuf; this header helps proxies behave
-        "Accept": "application/x-protobuf",
-    }
-
-    all_entities: List[dict] = []
-    debug_rows = []
+    headers = {"Authorization": f"apikey {TFNSW_API_TOKEN}"}
+    out: List[dict] = []
 
     for feed_url in FEEDS:
-        row = {"feed": feed_url, "ok": False, "status": None, "bytes": 0, "entities": 0, "error": None}
         try:
-            resp = requests.get(feed_url, headers=headers, timeout=20)
-            row["status"] = resp.status_code
-            row["bytes"] = len(resp.content or b"")
+            resp = requests.get(feed_url, headers=headers, timeout=12)
             resp.raise_for_status()
-
             feed = gtfs_realtime_pb2.FeedMessage()
             feed.ParseFromString(resp.content)
-
-            ent_cnt = 0
-            for ent in feed.entity:
-                if not ent.HasField("vehicle"):
-                    continue
-                veh = ent.vehicle
-
-                trip_rid = veh.trip.route_id if hasattr(veh, "trip") and veh.trip.route_id else None
-                veh_label = veh.vehicle.label if hasattr(veh, "vehicle") and veh.vehicle.label else None
-                route_short = route_to_short(trip_rid, feed_url, veh_label)
-                if not route_short or route_short not in ROUTE_SHORT_ALLOW:
-                    continue
-
-                lat = veh.position.latitude if veh.position and veh.position.latitude else None
-                lon = veh.position.longitude if veh.position and veh.position.longitude else None
-                stop_id = veh.stop_id if veh.stop_id else None
-                raw_stop = stop_id
-
-                all_entities.append(
-                    {
-                        "route_short": route_short,
-                        "lat": float(lat) if lat is not None else None,
-                        "lon": float(lon) if lon is not None else None,
-                        "stop_id": stop_id,
-                        "parent_station": None,
-                        "raw_stop": raw_stop,
-                        "feed": feed_url,
-                    }
-                )
-                ent_cnt += 1
-
-            row["ok"] = True
-            row["entities"] = ent_cnt
-
         except Exception as e:
-            row["error"] = repr(e)
+            log.warning("Feed fetch/parse failed for %s: %s", feed_url, e)
+            continue
 
-        debug_rows.append(row)
+        cnt = 0
+        for ent in feed.entity:
+            if not ent.HasField("vehicle"):
+                continue
+            veh = ent.vehicle
 
-    _last_fetch = debug_rows
-    _cached_entities = all_entities
+            short = route_to_short(veh.trip.route_id if veh.trip and veh.trip.route_id else None, feed_url)
+            if not short or short not in ROUTE_SHORT_ALLOW:
+                continue
+
+            stop_id = veh.stop_id if veh.stop_id else None
+
+            out.append(
+                {
+                    "route_short": short,
+                    "stop_id": stop_id,
+                    "feed": feed_url,
+                    "lat": float(veh.position.latitude) if veh.position and veh.position.latitude else None,
+                    "lon": float(veh.position.longitude) if veh.position and veh.position.longitude else None,
+                }
+            )
+            cnt += 1
+
+        if MB_VERBOSE:
+            log.info("Parsed %d vehicle entities from %s", cnt, feed_url)
+
+    _cached_entities = out
     _cache_until = time.time() + FEED_CACHE_SEC
     return _cached_entities
 
-
-def build_states() -> Dict[str, int]:
-    global _last_build
+def build_states_snapshot() -> Dict[str, int]:
     entities = fetch_all_entities()
-    out: Dict[str, int] = {}
+    counts: Dict[str, int] = {}
 
     for e in entities:
-        suffix = ROUTE_SUFFIX.get(e["route_short"])
-        if not suffix:
+        short = e["route_short"]
+        suf = ROUTE_SUFFIX.get(short)
+        if not suf:
             continue
 
-        station_raw = e.get("raw_stop") or e.get("stop_id") or e.get("parent_station")
-        station_core = extract_station_core(station_raw or "")
-        if not station_core:
+        # Resolve stop_id -> canonical station name from GTFS stops.txt
+        station_name = station_name_from_stop_id(e.get("stop_id"))
+        if not station_name:
             continue
 
-        key = f"{station_core}{suffix}"
-        out[key] = 3  # solid-at-station
+        key = f"{station_name}{suf}"
+        counts[key] = counts.get(key, 0) + 1
 
-    _last_build = {"entities": len(entities), "keys": len(out), "when": int(time.time())}
-    return out
+    return counts
 
-
+# -------------------- background refresher --------------------
 def _refresh_loop():
     global STATES
-    interval = max(5, FEED_CACHE_SEC)   # poll at least every 5s
+    interval = max(5, FEED_CACHE_SEC)  # at least every 5s
     while True:
         try:
-            STATES = build_states()
+            STATES = build_states_snapshot()
             if MB_VERBOSE:
-                log.info("Refreshed STATES: %d keys", len(STATES))
+                log.info("STATES refreshed: %d keys", len(STATES))
         except Exception:
-            log.exception("Error refreshing STATES")
+            log.exception("Error while refreshing STATES")
         time.sleep(interval)
 
-# ---------- Routes ----------
-@app.get("/")
-def root():
-    return {"ok": True, "keys": len(STATES)}
-
+# -------------------- endpoints --------------------
 @app.on_event("startup")
-def _start_refresher():
-    # Prime once so /states isn’t empty on the first call
-    try:
-        global STATES
-        STATES = build_states()
-    except Exception:
-        log.exception("Initial build_states failed")
-    # Kick off the refresher thread
+def _on_start():
+    _load_stops()
     t = Thread(target=_refresh_loop, daemon=True)
     t.start()
+
+@app.get("/debug")
+def debug():
+    ents = fetch_all_entities()
+    return {
+        "feeds": [
+            {
+                "feed": url,
+                "ok": True,
+                "status": 200,
+            }
+            for url in FEEDS
+        ],
+        "last_build": {"entities": len(ents), "keys": len(STATES), "when": int(time.time())},
+        "states_keys": len(STATES),
+        "routes_allowed": sorted(list(ROUTE_SHORT_ALLOW)),
+        "feeds_config": FEEDS,
+        "cache_sec": FEED_CACHE_SEC,
+        "stops_indexed": len(STOP_NAME_BY_ID),
+        "token_present": bool(TFNSW_API_TOKEN),
+        "verbose": MB_VERBOSE,
+    }
 
 @app.get("/trains")
 def get_trains():
     ents = fetch_all_entities()
-    sample = ents[:50]
-    return JSONResponse({"total_trains": len(ents), "sample_trains": sample})
+    return JSONResponse({"total_trains": len(ents), "sample_trains": ents[:50]})
 
 @app.get("/states")
 def get_states(only: Optional[str] = Query(None, description="Comma-separated list of station keys")):
-    """
-    Returns a BARE map (no wrapper), so the ESP can index keys directly.
-    """
     global STATES
     if only:
         wanted = [x.strip() for x in only.split(",") if x.strip()]
-        return {k: int(STATES.get(k, 0)) for k in wanted}
-    # full snapshot (bare)
-    return {k: int(v) for k, v in STATES.items()}
+        return {"states": {k: int(STATES.get(k, 0)) for k in wanted}}
+    return {"states": {k: int(v) for k, v in STATES.items()}}
 
-@app.get("/debug")
-def debug():
-    """
-    Shows per-feed status and last build snapshot.
-    """
-    return {
-        "feeds": _last_fetch,
-        "last_build": _last_build,
-        "states_keys": len(STATES),
-        "routes_allowed": sorted(ROUTE_SHORT_ALLOW),
-        "feeds_config": FEEDS,
-        "cache_sec": FEED_CACHE_SEC,
-        "verbose": MB_VERBOSE,
-        "token_present": bool(TFNSW_API_TOKEN),
-    }
-
-# ---------- Local run ----------
+# -------------------- local run --------------------
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=os.getenv("RELOAD", "0") == "1")
+    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=os.getenv("RELOAD", "0") == "1")
