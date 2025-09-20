@@ -211,16 +211,25 @@ def require_allowed_pairs(stops="stops.txt",routes="routes.txt",trips="trips.txt
       p=parent_of((r.get("stop_id") or "").strip())
       if p and is_num_parent(p): pairs.add((p,rs))
   if pairs: vlog(f"pairs strict: {len(pairs)}"); return pairs
-  # permissive fallback
-  if os.getenv("MB_PERMISSIVE_PAIRS","1")!="0":
-    known=_known_tm(rshort)
-    if ROUTE_SHORT_ALLOW: known&={x.upper() for x in ROUTE_SHORT_ALLOW}
-    if not known: vlog("WARN: no T*/M* for fallback"); return set()
-    if not allowed_parents_for_fallback:
-      allowed_parents_for_fallback={sid for sid,row in stops_map.items() if (row.get("location_type") or "0").strip()=="1" and is_num_parent(sid)}
-    fan={(pid,rs) for pid in allowed_parents_for_fallback for rs in known}
-    vlog(f"pairs fallback: {len(fan)}"); return fan
-  raise RuntimeError("No station×route pairs; supply overrides or enable fallback.")
+      # ---------- FILTERED FALLBACK ----------
+    if os.getenv("MB_PERMISSIVE_PAIRS", "1") != "0":
+        # Whitelist only the lines we actually render
+        allowed_tm = {f"T{i}" for i in range(1, 10)} | {"M1"}
+        if ROUTE_SHORT_ALLOW:
+            allowed_tm &= {x.strip().upper() for x in ROUTE_SHORT_ALLOW}
+
+        if not allowed_parents_for_fallback:
+            allowed_parents_for_fallback = {
+                sid for sid, row in stops_map.items()
+                if (row.get("location_type") or "0").strip() == "1" and is_num_parent(sid)
+            }
+
+        fan = {(pid, rs) for pid in allowed_parents_for_fallback for rs in allowed_tm}
+        vlog(f"pairs fallback (filtered): {len(fan)}")
+        return fan
+
+    raise RuntimeError("No station×route pairs; supply overrides or enable fallback.")
+
 
 def route_suffix(rs:str)->str:
   rs=(rs or "").upper()
