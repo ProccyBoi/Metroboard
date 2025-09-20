@@ -2,6 +2,7 @@
 import os, csv, json, time, re, logging
 from typing import Dict, List, Optional
 from threading import Thread
+import re
 
 import requests
 from fastapi import FastAPI, Query
@@ -72,21 +73,39 @@ ROUTE_SUFFIX = {"M1": "M", "T1": "1", "T2": "2", "T3": "3", "T4": "4", "T5": "5"
 
 _name_sanitize = re.compile(r"\s+\d+\s+Loc.*$")
 
+_ROUTE_RE = re.compile(r"\b([MT])\s*([1-9])\b", re.IGNORECASE)
+
 def route_to_short(route_id: Optional[str], feed_hint: Optional[str]) -> Optional[str]:
+    """
+    Try hard to get a short name:
+    1) Explicit overrides (ROUTE_SHORT_OVERRIDES)
+    2) Regex for things like "S_T2" or "T9" or "m1"
+    3) Heuristic fallback from the feed URL (metro -> M1)
+    """
+    # 3) feed hint fallback (metro -> M1)
+    feed_fallback = "M1" if (feed_hint and "metro" in feed_hint.lower()) else None
+
+    # 1) explicit overrides first
     if route_id and route_id in ROUTE_SHORT_OVERRIDES:
         return ROUTE_SHORT_OVERRIDES[route_id]
 
-    if not route_id:
-        if feed_hint and "metro" in feed_hint.lower():
+    # 2) regex parse
+    if route_id:
+        rid = route_id.strip().upper()
+        # common “S_Tx” shape
+        if rid.startswith("S_T") and len(rid) >= 4 and rid[3].isdigit():
+            return f"T{rid[3]}"
+        if rid.startswith("S_M1") or "METRO" in rid:
             return "M1"
-        return None
+        m = _ROUTE_RE.search(rid)
+        if m:
+            letter, num = m.group(1).upper(), m.group(2)
+            if letter == "M":
+                return f"M{num}"
+            return f"T{num}"
 
-    rid = route_id.upper()
-    if rid.startswith("S_T") and len(rid) >= 4 and rid[3].isdigit():
-        return f"T{rid[3]}"
-    if "METRO" in rid or "S_M1" in rid:
-        return "M1"
-    return None
+    # 3) give up → feed fallback (helps when route_id is empty/weird)
+    return feed_fallback
 
 def sanitize_name(s: str) -> str:
     # remove trailing “ 3 Loc”, trim BOM/whitespace
@@ -157,18 +176,27 @@ def station_name_from_stop_id(stop_id: Optional[str]) -> Optional[str]:
     return stop_id
 
 def fetch_all_entities() -> List[dict]:
+    """
+    Fetch both feeds, decode GTFS-RT, and keep entities whose route we can map.
+    """
     global _cache_until, _cached_entities
 
     now = time.time()
     if _cached_entities and now < _cache_until:
         return _cached_entities
 
-    headers = {"Authorization": f"apikey {TFNSW_API_TOKEN}"}
+    headers = {
+        "Authorization": f"apikey {TFNSW_API_TOKEN}",
+        "Accept": "application/x-protobuf",   # <- important for some gateways
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
     out: List[dict] = []
 
     for feed_url in FEEDS:
+        per_feed = 0
         try:
-            resp = requests.get(feed_url, headers=headers, timeout=12)
+            resp = requests.get(feed_url, headers=headers, timeout=15)
             resp.raise_for_status()
             feed = gtfs_realtime_pb2.FeedMessage()
             feed.ParseFromString(resp.content)
@@ -176,31 +204,33 @@ def fetch_all_entities() -> List[dict]:
             log.warning("Feed fetch/parse failed for %s: %s", feed_url, e)
             continue
 
-        cnt = 0
         for ent in feed.entity:
             if not ent.HasField("vehicle"):
                 continue
             veh = ent.vehicle
 
-            short = route_to_short(veh.trip.route_id if veh.trip and veh.trip.route_id else None, feed_url)
+            short = route_to_short(
+                veh.trip.route_id if (veh.trip and veh.trip.route_id) else None,
+                feed_url,
+            )
+            # allow-list gate
             if not short or short not in ROUTE_SHORT_ALLOW:
                 continue
 
             stop_id = veh.stop_id if veh.stop_id else None
-
             out.append(
                 {
                     "route_short": short,
                     "stop_id": stop_id,
                     "feed": feed_url,
-                    "lat": float(veh.position.latitude) if veh.position and veh.position.latitude else None,
-                    "lon": float(veh.position.longitude) if veh.position and veh.position.longitude else None,
+                    "lat": float(veh.position.latitude) if (veh.position and veh.position.latitude) else None,
+                    "lon": float(veh.position.longitude) if (veh.position and veh.position.longitude) else None,
                 }
             )
-            cnt += 1
+            per_feed += 1
 
         if MB_VERBOSE:
-            log.info("Parsed %d vehicle entities from %s", cnt, feed_url)
+            log.info("Parsed %d vehicles from %s", per_feed, feed_url)
 
     _cached_entities = out
     _cache_until = time.time() + FEED_CACHE_SEC
