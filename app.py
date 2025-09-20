@@ -355,68 +355,83 @@ def trains():
 def stations(): return JSONResponse([STATION_INDEX[k] for k in sorted(STATION_INDEX.keys())])
 
 @app.get("/states")
-def states(only: T.Optional[str]=Query(None,description="Comma-separated station names")):
-  subset=STATION_INDEX if not only else {n:STATION_INDEX[n] for n in [x.strip() for x in only.split(",") if x.strip()] if n in STATION_INDEX}
-  if not subset: return JSONResponse({})
-  feed,_=fetch_vp_cached()
-  trains,by_route=collect_trains(feed,ROUTE_ID_TO_SHORT)
-  if MB_VERBOSE: vlog(f"processing trains={len(trains)} stations={len(subset)}")
-  if not trains: return JSONResponse({k:0 for k in subset.keys()})
-# group by route, keep None for unknown routes (distance-only bucket)
-grouped = {}
-for t in trains:
-    grouped.setdefault(t[2], []).append(t)  # key is route_short or None
+def states(only: T.Optional[str] = Query(None, description="Comma-separated station names")):
+    subset = STATION_INDEX if not only else {
+        n: STATION_INDEX[n]
+        for n in [x.strip() for x in only.split(",") if x.strip()]
+        if n in STATION_INDEX
+    }
+    if not subset:
+        return JSONResponse({})
 
-VP_INCOMING = rt.VehiclePosition.INCOMING_AT
-VP_STOPPED  = rt.VehiclePosition.STOPPED_AT
+    feed, _ = fetch_vp_cached()
+    trains, by_route = collect_trains(feed, ROUTE_ID_TO_SHORT)
 
-out = {}
-matches = 0
-dist_fb = 0
+    if MB_VERBOSE:
+        vlog(f"processing trains={len(trains)} stations={len(subset)}")
 
-for name, meta in subset.items():
-    pid = meta["stop_id"]
-    slat, slon = meta["lat"], meta["lon"]
-    rs = (meta.get("route_short") or "").upper()
+    if not trains:
+        return JSONResponse({k: 0 for k in subset.keys()})
 
-    best = 0
-    best_d = None
+    # group by route, keep None for unknown routes (distance-only bucket)
+    grouped: dict[T.Optional[str], list[tuple]] = {}
+    for t in trains:
+        grouped.setdefault(t[2], []).append(t)  # key is route_short or None
 
-    # 1) Consider only trains on the SAME ROUTE for direct parent matches
-    for (tlat, tlon, trs, child_sid, st) in grouped.get(rs, []):
-        if not MB_FORCE_DISTANCE and child_sid:
-            parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
-            if parent == pid:
-                if st == VP_STOPPED:
-                    best = 3
-                    matches += 1
-                    break
-                elif st == VP_INCOMING:
-                    best = max(best, 2)
-                    matches += 1
-        # Also track nearest distance for same-route trains (as a tie-breaker)
-        if best < 3 and tlat is not None and tlon is not None:
-            d = hav_m(slat, slon, tlat, tlon)
-            if best_d is None or d < best_d:
-                best_d = d
+    VP_INCOMING = rt.VehiclePosition.INCOMING_AT
+    VP_STOPPED = rt.VehiclePosition.STOPPED_AT
 
-    # 2) For UNKNOWN-ROUTE trains, **distance only** (no direct parent match!)
-    if best < 3:
-        for (tlat, tlon, trs, child_sid, st) in grouped.get(None, []):
-            if tlat is None or tlon is None:
-                continue
-            d = hav_m(slat, slon, tlat, tlon)
-            if best_d is None or d < best_d:
-                best_d = d
+    out: dict[str, int] = {}
+    matches = 0
+    dist_fb = 0
 
-    # 3) Apply distance-based fallback thresholds if we didn’t get a direct match
-    if best == 0 and best_d is not None:
-        best = status_from_dist(best_d)
-        if best > 0:
-            dist_fb += 1
+    for name, meta in subset.items():
+        pid = meta["stop_id"]
+        slat, slon = meta["lat"], meta["lon"]
+        rs = (meta.get("route_short") or "").upper()
 
-    out[name] = best
-  if MB_VERBOSE:
-    act=sum(1 for v in out.values() if v>0)
-    vlog(f"result active={act}/{len(subset)} matches={matches} distance_fb={dist_fb}")
-  return JSONResponse(out)
+        best = 0
+        best_d = None
+
+        # 1) Consider only trains on the SAME ROUTE for direct parent matches
+        for (tlat, tlon, trs, child_sid, st) in grouped.get(rs, []):
+            if not MB_FORCE_DISTANCE and child_sid:
+                parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
+                if parent == pid:
+                    if st == VP_STOPPED:
+                        best = 3
+                        matches += 1
+                        break
+                    elif st == VP_INCOMING:
+                        best = max(best, 2)
+                        matches += 1
+
+            # Track nearest distance for same-route trains (tie-breaker / fallback)
+            if best < 3 and tlat is not None and tlon is not None:
+                d = hav_m(slat, slon, tlat, tlon)
+                if best_d is None or d < best_d:
+                    best_d = d
+
+        # 2) For UNKNOWN-ROUTE trains, distance-only (no direct parent match)
+        if best < 3:
+            for (tlat, tlon, trs, child_sid, st) in grouped.get(None, []):
+                if tlat is None or tlon is None:
+                    continue
+                d = hav_m(slat, slon, tlat, tlon)
+                if best_d is None or d < best_d:
+                    best_d = d
+
+        # 3) Apply distance thresholds if no direct match
+        if best == 0 and best_d is not None:
+            best = status_from_dist(best_d)
+            if best > 0:
+                dist_fb += 1
+
+        out[name] = best
+
+    if MB_VERBOSE:
+        act = sum(1 for v in out.values() if v > 0)
+        vlog(f"result active={act}/{len(subset)} matches={matches} distance_fb={dist_fb}")
+
+    return JSONResponse(out)
+
