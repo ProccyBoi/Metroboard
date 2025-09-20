@@ -420,10 +420,17 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
     if not trains:
         return JSONResponse({k: 0 for k in subset.keys()})
 
-    # group by route, keep None for unknown routes (distance-only bucket)
+    # ---- group trains by route (key is route_short or None for unknown) ----
     grouped: dict[T.Optional[str], list[tuple]] = {}
     for t in trains:
-        grouped.setdefault(t[2], []).append(t)  # key is route_short or None
+        grouped.setdefault(t[2], []).append(t)
+
+    # ---- how many route variants each parent station has in this subset ----
+    parent_variants: dict[str, set[str]] = {}
+    for meta in subset.values():
+        pid = meta["stop_id"]
+        rs = (meta.get("route_short") or "").upper()
+        parent_variants.setdefault(pid, set()).add(rs)
 
     VP_INCOMING = rt.VehiclePosition.INCOMING_AT
     VP_STOPPED = rt.VehiclePosition.STOPPED_AT
@@ -440,7 +447,7 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
         best = 0
         best_d = None
 
-        # 1) Consider only trains on the SAME ROUTE for direct parent matches
+        # 1) SAME-ROUTE only: direct parent match first, plus nearest same-route distance
         for (tlat, tlon, trs, child_sid, st) in grouped.get(rs, []):
             if not MB_FORCE_DISTANCE and child_sid:
                 parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
@@ -453,14 +460,15 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
                         best = max(best, 2)
                         matches += 1
 
-            # Track nearest distance for same-route trains (tie-breaker / fallback)
+            # track nearest same-route distance for fallback/tie-break
             if best < 3 and tlat is not None and tlon is not None:
                 d = hav_m(slat, slon, tlat, tlon)
                 if best_d is None or d < best_d:
                     best_d = d
 
-        # 2) For UNKNOWN-ROUTE trains, distance-only (no direct parent match)
-        if best < 3:
+        # 2) UNKNOWN-ROUTE distance fallback ONLY if the parent has a single route variant
+        #    (prevents cross-lighting at multi-line stations like T1/T9)
+        if best < 3 and len(parent_variants.get(pid, ())) <= 1:
             for (tlat, tlon, trs, child_sid, st) in grouped.get(None, []):
                 if tlat is None or tlon is None:
                     continue
@@ -468,7 +476,7 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
                 if best_d is None or d < best_d:
                     best_d = d
 
-        # 3) Apply distance thresholds if no direct match
+        # 3) Apply distance thresholds if there was no direct match
         if best == 0 and best_d is not None:
             best = status_from_dist(best_d)
             if best > 0:
@@ -481,4 +489,3 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
         vlog(f"result active={act}/{len(subset)} matches={matches} distance_fb={dist_fb}")
 
     return JSONResponse(out)
-
