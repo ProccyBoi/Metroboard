@@ -11,6 +11,9 @@ ROUTE_ID_TO_SHORT = {}
 TRIP_TO_SHORT = {}   # NEW: trip_id -> route_short
 STATION_INDEX = {}
 CHILD_TO_PARENT = {}
+BASE_TO_ROUTES = {}   # base station name -> set({"T1","T2",...,"M1"})
+NAME_TO_PARENT = {}   # lower(base) -> set({parent_stop_id,...})
+
 
 API_TOKEN=os.environ["TFNSW_API_TOKEN"]
 URLS_VP=[ # v2 endpoints
@@ -33,6 +36,30 @@ CORS_ALLOW_ORIGIN=os.getenv("CORS_ALLOW_ORIGIN")
 MB_VERBOSE=os.getenv("MB_VERBOSE","1")=="1"
 MB_FORCE_DISTANCE=os.getenv("MB_FORCE_DISTANCE","0")=="1"
 # BBox guardrail (None disables)
+
+def _normalize_text(s: str) -> str:
+    # keep letters/numbers, collapse spaces
+    return re.sub(r'\s+', ' ', re.sub(r'[^a-z0-9]+', ' ', (s or '').lower())).strip()
+
+def infer_route_from_stopid(stop_id: str) -> T.Optional[str]:
+    """
+    Try to infer a T/M line from opaque vehicle 'stop_id' text like
+    'Sydenham.Bondi Junction 2 Loc'. We scan for any known base station
+    name and return its single line if unambiguous; otherwise None.
+    """
+    if not stop_id:
+        return None
+    text = _normalize_text(stop_id)
+    # fast path: exact base-name match
+    for base, routes in BASE_TO_ROUTES.items():
+        b = _normalize_text(base)
+        if b and b in text:
+            if len(routes) == 1:
+                # unambiguous: use it
+                return next(iter(routes))
+            # ambiguous (multi-line station) -> don't guess
+    return None
+
 
 def build_trip_to_short(routes_path="routes.txt", trips_path="trips.txt") -> dict[str, str]:
     """Map trip_id -> route_short (T1/T2/.../M1) using static GTFS."""
@@ -353,36 +380,46 @@ def fetch_vp_cached():
   _FEED_CACHE=merged; _FEED_TS=now; vlog("feed merged vehicles",total); return merged,0.0
 
 def collect_trains(feed, route_id_to_short: dict[str, str]):
-  VP_INCOMING = rt.VehiclePosition.INCOMING_AT
-  VP_STOPPED  = rt.VehiclePosition.STOPPED_AT
-  trains = []; by_route = {}; total = 0
-  for e in feed.entity:
-    if not e.HasField("vehicle"): continue
-    total += 1; v = e.vehicle
+    VP_INCOMING = rt.VehiclePosition.INCOMING_AT
+    VP_STOPPED  = rt.VehiclePosition.STOPPED_AT
+    trains = []; by_route = {}; total = 0
 
-    rid = v.trip.route_id if v.HasField("trip") else ""
-    rs = (route_id_to_short.get(rid, "") or "").upper()
+    for e in feed.entity:
+        if not e.HasField("vehicle"): 
+            continue
+        total += 1
+        v = e.vehicle
 
-    # NEW: fallback via trip_id -> route_short when route_id missing
-    if not rs and v.HasField("trip"):
-        tid = (v.trip.trip_id or "").strip()
-        rs = (TRIP_TO_SHORT.get(tid, "") or "").upper()
+        # 1) normal route_short
+        rid = v.trip.route_id if v.HasField("trip") else ""
+        rs  = (route_id_to_short.get(rid, "") or "").upper()
 
-    if ROUTE_SHORT_ALLOW and rs and rs not in ROUTE_SHORT_ALLOW: 
-        continue
+        # 2) fallback via trip_id -> route_short
+        if not rs and v.HasField("trip"):
+            tid = (v.trip.trip_id or "").strip()
+            rs = (TRIP_TO_SHORT.get(tid, "") or "").upper()
 
-    sid = getattr(v, "stop_id", "")
-    st  = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
-    lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
-    lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
-    rs_or_none = rs or None
+        # 3) NEW: final fallback via textual stop_id inference
+        if not rs:
+            rs = infer_route_from_stopid(getattr(v, "stop_id", "")) or ""
 
-    trains.append((lat, lon, rs_or_none, sid, st))
-    if rs:
-        by_route[rs] = by_route.get(rs, 0) + 1
+        # allow-list filter (unchanged)
+        if ROUTE_SHORT_ALLOW and rs and rs not in ROUTE_SHORT_ALLOW:
+            continue
 
-  vlog(f"collect_trains kept={len(trains)} entities={total}")
-  return trains, by_route
+        sid = getattr(v, "stop_id", "")
+        st  = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
+        lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
+        lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
+
+        rs_or_none = rs or None
+        trains.append((lat, lon, rs_or_none, sid, st))
+        if rs:
+            by_route[rs] = by_route.get(rs, 0) + 1
+
+    vlog(f"collect_trains kept={len(trains)} entities={total}")
+    return trains, by_route
+
 
 
 app=FastAPI()
@@ -398,6 +435,19 @@ def _startup():
   allowed_parents = require_allowed_parents()
   allowed_pairs = require_allowed_pairs(allowed_parents_for_fallback=allowed_parents)
   STATION_INDEX = load_station_index(allowed_parents=allowed_parents, allowed_pairs=allowed_pairs)
+  # Build name/route indices for inference from textual stop_id
+  global BASE_TO_ROUTES, NAME_TO_PARENT
+  BASE_TO_ROUTES = {}
+  NAME_TO_PARENT = {}
+  for meta in STATION_INDEX.values():
+      base = meta["base_name"]
+      rs = (meta.get("route_short") or "").upper()
+      pid = meta["stop_id"]
+      if base and rs and pid:
+          BASE_TO_ROUTES.setdefault(base, set()).add(rs)
+          NAME_TO_PARENT.setdefault(base.lower(), set()).add(pid)
+  vlog(f"name/route indices: bases={len(BASE_TO_ROUTES)}")
+
   CHILD_TO_PARENT = build_child_to_parent("stops.txt")
   ...
 
