@@ -14,7 +14,6 @@ CHILD_TO_PARENT = {}
 BASE_TO_ROUTES = {}   # base station name -> set({"T1","T2",...,"M1"})
 NAME_TO_PARENT = {}   # lower(base) -> set({parent_stop_id,...})
 
-
 API_TOKEN=os.environ["TFNSW_API_TOKEN"]
 URLS_VP=[ # v2 endpoints
   "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains",
@@ -35,7 +34,22 @@ FEED_CACHE_SEC=int(os.getenv("FEED_CACHE_SEC","3"))
 CORS_ALLOW_ORIGIN=os.getenv("CORS_ALLOW_ORIGIN")
 MB_VERBOSE=os.getenv("MB_VERBOSE","1")=="1"
 MB_FORCE_DISTANCE=os.getenv("MB_FORCE_DISTANCE","0")=="1"
+MB_PERMISSIVE_PAIRS = os.getenv("MB_PERMISSIVE_PAIRS", "0") != "0"
+PAIRS_OVERRIDES_CSV = os.getenv("PAIRS_OVERRIDES_CSV", "station_line_pairs.csv")  # optional
 # BBox guardrail (None disables)
+def load_pairs_overrides(path:str) -> set[tuple[str,str]]:
+    out=set()
+    try:
+        if path and os.path.exists(path):
+            with open(path, encoding="utf-8-sig") as f:
+                for r in csv.DictReader(f):
+                    pid=(r.get("parent_stop_id") or "").strip()
+                    rs =(r.get("route_short") or "").strip().upper()
+                    if pid and rs: out.add((pid, rs))
+            vlog(f"pairs overrides: {len(out)} from file")
+    except Exception as e:
+        vlog("WARN pairs overrides:", e)
+    return out
 
 def _normalize_text(s: str) -> str:
     # keep letters/numbers, collapse spaces
@@ -227,7 +241,7 @@ def require_allowed_pairs(
     stop_times="stop_times.txt",
     agency="agency.txt",
     types=(1, 2),
-    allowed_parents_for_fallback: T.Optional[set[str]] = None,
+    allowed_parents_for_fallback: T.Optional[set[str]] = None
 ):
     ag_name = {}
     with open(agency, encoding="utf-8-sig") as f:
@@ -269,8 +283,6 @@ def require_allowed_pairs(
         return p or (sid if sid in parents else None)
 
     rshort = load_route_shortnames(routes)
-
-    # ---------- strict pairs from actual rail/metro trips ----------
     pairs = set()
     with open(stop_times, encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
@@ -280,13 +292,11 @@ def require_allowed_pairs(
                 continue
             if AGENCY_ALLOW and ag not in AGENCY_ALLOW:
                 continue
-
             rs = (rshort.get(rid, "") or "").upper()
             if not rs:
                 continue
             if ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW:
                 continue
-
             p = parent_of((r.get("stop_id") or "").strip())
             if p and is_num_parent(p):
                 pairs.add((p, rs))
@@ -295,26 +305,45 @@ def require_allowed_pairs(
         vlog(f"pairs strict: {len(pairs)}")
         return pairs
 
-    # ---------- FILTERED FALLBACK (safe) ----------
-    if os.getenv("MB_PERMISSIVE_PAIRS", "1") != "0":
-        # Only the lines we render
+    # ---------- FILTERED FALLBACK / OVERRIDES ----------
+    def load_pairs_overrides(path: str) -> set[tuple[str, str]]:
+        out = set()
+        try:
+            if path and os.path.exists(path):
+                with open(path, encoding="utf-8-sig") as f:
+                    for r in csv.DictReader(f):
+                        pid = (r.get("parent_stop_id") or "").strip()
+                        rs = (r.get("route_short") or "").strip().upper()
+                        if pid and rs:
+                            out.add((pid, rs))
+                vlog(f"pairs overrides: {len(out)} from file")
+        except Exception as e:
+            vlog("WARN pairs overrides:", e)
+        return out
+
+    # Try overrides CSV first
+    ov_path = os.getenv("PAIRS_OVERRIDES_CSV", "station_line_pairs.csv")
+    ov = load_pairs_overrides(ov_path)
+    if ov:
+        vlog(f"pairs overrides used: {len(ov)}")
+        return ov
+
+    # Fall back to permissive fan-out if explicitly allowed
+    if os.getenv("MB_PERMISSIVE_PAIRS", "0") != "0":
         allowed_tm = {f"T{i}" for i in range(1, 10)} | {"M1"}
         if ROUTE_SHORT_ALLOW:
             allowed_tm &= {x.strip().upper() for x in ROUTE_SHORT_ALLOW}
-
         if not allowed_parents_for_fallback:
             allowed_parents_for_fallback = {
                 sid
                 for sid, row in stops_map.items()
                 if (row.get("location_type") or "0").strip() == "1" and is_num_parent(sid)
             }
-
         fan = {(pid, rs) for pid in allowed_parents_for_fallback for rs in allowed_tm}
         vlog(f"pairs fallback (filtered): {len(fan)}")
         return fan
 
-    raise RuntimeError("No station×route pairs; supply overrides or enable fallback.")
-
+    raise RuntimeError("No station×route pairs; supply overrides CSV or enable MB_PERMISSIVE_PAIRS.")
 
 def route_suffix(rs:str)->str:
   rs=(rs or "").upper()
