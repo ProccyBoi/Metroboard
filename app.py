@@ -72,6 +72,8 @@ app = FastAPI(title="Sydney Trains / Metro States API", version="1.0.0")
 # Simple in-memory cache for feed snapshots
 _cache_until: float = 0.0
 _cached_entities: List[dict] = []  # normalized train dicts
+_last_fetch = []   # list of per-feed snapshots for /debug
+_last_build = {"entities": 0, "keys": 0, "when": 0}
 
 # ---------- Helpers ----------
 ROUTE_SUFFIX = {
@@ -122,70 +124,90 @@ def route_to_short(route_id: Optional[str], feed_hint: Optional[str]) -> Optiona
     return None
 
 def fetch_all_entities() -> List[dict]:
-    global _cache_until, _cached_entities
+    """
+    Fetch both feeds with strong diagnostics.
+    """
+    global _cache_until, _cached_entities, _last_fetch
     now = time.time()
     if now < _cache_until and _cached_entities:
         return _cached_entities
 
-    headers = {"Authorization": f"apikey {TFNSW_API_TOKEN}"}
+    headers = {
+        "Authorization": f"apikey {TFNSW_API_TOKEN}",
+        # TfNSW returns protobuf; this header helps proxies behave
+        "Accept": "application/x-protobuf",
+    }
+
     all_entities: List[dict] = []
+    debug_rows = []
 
     for feed_url in FEEDS:
+        row = {"feed": feed_url, "ok": False, "status": None, "bytes": 0, "entities": 0, "error": None}
         try:
-            resp = requests.get(feed_url, headers=headers, timeout=10)
+            resp = requests.get(feed_url, headers=headers, timeout=20)
+            row["status"] = resp.status_code
+            row["bytes"] = len(resp.content or b"")
             resp.raise_for_status()
+
             feed = gtfs_realtime_pb2.FeedMessage()
             feed.ParseFromString(resp.content)
+
+            ent_cnt = 0
+            for ent in feed.entity:
+                if not ent.HasField("vehicle"):
+                    continue
+                veh = ent.vehicle
+
+                route_short = route_to_short(veh.trip.route_id if veh.trip.route_id else None, feed_url)
+                if not route_short or route_short not in ROUTE_SHORT_ALLOW:
+                    continue
+
+                lat = veh.position.latitude if veh.position and veh.position.latitude else None
+                lon = veh.position.longitude if veh.position and veh.position.longitude else None
+                stop_id = veh.stop_id if veh.stop_id else None
+                raw_stop = stop_id
+
+                all_entities.append(
+                    {
+                        "route_short": route_short,
+                        "lat": float(lat) if lat is not None else None,
+                        "lon": float(lon) if lon is not None else None,
+                        "stop_id": stop_id,
+                        "parent_station": None,
+                        "raw_stop": raw_stop,
+                        "feed": feed_url,
+                    }
+                )
+                ent_cnt += 1
+
+            row["ok"] = True
+            row["entities"] = ent_cnt
+
         except Exception as e:
-            log.warning("Failed to fetch/parse feed %s: %s", feed_url, e)
-            continue
+            row["error"] = repr(e)
 
-        for ent in feed.entity:
-            if not ent.HasField("vehicle"):
-                continue
-            veh = ent.vehicle
+        debug_rows.append(row)
 
-            # route short name
-            route_short = route_to_short(veh.trip.route_id if veh.trip.route_id else None, feed_url)
-            if not route_short or route_short not in ROUTE_SHORT_ALLOW:
-                continue
-
-            lat = veh.position.latitude if veh.position and veh.position.latitude else None
-            lon = veh.position.longitude if veh.position and veh.position.longitude else None
-            stop_id = veh.stop_id if veh.stop_id else None
-            raw_stop = stop_id
-
-            all_entities.append(
-                {
-                    "route_short": route_short,
-                    "lat": float(lat) if lat is not None else None,
-                    "lon": float(lon) if lon is not None else None,
-                    "stop_id": stop_id,
-                    "parent_station": None,
-                    "raw_stop": raw_stop,
-                    "feed": feed_url,
-                }
-            )
-
+    _last_fetch = debug_rows
     _cached_entities = all_entities
     _cache_until = time.time() + FEED_CACHE_SEC
     return _cached_entities
 
+
 def build_states() -> Dict[str, int]:
+    global _last_build
     entities = fetch_all_entities()
     counts: Dict[str, int] = {}
     for e in entities:
         suffix = ROUTE_SUFFIX.get(e["route_short"])
         if not suffix:
             continue
-        station_raw = e.get("raw_stop") or e.get("stop_id") or e.get("parent_station")
-        station_core = extract_station_core(station_raw or "")
+        station_core = extract_station_core((e.get("raw_stop") or e.get("stop_id") or e.get("parent_station") or ""))
         if not station_core:
-            if MB_VERBOSE:
-                log.debug("Skip entity without parsable station: %r", e)
             continue
         key = f"{station_core}{suffix}"
         counts[key] = counts.get(key, 0) + 1
+    _last_build = {"entities": len(entities), "keys": len(counts), "when": int(time.time())}
     return counts
 
 def _refresh_loop():
@@ -234,6 +256,22 @@ def get_states(only: Optional[str] = Query(None, description="Comma-separated li
         return {k: int(STATES.get(k, 0)) for k in wanted}
     # full snapshot (bare)
     return {k: int(v) for k, v in STATES.items()}
+
+@app.get("/debug")
+def debug():
+    """
+    Shows per-feed status and last build snapshot.
+    """
+    return {
+        "feeds": _last_fetch,
+        "last_build": _last_build,
+        "states_keys": len(STATES),
+        "routes_allowed": sorted(ROUTE_SHORT_ALLOW),
+        "feeds_config": FEEDS,
+        "cache_sec": FEED_CACHE_SEC,
+        "verbose": MB_VERBOSE,
+        "token_present": bool(TFNSW_API_TOKEN),
+    }
 
 # ---------- Local run ----------
 if __name__ == "__main__":
