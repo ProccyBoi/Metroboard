@@ -403,6 +403,7 @@ def stations(): return JSONResponse([STATION_INDEX[k] for k in sorted(STATION_IN
 
 @app.get("/states")
 def states(only: T.Optional[str] = Query(None, description="Comma-separated station names")):
+    # --- subset to requested station keys (e.g., "Central1","Central9","CentralM") ---
     subset = STATION_INDEX if not only else {
         n: STATION_INDEX[n]
         for n in [x.strip() for x in only.split(",") if x.strip()]
@@ -412,7 +413,7 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
         return JSONResponse({})
 
     feed, _ = fetch_vp_cached()
-    trains, by_route = collect_trains(feed, ROUTE_ID_TO_SHORT)
+    trains, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
 
     if MB_VERBOSE:
         vlog(f"processing trains={len(trains)} stations={len(subset)}")
@@ -420,72 +421,109 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
     if not trains:
         return JSONResponse({k: 0 for k in subset.keys()})
 
-    # ---- group trains by route (key is route_short or None for unknown) ----
-    grouped: dict[T.Optional[str], list[tuple]] = {}
-    for t in trains:
-        grouped.setdefault(t[2], []).append(t)
+    VP_INCOMING = rt.VehiclePosition.INCOMING_AT
+    VP_STOPPED = rt.VehiclePosition.STOPPED_AT
 
-    # ---- how many route variants each parent station has in this subset ----
+    # ---- Group trains by route_short (T1/T2/.../M1) and also track direct parent matches ----
+    by_route: dict[T.Optional[str], list[tuple]] = {}
+    for t in trains:
+        by_route.setdefault(t[2], []).append(t)  # key is route_short or None
+
+    # For each parent station, what route variants exist in the *subset* we’re answering for?
     parent_variants: dict[str, set[str]] = {}
+    parent_coords: dict[str, tuple[float, float]] = {}
     for meta in subset.values():
         pid = meta["stop_id"]
         rs = (meta.get("route_short") or "").upper()
         parent_variants.setdefault(pid, set()).add(rs)
+        parent_coords[pid] = (meta["lat"], meta["lon"])  # same for all variants
 
-    VP_INCOMING = rt.VehiclePosition.INCOMING_AT
-    VP_STOPPED = rt.VehiclePosition.STOPPED_AT
+    # 1) Direct matches only: build best status per (parent, route_short) using child->parent from feed
+    direct_best: dict[tuple[str, str], int] = {}  # (pid, rs) -> 1/2/3
+    direct_hits = 0
 
+    for route_key, lst in by_route.items():
+        if not route_key:
+            continue  # unknown route bucket is not used for direct matches
+        for (tlat, tlon, trs, child_sid, st) in lst:
+            if not child_sid:
+                continue
+            parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
+            if not parent:
+                continue
+            key = (parent, route_key)
+            val = 3 if st == VP_STOPPED else (2 if st == VP_INCOMING else 0)
+            if val > 0:
+                if direct_best.get(key, 0) < val:
+                    direct_best[key] = val
+                direct_hits += 1
+
+    # 2) Distance fallbacks:
+    #    - same-route distance: always allowed
+    #    - unknown-route distance: only if that parent has a single variant in this subset
+    same_route_near: dict[tuple[str, str], float] = {}      # (pid, rs) -> meters
+    unknown_route_near: dict[str, float] = {}               # pid -> meters (no route)
+
+    # Precompute nearest same-route distances
+    for route_key, lst in by_route.items():
+        if not route_key:
+            continue
+        for pid, (slat, slon) in parent_coords.items():
+            # Only consider this (pid, route_key) if that variant actually exists in the subset
+            if route_key not in parent_variants.get(pid, ()):
+                continue
+            for (tlat, tlon, trs, child_sid, st) in lst:
+                if tlat is None or tlon is None:
+                    continue
+                d = hav_m(slat, slon, tlat, tlon)
+                k = (pid, route_key)
+                if k not in same_route_near or d < same_route_near[k]:
+                    same_route_near[k] = d
+
+    # Precompute nearest unknown-route distances (only once per parent)
+    unknown_list = by_route.get(None, [])
+    if unknown_list:
+        for pid, (slat, slon) in parent_coords.items():
+            # Only store if single-variant parent to avoid cross-lighting
+            if len(parent_variants.get(pid, ())) == 1:
+                for (tlat, tlon, trs, child_sid, st) in unknown_list:
+                    if tlat is None or tlon is None:
+                        continue
+                    d = hav_m(slat, slon, tlat, tlon)
+                    if pid not in unknown_route_near or d < unknown_route_near[pid]:
+                        unknown_route_near[pid] = d
+
+    # 3) Produce answer per station *key* (variant)
     out: dict[str, int] = {}
-    matches = 0
     dist_fb = 0
 
     for name, meta in subset.items():
         pid = meta["stop_id"]
-        slat, slon = meta["lat"], meta["lon"]
         rs = (meta.get("route_short") or "").upper()
 
-        best = 0
-        best_d = None
+        # Priority A: direct match for (parent, route_short)
+        val = direct_best.get((pid, rs), 0)
 
-        # 1) SAME-ROUTE only: direct parent match first, plus nearest same-route distance
-        for (tlat, tlon, trs, child_sid, st) in grouped.get(rs, []):
-            if not MB_FORCE_DISTANCE and child_sid:
-                parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
-                if parent == pid:
-                    if st == VP_STOPPED:
-                        best = 3
-                        matches += 1
-                        break
-                    elif st == VP_INCOMING:
-                        best = max(best, 2)
-                        matches += 1
+        # Priority B: same-route distance threshold if no direct match
+        if val == 0:
+            d = same_route_near.get((pid, rs))
+            if d is not None:
+                val = status_from_dist(d)
+                if val > 0:
+                    dist_fb += 1
 
-            # track nearest same-route distance for fallback/tie-break
-            if best < 3 and tlat is not None and tlon is not None:
-                d = hav_m(slat, slon, tlat, tlon)
-                if best_d is None or d < best_d:
-                    best_d = d
+        # Priority C: unknown-route distance only if the parent has one variant
+        if val == 0 and len(parent_variants.get(pid, ())) == 1:
+            d = unknown_route_near.get(pid)
+            if d is not None:
+                val = status_from_dist(d)
+                if val > 0:
+                    dist_fb += 1
 
-        # 2) UNKNOWN-ROUTE distance fallback ONLY if the parent has a single route variant
-        #    (prevents cross-lighting at multi-line stations like T1/T9)
-        if best < 3 and len(parent_variants.get(pid, ())) <= 1:
-            for (tlat, tlon, trs, child_sid, st) in grouped.get(None, []):
-                if tlat is None or tlon is None:
-                    continue
-                d = hav_m(slat, slon, tlat, tlon)
-                if best_d is None or d < best_d:
-                    best_d = d
-
-        # 3) Apply distance thresholds if there was no direct match
-        if best == 0 and best_d is not None:
-            best = status_from_dist(best_d)
-            if best > 0:
-                dist_fb += 1
-
-        out[name] = best
+        out[name] = val
 
     if MB_VERBOSE:
         act = sum(1 for v in out.values() if v > 0)
-        vlog(f"result active={act}/{len(subset)} matches={matches} distance_fb={dist_fb}")
+        vlog(f"result active={act}/{len(subset)} direct_hits={direct_hits} distance_fb={dist_fb}")
 
     return JSONResponse(out)
