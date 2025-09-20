@@ -3,4 +3,5 @@ uvicorn[standard]==0.30.6
 requests==2.32.3
 urllib3==2.2.2
 gtfs-realtime-bindings==1.0.0
+protobuf==4.25.3
 python-dotenv==1.0.1
