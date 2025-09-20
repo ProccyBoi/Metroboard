@@ -56,6 +56,8 @@ log = logging.getLogger("sydtrains")
 app = FastAPI(title="Sydney Trains / Metro States API", version="1.2.0")
 
 STATES: Dict[str, int] = {}
+STOP_NAME_BY_ID: Dict[str, str] = {}
+STOP_PARENT: Dict[str, str] = {}
 _cache_until: float = 0.0
 _cached_entities: List[dict] = []
 
@@ -136,16 +138,24 @@ def fetch_all_entities() -> List[dict]:
 def build_states_snapshot() -> Dict[str, int]:
     entities = fetch_all_entities()
     counts: Dict[str, int] = {}
+
     for e in entities:
-        suf = ROUTE_SUFFIX.get(e["route_short"])
+        short = e["route_short"]
+        suf = ROUTE_SUFFIX.get(short)
         if not suf:
             continue
-        station_core = extract_station_core(e.get("stop_id") or "")
-        if not station_core:
+
+        # Map stop_id → station name (via stops.txt)
+        sid = e.get("stop_id")
+        station_name = STOP_NAME_BY_ID.get(sid) if sid else None
+        if not station_name:
             continue
-        key = f"{station_core}{suf}"
+
+        key = f"{station_name}{suf}"
         counts[key] = counts.get(key, 0) + 1
+
     return counts
+
 
 # -------------------- background refresher --------------------
 def _refresh_loop():
