@@ -279,8 +279,7 @@ class StaticGTFS:
         padded = f" {nm} "
         if any(k in padded for k in bad_substrings):
             return False
-
-    return True
+        return True
 
 
     def _compute_allowed_sets(self):
