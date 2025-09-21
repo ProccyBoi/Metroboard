@@ -272,6 +272,19 @@ def _merge_csvs(sources: list[Path], dest_dir: Path):
          f"trips={sum(1 for _ in open(dest_dir/'trips.txt',encoding='utf-8'))-1}, "
          f"stops={sum(1 for _ in open(dest_dir/'stops.txt',encoding='utf-8'))-1}")
 
+def ensure_gtfs(dirpath: str):
+    root = Path(dirpath)
+    root.mkdir(parents=True, exist_ok=True)
+
+    # If a previous run already produced a merged GTFS, reuse it.
+    if all((root / f).exists() for f in NEEDED):
+        vlog(f"GTFS already present at {root}")
+        return
+
+    # Otherwise fetch sources and merge.
+    src_dirs = _download_sources_to_tempdirs()
+    vlog(f"Fetched {len(src_dirs)} GTFS source(s); merging into {root}")
+    _merge_csvs(src_dirs, root)
 
 # ---------------- Route/GTFS helpers ----------------
 def load_route_overrides(path:str,json_env:str)->dict[str,str]:
