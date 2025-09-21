@@ -323,54 +323,6 @@ class LiveState:
             return None
         return (parent, line_code)
 
-        def counts_for_tokens(self, tokens: List[str]) -> Dict[str, int]:
-            bucket_counts: Counter[Tuple[str, str]] = Counter()
-    
-            # Build counts keyed by (parent_id, line)
-            for t in self.trains:
-                line = t.route_short  # already normalized to 'T#' or 'M'
-                if not line:
-                    continue
-                seen: Set[Tuple[str, str]] = set()
-                for sid in t.upcoming_stop_ids[:40]:
-                    parent = self.gtfs.parent_of(sid)
-                    key = (parent, line)
-                    if key not in seen:
-                        bucket_counts[key] += 1
-                        seen.add(key)
-    
-            out: Dict[str, int] = {}
-            for tok in tokens:
-                parsed = self._parse_only_token(tok)
-                if not parsed:
-                    out[tok] = 0
-                    continue
-    
-                parent, line = parsed
-    
-                # 1) Exact (parent_id, line)
-                total = bucket_counts.get((parent, line), 0)
-    
-                # 2) Prefix parent-id match (helps degraded mode like '200060' vs '2000601')
-                if total == 0:
-                    for (p, l), v in bucket_counts.items():
-                        if l == line and (p == parent or p.startswith(parent)):
-                            total += v
-    
-                # 3) Name+line fallback for stations with multiple parents (e.g., heavy vs metro "Chatswood")
-                if total == 0:
-                    base_name = self._base_name_from_token(tok).lower()
-                    for (p, l), v in bucket_counts.items():
-                        if l != line:
-                            continue
-                        pname = self.gtfs.parent_to_name.get(p, "")
-                        if pname and pname.lower() == base_name:
-                            total += v
-    
-                out[tok] = total
-            return out
-
-
     @staticmethod
     def _base_name_from_token(tok: str) -> str:
         """
@@ -381,12 +333,59 @@ class LiveState:
         # Remove ' (12345)' if present
         if "(" in t and t.endswith(")"):
             t = t[: t.rfind("(")].strip()
-
         # Remove trailing digits / 'M' suffix
         i = len(t) - 1
         while i >= 0 and (t[i].isdigit() or t[i].upper() == "M"):
             i -= 1
         return t[: i + 1].strip()
+
+    def counts_for_tokens(self, tokens: List[str]) -> Dict[str, int]:
+        bucket_counts: Counter[Tuple[str, str]] = Counter()
+
+        # Build counts keyed by (parent_id, line)
+        for t in self.trains:
+            line = t.route_short  # already normalized to 'T#' or 'M'
+            if not line:
+                continue
+            seen: Set[Tuple[str, str]] = set()
+            for sid in t.upcoming_stop_ids[:40]:
+                parent = self.gtfs.parent_of(sid)
+                key = (parent, line)
+                if key not in seen:
+                    bucket_counts[key] += 1
+                    seen.add(key)
+
+        out: Dict[str, int] = {}
+        for tok in tokens:
+            parsed = self._parse_only_token(tok)
+            if not parsed:
+                out[tok] = 0
+                continue
+
+            parent, line = parsed
+
+            # 1) Exact (parent_id, line)
+            total = bucket_counts.get((parent, line), 0)
+
+            # 2) Prefix parent-id match (helps degraded mode like '200060' vs '2000601')
+            if total == 0:
+                for (p, l), v in bucket_counts.items():
+                    if l == line and (p == parent or p.startswith(parent)):
+                        total += v
+
+            # 3) Name+line fallback for stations with multiple parents (e.g., heavy vs metro "Chatswood")
+            if total == 0:
+                base_name = self._base_name_from_token(tok).lower()
+                for (p, l), v in bucket_counts.items():
+                    if l != line:
+                        continue
+                    pname = self.gtfs.parent_to_name.get(p, "")
+                    if pname and pname.lower() == base_name:
+                        total += v
+
+            out[tok] = total
+        return out
+
 
 
 # -----------------------------
