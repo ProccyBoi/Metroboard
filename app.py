@@ -1,12 +1,20 @@
-# app.py — Metroboard backend (Rail + Metro only, strict parents)
+# app.py — Metroboard backend (rail+metro strict, parent stations only)
 # - Requires static GTFS files: routes.txt, trips.txt, stops.txt, stop_times.txt, agency.txt
-# - Builds an "allowed parent station" set from routes with route_type in {1 (subway), 2 (rail)}
-#   optionally filtered by an agency allow-list (e.g. Sydney Trains, NSW Trains, Sydney Metro).
+# - Builds an "allowed parent station" set from routes with route_type in {1=subway, 2=rail}
+#   optionally filtered by an agency allow-list (Sydney Trains / NSW Trains / Sydney Metro).
 # - Buckets ONLY stops whose parent is in the allowed set (filters out bus/light rail/wharf/etc).
 # - Supports route short-name overrides and line aliases (e.g. merge T6 into T4 if desired).
 # - Endpoints: /healthz, /stations (debug), /states?only=Central4,ChatswoodM,...
 
-import os, io, zipfile, asyncio, csv, logging, json, re, shutil
+import os
+import io
+import zipfile
+import asyncio
+import csv
+import logging
+import json
+import re
+import shutil
 from collections import defaultdict, Counter
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional, Set
@@ -87,6 +95,7 @@ class Stop:
     stop_id: str
     name: str
     parent_station: Optional[str]
+    location_type: int = 0  # 1 = station, 0 = stop/platform, GTFS standard
 
 @dataclass
 class TrainObs:
@@ -134,8 +143,10 @@ class StaticGTFS:
             self._compute_allowed_sets()
             self._build_name_parent_index()  # only for allowed parents
             self.available = True
-            log.info("[metroboard] static GTFS ready: routes=%d trips=%d stops=%d allowed_parents=%d",
-                     len(self.routes), len(self.trips), len(self.stops), len(self.allowed_parent_ids))
+            log.info(
+                "[metroboard] static GTFS ready: routes=%d trips=%d stops=%d allowed_parents=%d",
+                len(self.routes), len(self.trips), len(self.stops), len(self.allowed_parent_ids)
+            )
         except Exception as e:
             log.exception("[metroboard] static GTFS load failed (degraded mode): %s", e)
 
@@ -203,7 +214,7 @@ class StaticGTFS:
                 short = (row.get("route_short_name") or "").strip()
                 route_type = None
                 try:
-                    route_type = int(row.get("route_type", "").strip())
+                    route_type = int((row.get("route_type") or "").strip())
                 except Exception:
                     pass
                 agency_id = (row.get("agency_id") or "").strip() or None
@@ -222,17 +233,19 @@ class StaticGTFS:
         # stops.txt
         with self._open_csv(d, "stops.txt") as f:
             rdr = csv.DictReader(f)
-            # tolerate BOM names
             headers = [h.strip().lstrip("\ufeff") for h in (rdr.fieldnames or [])]
-            idx = {h: i for i, h in enumerate(headers)}
             for row in rdr:
                 sid = (row.get("stop_id") or row.get("\ufeffstop_id") or "").strip()
                 name = (row.get("stop_name") or "").strip()
                 parent = (row.get("parent_station") or "").strip() or None
+                try:
+                    ltype = int((row.get("location_type") or "0").strip())
+                except Exception:
+                    ltype = 0
                 if sid:
-                    self.stops[sid] = Stop(sid, name, parent)
+                    self.stops[sid] = Stop(stop_id=sid, name=name, parent_station=parent, location_type=ltype)
 
-        # stop_times.txt: we don't store; we’ll scan it during _compute_allowed_sets
+        # stop_times.txt path for later scan
         self._stop_times_path = os.path.join(d, "stop_times.txt")
 
     def _route_allowed(self, r: Route) -> bool:
@@ -244,8 +257,22 @@ class StaticGTFS:
                 return False
         return True
 
+    def _is_station_parent(self, pid: str) -> bool:
+        # must exist and be a location_type=1 "station"
+        s = self.stops.get(pid)
+        if not s or s.location_type != 1:
+            return False
+        nm = (s.name or "").lower()
+        # drop obvious bus/light-rail/bus-stand phrasing seen in your data
+        bad_substrings = (
+            "stand ", "nightride", "light rail", " concourse", " opp ", " at "
+        )
+        if any(k in nm for k in bad_substrings):
+            return False
+        return True
+
     def _compute_allowed_sets(self):
-        # 1) routes by type/agency
+        # 1) allowed routes (by type/agency)
         for r in self.routes.values():
             if self._route_allowed(r):
                 self.allowed_route_ids.add(r.route_id)
@@ -258,7 +285,7 @@ class StaticGTFS:
         if not allowed_trips:
             raise RuntimeError("No trips for allowed routes.")
 
-        # 3) allowed parent stations from stop_times of allowed trips
+        # 3) parents touched by allowed trips (from stop_times)
         parents: Set[str] = set()
         with self._open_csv(os.path.dirname(self._stop_times_path), "stop_times.txt") as f:
             rdr = csv.DictReader(f)
@@ -269,15 +296,16 @@ class StaticGTFS:
                 sid = (row.get("stop_id") or "").strip()
                 if not sid:
                     continue
-                parent = self.parent_of(sid)  # uses stops map; if no parent, returns sid
+                parent = self.parent_of(sid)
                 parents.add(parent)
 
-        if not parents:
-            raise RuntimeError("No parent stations derived from allowed trips/stop_times.")
+        # 4) final filter: must be location_type=1 and pass the name sanity check
+        filtered_parents = {p for p in parents if self._is_station_parent(p)}
+        if not filtered_parents:
+            raise RuntimeError("No station parents after filtering; check GTFS source and filters.")
+        self.allowed_parent_ids = filtered_parents
 
-        self.allowed_parent_ids = parents
-
-        # Build canonical parent->name map for allowed parents only
+        # 5) canonical parent->name map for allowed parents only
         self.parent_to_name.clear()
         for s in self.stops.values():
             parent = s.parent_station or s.stop_id
@@ -305,7 +333,7 @@ class StaticGTFS:
         s = self.stops.get(stop_id)
         if s:
             return s.parent_station or s.stop_id
-        # degraded fallback: strip leading digits
+        # degraded fallback: strip digits if any
         digits = "".join(ch for ch in stop_id if ch.isdigit())
         return digits or stop_id
 
