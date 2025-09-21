@@ -1,10 +1,18 @@
 FROM python:3.11-slim
+
 WORKDIR /app
+
+# deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-# routes.txt and stops.txt must be in the image (same versions you use locally)
-COPY stops.txt routes.txt trips.txt stop_times.txt agency.txt /app/
+
+# copy code and static GTFS (folder)
 COPY app.py .
+COPY gtfs/ /app/gtfs/
+
+# tell the app where GTFS lives (matches app default, but explicit is nice)
+ENV GTFS_DIR=/app/gtfs
 ENV PYTHONUNBUFFERED=1
+
 EXPOSE 8000
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
