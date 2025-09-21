@@ -317,6 +317,43 @@ def require_allowed_pairs(stops: str,routes: str,trips: str,stop_times: str,agen
                 allowed_parents_for_fallback={sid for sid,row in stops_map.items()
                                               if (row.get("location_type") or "0").strip()=="1" and is_num_parent(sid)}
             pairs={(pid,rs) for pid in allowed_parents_for_fallback for rs in known}
+    # permissive fallback (generate station×line for known T*/M* shortnames)
+    if not pairs and os.getenv("MB_PERMISSIVE_PAIRS","1")!="0":
+        known = { (rs or "").upper().strip()
+                  for rs in rshort.values()
+                  if re.fullmatch(r"[TM]\d{1,2}", (rs or "").upper().strip()) }
+        # Also allow shortnames explicitly requested via env, even if missing from routes.txt
+        for rs_env in ROUTE_SHORT_ALLOW:
+            if re.fullmatch(r"[TM]\d{1,2}", rs_env):
+                known.add(rs_env)
+
+        if ROUTE_SHORT_ALLOW:
+            known &= {x.upper() for x in ROUTE_SHORT_ALLOW}
+
+        if known:
+            if not allowed_parents_for_fallback:
+                # limit parents to likely metro corridor when injecting M1
+                metro_names = {  # can also read from an env JSON if you prefer
+                    "Tallawong","Rouse Hill","Kellyville","Bella Vista","Norwest",
+                    "Hills Showground","Castle Hill","Cherrybrook",
+                    "Epping","Macquarie University","Macquarie Park","North Ryde",
+                    "Chatswood"
+                }
+                allowed_parents_for_fallback = {
+                    sid for sid,row in stops_map.items()
+                    if (row.get("location_type") or "0").strip()=="1"
+                    and is_num_parent(sid)
+                    and clean_name(row.get("stop_name","")) in metro_names
+                }
+                # if we failed to identify any metro parents, fall back to all
+                if not allowed_parents_for_fallback:
+                    allowed_parents_for_fallback = {
+                        sid for sid,row in stops_map.items()
+                        if (row.get("location_type") or "0").strip()=="1" and is_num_parent(sid)
+                    }
+
+            pairs = { (pid, rs) for pid in allowed_parents_for_fallback for rs in known }
+
     return pairs
 
 def route_suffix(rs:str)->str:
