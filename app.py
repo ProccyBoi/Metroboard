@@ -6,6 +6,7 @@ import asyncio
 import csv
 import logging
 import json
+import re
 from collections import defaultdict, Counter
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional, Set
@@ -377,13 +378,33 @@ def normalize_line_code(val: str) -> Optional[str]:
             return f"T{int(digits)}"
     return None
 
+_line_pat = re.compile(r'(?:\b|_)(T)(\d)(?:\b|_)', re.IGNORECASE)
 
-def route_short_from_ids(route_id: str, route_short: str) -> Optional[str]:
+def infer_line_code_from_text(*texts: str) -> Optional[str]:
     """
-    Choose a sensible short code from either the GTFS short name or the route_id
-    using overrides if present, then normalize to 'T#' or 'M'.
+    Look through arbitrary strings (route_id, trip_id, etc) and try to infer 'T#' or 'M'.
     """
-    # 1) start with routes.txt short_name if present
+    for t in texts:
+        if not t:
+            continue
+        s = t.upper()
+        # Metro
+        if "S_M1" in s or " METRO" in s or s.endswith("M1") or s == "M1" or s == "M":
+            return "M"
+        # T-lines (first match wins)
+        m = _line_pat.search(s)
+        if m:
+            return f"T{m.group(2)}"
+        # Also handle prefixes like 'S_T3_MAIN'
+        if s.startswith("S_T") and len(s) > 3 and s[3].isdigit():
+            return f"T{int(s[3])}"
+    return None
+
+def route_short_from_ids(route_id: str, route_short: str, trip_id: Optional[str] = None) -> Optional[str]:
+    """
+    Choose a sensible short code from GTFS short name / overrides / heuristics, normalized to 'T#' or 'M'.
+    """
+    # 1) start from routes.txt short_name if present
     cand = (route_short or "").strip()
 
     # 2) overlay env overrides by exact route_id
@@ -394,7 +415,13 @@ def route_short_from_ids(route_id: str, route_short: str) -> Optional[str]:
     if not cand and route_id:
         cand = route_id
 
-    return normalize_line_code(cand)
+    short = normalize_line_code(cand)
+
+    # 4) last-resort: regex through route_id/trip_id for embedded T#/M patterns
+    if not short:
+        short = infer_line_code_from_text(route_id, trip_id)
+
+    return short
 
 
 
@@ -454,21 +481,17 @@ def build_train_obs(gtfs: StaticGTFS, pairs: List[Tuple[str, str]], upcoming: Di
     for trip_id, route_id in pairs:
         r = gtfs.routes.get(route_id)
         short_raw = r.short if r else ""
-        short = route_short_from_ids(route_id, short_raw) or normalize_line_code(route_id)
+        short = route_short_from_ids(route_id, short_raw, trip_id=trip_id)
         stops = upcoming.get(trip_id, [])
-
         if not stops or not short:
             continue
-
         trains.append(TrainObs(
             trip_id=trip_id,
             route_id=route_id,
-            route_short=short,        # already normalized to 'T#' or 'M'
+            route_short=short,       # normalized: 'T#' or 'M'
             upcoming_stop_ids=stops
         ))
     return trains
-
-
 
 # -----------------------------
 # Background refresh loop
