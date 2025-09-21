@@ -1,1001 +1,378 @@
-# app.py — Metroboard backend (Rail + Metro, schedule-first + future-stop guard)
-# - Uses static GTFS (stops.txt, routes.txt, trips.txt, stop_times.txt, agency.txt)
-# - Filters to route_type in (1=subway/metro, 2=rail); optional agency allow-list
-# - Builds station×route keys like "Central1" (T1) and "CentralM" (M1)
-# - GTFS-RT from TfNSW: VehiclePositions + TripUpdates (v2 /gtfs/realtime/)
-# - Logic:
-#     1) Prefer TripUpdates (schedule) to determine current/next stop & status, fill route
-#     2) Join TU with VP by trip_id and/or vehicle.id to fill missing route on VP
-#     3) Fallback to geo distance thresholds, BUT only if the trip will actually visit that station (future-stop guard)
-# - Endpoints: /, /healthz, /debug, /stations, /states, /trains
-#
-# ENV (examples):
-#   TFNSW_API_TOKEN=...                 # required
-#   FEEDS=...                           # optional CSV of VehiclePositions feeds (default ST+Metro)
-#   FEEDS_TU=...                        # optional CSV overrides for TripUpdates; defaults to v2 realtime endpoints
-#   FEED_CACHE_SEC=3
-#   MB_D_SOLID=300  MB_D_NEAR=1000  MB_D_FAR=2000
-#   MB_FORCE_DISTANCE=0               # if 1, ignore VP.stop_id/TU schedule and always use geo
-#   MB_PREFER_TU=1                    # if 1, prefer TU schedule match over VP.stop_id
-#   MB_PERMISSIVE_PAIRS=1             # allow T*/M* × every parent fallback if strict pairing is empty
-#   MB_VERBOSE=1
-#   MB_AGENCIES="Sydney Trains,Sydney Metro"  # optional allow-list
-#   MB_ROUTE_SHORT_ALLOW="T1,...,M1"          # optional allow-list
-#   ROUTE_SHORT_OVERRIDES_JSON='{"S_T1_MAIN":"T1",...}'
-#   STATION_WHITELIST_PATH=stations_whitelist.txt
-#
-# Notes:
-# - Keep your static GTFS files next to this app.
-# - You MUST provide TFNSW API token via env.
-
+# app.py
 import os
-import time
+import asyncio
 import csv
-import json
-import re
-import random
-import typing as T
+import logging
+from collections import defaultdict, Counter
+from dataclasses import dataclass
+from typing import Dict, Tuple, List, Optional, Set
 
-import requests
+import httpx
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from google.transit import gtfs_realtime_pb2 as rt
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
-# ---------------- Config ----------------
-API_TOKEN = os.environ["TFNSW_API_TOKEN"]
+# -----------------------------
+# Config
+# -----------------------------
+TFNSW_API_KEY = os.getenv("TFNSW_API_KEY", "")
+GTFS_DIR = os.getenv("GTFS_DIR", "./gtfs")  # folder with routes.txt, trips.txt, stops.txt, stop_times.txt
+POLL_SECONDS = float(os.getenv("POLL_SECONDS", "15"))
 
-# VehiclePositions feeds
-_FEEDS_ENV = os.getenv("FEEDS", "").strip()
-if _FEEDS_ENV:
-    URLS_VP = [u.strip() for u in _FEEDS_ENV.split(",") if u.strip()]
-else:
-    URLS_VP = [
-        "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains",
-        "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/metro",
-    ]
+# NSW endpoints (Sydney Trains + Metro)
+ENDPOINTS = {
+    "vp_trains": "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains",
+    "tu_trains": "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains",
+    "vp_metro": "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/metro",
+    "tu_metro": "https://api.transport.nsw.gov.au/v2/gtfs/realtime/metro",
+}
 
-# TripUpdates feeds (v2 realtime). You can override with FEEDS_TU if TfNSW rotates URLs.
-_FEEDS_TU_ENV = os.getenv("FEEDS_TU", "").strip()
-if _FEEDS_TU_ENV:
-    URLS_TU = [u.strip() for u in _FEEDS_TU_ENV.split(",") if u.strip()]
-else:
-    URLS_TU = [
-        "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains",
-        "https://api.transport.nsw.gov.au/v2/gtfs/realtime/metro",
-    ]
+# -----------------------------
+# Logging
+# -----------------------------
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("metroboard")
 
-# Distance thresholds (meters) for fallback (tune via env)
-D_SOLID = int(os.getenv("MB_D_SOLID", "300"))
-D_NEAR  = int(os.getenv("MB_D_NEAR",  "1000"))
-D_FAR   = int(os.getenv("MB_D_FAR",   "2000"))
+# -----------------------------
+# Data models (minimal)
+# -----------------------------
+@dataclass(frozen=True)
+class Route:
+    route_id: str
+    short: str  # e.g. "T1", "T9", "M", etc.
 
-# Behavior flags
-MB_VERBOSE = os.getenv("MB_VERBOSE", "1") == "1"
-MB_FORCE_DISTANCE = os.getenv("MB_FORCE_DISTANCE", "0") == "1"
-MB_PREFER_TU = os.getenv("MB_PREFER_TU", "1") == "1"
+@dataclass(frozen=True)
+class Trip:
+    trip_id: str
+    route_id: str
 
-# Caching/CORS
-FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
-CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN")
+@dataclass(frozen=True)
+class Stop:
+    stop_id: str
+    name: str
+    parent_station: Optional[str]  # parent stop_id or None
 
-# BBox guardrail (None disables)
-DEFAULT_SYD_BBOX = (-34.2, 150.5, -33.4, 151.4)
-def _bbox_env() -> T.Optional[tuple[float, float, float, float]]:
-    if os.getenv("SYD_BBOX_DISABLE") == "1":
+@dataclass
+class TrainObs:
+    # an observation for a single train (from TU join)
+    trip_id: str
+    route_id: str
+    route_short: str  # "T1".."T9" or "M" etc.
+    upcoming_stop_ids: List[str]  # future stops (stop_ids) if available; fallback to current/next stop
+    # you can extend this with delay, position, etc.
+
+
+# -----------------------------
+# Static GTFS load
+# -----------------------------
+class StaticGTFS:
+    def __init__(self, gtfs_dir: str):
+        self.routes: Dict[str, Route] = {}
+        self.trips: Dict[str, Trip] = {}
+        self.stops: Dict[str, Stop] = {}
+
+        # reverse maps
+        self.stopname_to_parentid: Dict[str, str] = {}
+
+        self._load(gtfs_dir)
+        self._build_name_parent_index()
+
+    def _load(self, d: str):
+        # routes
+        with open(os.path.join(d, "routes.txt"), newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                rid = row["route_id"]
+                short = (row.get("route_short_name") or "").strip()
+                self.routes[rid] = Route(route_id=rid, short=short)
+
+        # trips
+        with open(os.path.join(d, "trips.txt"), newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                self.trips[row["trip_id"]] = Trip(trip_id=row["trip_id"], route_id=row["route_id"])
+
+        # stops
+        with open(os.path.join(d, "stops.txt"), newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                parent = row.get("parent_station") or None
+                self.stops[row["stop_id"]] = Stop(
+                    stop_id=row["stop_id"],
+                    name=(row.get("stop_name") or "").strip(),
+                    parent_station=parent if parent and parent != "" else None,
+                )
+
+    def _build_name_parent_index(self):
+        # Map a display name (e.g. "Central") → a canonical parent_station_id
+        # Preference: a stop that is a parent itself; otherwise the parent of children.
+        name_to_parent_candidates: Dict[str, Set[str]] = defaultdict(set)
+        for s in self.stops.values():
+            parent = s.parent_station or s.stop_id
+            name_to_parent_candidates[s.name].add(parent)
+
+        for name, parents in name_to_parent_candidates.items():
+            # Choose deterministically: smallest string id works fine for stability
+            parent_id = sorted(parents)[0]
+            self.stopname_to_parentid[name] = parent_id
+
+    def parent_of(self, stop_id: str) -> str:
+        """Return the parent station_id (or itself if none)."""
+        s = self.stops.get(stop_id)
+        if not s:
+            return stop_id
+        return s.parent_station or s.stop_id
+
+    def parent_by_name(self, name: str) -> Optional[str]:
+        return self.stopname_to_parentid.get(name)
+
+
+# -----------------------------
+# Live state cache
+# -----------------------------
+class LiveState:
+    def __init__(self, gtfs: StaticGTFS):
+        self.gtfs = gtfs
+        self.trains: List[TrainObs] = []  # refreshed periodically
+
+    def set_trains(self, trains: List[TrainObs]):
+        self.trains = trains
+
+    @staticmethod
+    def _suffix_to_line_code(suffix: str) -> Optional[str]:
+        # "1" -> "T1", ..., "9" -> "T9"; "M" -> "M"
+        suffix = suffix.strip()
+        if suffix.upper() == "M":
+            return "M"
+        if suffix.isdigit():
+            return f"T{suffix}"
+        # optionally support "T8" directly
+        if suffix.upper().startswith("T") and suffix[1:].isdigit():
+            return suffix.upper()
         return None
-    s = os.getenv("SYD_BBOX")
-    if not s:
-        return DEFAULT_SYD_BBOX
-    try:
-        a, b, c, d = [float(x) for x in s.split(",")]
-        return (a, b, c, d)
-    except Exception:
-        return DEFAULT_SYD_BBOX
 
-SYD_BBOX = _bbox_env()
+    def _parse_only_token(self, token: str) -> Optional[Tuple[str, str]]:
+        """
+        "Central9" -> (parent_station_id_for("Central"), "T9")
+        "CentralM" -> (parent_station_id_for("Central"), "M")
+        Also supports "Central (12345)9" forms, where name may carry a code in parentheses.
+        """
+        token = token.strip()
+        if not token:
+            return None
 
-# Allowlists (empty=set() means all)
-AGENCY_NAME_ALLOW: set[str] = {a.strip() for a in os.getenv("MB_AGENCIES", "").split(",") if a.strip()}
-ROUTE_SHORT_ALLOW: set[str] = {s.strip().upper() for s in os.getenv("MB_ROUTE_SHORT_ALLOW", "").split(",") if s.strip()}
+        # split trailing line suffix (digits or 'M')
+        # find the last contiguous [0-9M]+ at end
+        i = len(token) - 1
+        while i >= 0 and (token[i].isdigit() or token[i].upper() == "M"):
+            i -= 1
+        name_part = token[: i + 1].strip()
+        suffix_part = token[i + 1 :].strip()
 
-# Route short-name overrides
-ROUTE_SHORT_OVERRIDES_PATH = os.getenv("ROUTE_SHORT_OVERRIDES_PATH", "route_overrides.csv")
-ROUTE_SHORT_OVERRIDES_JSON = os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "")
+        line_code = self._suffix_to_line_code(suffix_part)
+        if not line_code:
+            return None
 
-EXCLUDE_SUB = ("wharf", "light rail", "b-line", "interchange", "motorway", " m2")
-SHORT_RE = re.compile(r"\b([TM]\d{1,2})\b", re.I)
+        # strip any trailing station code in parentheses from the name when resolving
+        # e.g. "Central (200060)" → "Central"
+        display_name = name_part
+        if "(" in name_part and name_part.endswith(")"):
+            display_name = name_part[: name_part.rfind("(")].strip()
 
-def vlog(*a):
-    if MB_VERBOSE:
-        print("[metroboard]", *a)
+        parent = self.gtfs.parent_by_name(display_name)
+        if not parent:
+            return None
 
-# ---------------- HTTP session ----------------
-def _session() -> requests.Session:
-    s = requests.Session()
-    retry = Retry(
-        total=4,
-        backoff_factor=0.6,
-        status_forcelist=(500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
-        raise_on_status=False,
-    )
-    s.mount("https://", HTTPAdapter(max_retries=retry))
-    return s
+        return (parent, line_code)
 
-# ---------------- Geo helpers ----------------
-def _valid_ll(x: float, y: float) -> bool:
-    try:
-        x = float(x); y = float(y)
-    except Exception:
-        return False
-    return -90 <= x <= 90 and -180 <= y <= 180
+    def counts_for_tokens(self, tokens: List[str]) -> Dict[str, int]:
+        """
+        For each token like "Central9" compute number of trains whose
+        (parent_station, line_code) matches, based on *train.route_short*.
+        """
+        # bucket trains by (parent, line_code)
+        bucket_counts: Counter[Tuple[str, str]] = Counter()
 
-def hav_m(a: float, b: float, c: float, d: float) -> float:
-    try:
-        a = float(a); b = float(b); c = float(c); d = float(d)
-    except Exception:
-        return float("inf")
-    if not (_valid_ll(a, b) and _valid_ll(c, d)):
-        return float("inf")
-    from math import radians, sin, cos, asin, sqrt
-    R = 6371000.0
-    da = radians(c - a)
-    db = radians(d - b)
-    t = sin(da / 2) ** 2 + cos(radians(a)) * cos(radians(c)) * sin(db / 2) ** 2
-    return 2 * R * asin(sqrt(max(0.0, min(1.0, t))))
-
-def within_bbox(lat: float, lon: float, bbox: tuple[float, float, float, float]) -> bool:
-    S, W, N, E = bbox
-    return (S <= lat <= N) and (W <= lon <= E)
-
-# ---------------- Name/ID helpers ----------------
-def is_num_parent(s: str) -> bool:
-    return s.isdigit()
-
-def clean_name(n: str) -> str:
-    n = (n or "").strip()
-    for suf in (" Station", " Railway Station"):
-        if n.endswith(suf):
-            n = n[: -len(suf)]
-    return n
-
-def _is_stationish(n: str) -> bool:
-    n = (n or "").strip().lower()
-    if any(s in n for s in EXCLUDE_SUB):
-        return False
-    return n.endswith(" station") or n.endswith(" railway station")
-
-def status_from_dist(m: T.Optional[float]) -> int:
-    if m is None:
-        return 0
-    if m <= D_SOLID:
-        return 3  # solid/stopped
-    if m <= D_NEAR:
-        return 2  # approaching/medium
-    if m <= D_FAR:
-        return 1  # in area/dim
-    return 0
-
-# ---------------- Whitelist ----------------
-def load_whitelist(path: str) -> tuple[set[str], set[str]]:
-    sid_w: set[str] = set()
-    name_w: set[str] = set()
-    if not path or not os.path.exists(path):
-        return sid_w, name_w
-    with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.split("#", 1)[0].strip()
+        for t in self.trains:
+            line = normalize_line_code(t.route_short)
             if not line:
                 continue
-            token = line.split(",", 1)[0].strip()
-            if token.isdigit():
-                sid_w.add(token)
+            # parentize all upcoming stops (first N to avoid explosion)
+            seen: Set[Tuple[str, str]] = set()
+            for sid in t.upcoming_stop_ids[:40]:
+                parent = self.gtfs.parent_of(sid)
+                key = (parent, line)
+                if key not in seen:
+                    bucket_counts[key] += 1
+                    seen.add(key)
+
+        # answer
+        out: Dict[str, int] = {}
+        for tok in tokens:
+            parsed = self._parse_only_token(tok)
+            if not parsed:
+                out[tok] = 0
             else:
-                name_w.add(clean_name(token).lower())
-    return sid_w, name_w
+                out[tok] = bucket_counts.get(parsed, 0)
+        return out
 
-# ---------------- Routes / overrides ----------------
-def derive_route_short(route_short_name: str | None, route_long_name: str | None) -> str:
-    rs = (route_short_name or "").strip()
-    if rs:
-        return rs.upper()
-    rl = (route_long_name or "").strip()
-    if rl:
-        m = SHORT_RE.search(rl)
-        if m:
-            return m.group(1).upper()
-    return ""
 
-def load_route_overrides(path: str, env_json: str) -> dict[str, str]:
-    out: dict[str, str] = {}
-    # CSV file
-    try:
-        if path and os.path.exists(path):
-            with open(path, newline="", encoding="utf-8-sig") as f:
-                for row in csv.DictReader(f):
-                    rid = (row.get("route_id") or "").strip()
-                    rs = (row.get("route_short_name") or "").strip().upper()
-                    if rid and rs:
-                        out[rid] = rs
-            vlog(f"route_overrides: loaded {len(out)} from file")
-    except Exception as e:
-        vlog(f"WARN: override file: {e}")
-    # Env JSON
-    if env_json:
-        try:
-            obj = json.loads(env_json)
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    k = (k or "").strip()
-                    v = (v or "").strip().upper()
-                    if k and v:
-                        out[k] = v
-            vlog("route_overrides: merged env JSON")
-        except Exception as e:
-            vlog(f"WARN: override env: {e}")
-    return out
-
-def load_route_shortnames(routes_path: str = "routes.txt") -> dict[str, str]:
-    ov = load_route_overrides(ROUTE_SHORT_OVERRIDES_PATH, ROUTE_SHORT_OVERRIDES_JSON)
-    out: dict[str, str] = {}
-    with open(routes_path, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            rid = (r.get("route_id") or "").strip()
-            if not rid:
-                continue
-            rs = ov.get(rid) or derive_route_short(r.get("route_short_name"), r.get("route_long_name"))
-            if rs:
-                out[rid] = rs
-    vlog(f"route_short: {len(out)} (ov={len(ov)})")
-    return out
-
-# ---------------- Static GTFS: allowed parents/pairs ----------------
-def require_allowed_parents(
-    stops="stops.txt",
-    routes="routes.txt",
-    trips="trips.txt",
-    stop_times="stop_times.txt",
-    agency="agency.txt",
-    types=(1, 2),
-    agencies_allowed: set[str] = AGENCY_NAME_ALLOW,
-    route_short_allow: set[str] = ROUTE_SHORT_ALLOW,
-) -> set[str]:
-    missing = [p for p in (stops, routes, trips, stop_times, agency) if not os.path.exists(p)]
-    if missing:
-        raise RuntimeError("Missing GTFS: " + ", ".join(missing))
-
-    ag_name: dict[str, str] = {}
-    with open(agency, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            ag_name[(r.get("agency_id") or "").strip()] = (r.get("agency_name") or "").strip()
-
-    route_meta: dict[str, tuple[int, str, str]] = {}
-    with open(routes, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            rid = (r.get("route_id") or "").strip()
-            try:
-                rtype = int((r.get("route_type") or "3").strip() or "3")
-            except Exception:
-                rtype = 3
-            rshort = (r.get("route_short_name") or "").strip()
-            agid = (r.get("agency_id") or "").strip()
-            route_meta[rid] = (rtype, rshort, ag_name.get(agid, ""))
-
-    trip_route: dict[str, str] = {}
-    with open(trips, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            trip_route[(r.get("trip_id") or "").strip()] = (r.get("route_id") or "").strip()
-
-    stops_map: dict[str, dict] = {}
-    parents: set[str] = set()
-    with open(stops, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            sid = (r.get("stop_id") or "").strip()
-            stops_map[sid] = r
-            if (r.get("location_type") or "0").strip() == "1":
-                parents.add(sid)
-
-    def parent_of(sid: str) -> T.Optional[str]:
-        row = stops_map.get(sid)
-        if not row:
-            return None
-        p = (row.get("parent_station") or "").strip()
-        if p:
-            return p
-        return sid if sid in parents else None
-
-    allowed: set[str] = set()
-    seen_types, seen_ag = set(), set()
-    with open(stop_times, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            rid = trip_route.get((r.get("trip_id") or "").strip(), "")
-            rtype, rshort, ag = route_meta.get(rid, (None, "", ""))
-            if rtype is None:
-                continue
-            seen_types.add(rtype); seen_ag.add(ag)
-            if types and rtype not in types:
-                continue
-            if agencies_allowed and ag not in agencies_allowed:
-                continue
-            if route_short_allow and rshort and rshort.upper() not in route_short_allow:
-                continue
-            p = parent_of((r.get("stop_id") or "").strip())
-            if p and is_num_parent(p):
-                allowed.add(p)
-
-    vlog("routes types seen", sorted(seen_types), "agencies", sorted(seen_ag))
-    if allowed:
-        vlog(f"parents by trips: {len(allowed)}")
-        return allowed
-
-    # fallback: names
-    fb: set[str] = set()
-    with open(stops, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            if (r.get("location_type") or "0").strip() != "1":
-                continue
-            pid = (r.get("stop_id") or "").strip()
-            if not is_num_parent(pid):
-                continue
-            if _is_stationish((r.get("stop_name") or "")):
-                fb.add(pid)
-    if not fb:
-        raise RuntimeError("No parent stations via fallback.")
-    vlog(f"parents by names: {len(fb)}")
-    return fb
-
-def _known_tm(route_id_to_short: dict[str, str]) -> set[str]:
-    out: set[str] = set()
-    for rs in route_id_to_short.values():
-        u = (rs or "").upper().strip()
-        if re.fullmatch(r"[TM]\d{1,2}", u):
-            out.add(u)
-    return out
-
-def require_allowed_pairs(
-    stops="stops.txt",
-    routes="routes.txt",
-    trips="trips.txt",
-    stop_times="stop_times.txt",
-    agency="agency.txt",
-    types=(1, 2),
-    agencies_allowed: set[str] = AGENCY_NAME_ALLOW,
-    route_short_allow: set[str] = ROUTE_SHORT_ALLOW,
-    allowed_parents_for_fallback: T.Optional[set[str]] = None,
-) -> set[tuple[str, str]]:
-    ag_name: dict[str, str] = {}
-    with open(agency, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            ag_name[(r.get("agency_id") or "").strip()] = (r.get("agency_name") or "").strip()
-
-    rt_meta: dict[str, tuple[int, str, str]] = {}
-    with open(routes, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            rid = (r.get("route_id") or "").strip()
-            try:
-                rtype = int((r.get("route_type") or "3").strip() or "3")
-            except Exception:
-                rtype = 3
-            agid = (r.get("agency_id") or "").strip()
-            ag = ag_name.get(agid, "")
-            rlong = (r.get("route_long_name") or "").strip()
-            rt_meta[rid] = (rtype, ag, rlong)
-
-    trip_route: dict[str, str] = {}
-    with open(trips, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            trip_route[(r.get("trip_id") or "").strip()] = (r.get("route_id") or "").strip()
-
-    stops_map: dict[str, dict] = {}
-    parents: set[str] = set()
-    with open(stops, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            sid = (r.get("stop_id") or "").strip()
-            stops_map[sid] = r
-            if (r.get("location_type") or "0").strip() == "1":
-                parents.add(sid)
-
-    def parent_of(sid: str) -> T.Optional[str]:
-        row = stops_map.get(sid)
-        if not row:
-            return None
-        p = (row.get("parent_station") or "").strip()
-        if p:
-            return p
-        return sid if sid in parents else None
-
-    route_id_to_short = load_route_shortnames(routes)
-
-    pairs: set[tuple[str, str]] = set()
-    with open(stop_times, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            rid = trip_route.get((r.get("trip_id") or "").strip(), "")
-            rtype, ag, _ = rt_meta.get(rid, (None, "", ""))
-            if rtype is None:
-                continue
-            if types and rtype not in types:
-                continue
-            if agencies_allowed and ag not in agencies_allowed:
-                continue
-            rshort = (route_id_to_short.get(rid, "") or "").upper()
-            if not rshort:
-                continue
-            if route_short_allow and rshort not in route_short_allow:
-                continue
-            p = parent_of((r.get("stop_id") or "").strip())
-            if p and is_num_parent(p):
-                pairs.add((p, rshort))
-
-    if pairs:
-        vlog(f"pairs strict: {len(pairs)}")
-        return pairs
-
-    # permissive fallback
-    if os.getenv("MB_PERMISSIVE_PAIRS", "1") != "0":
-        known = _known_tm(route_id_to_short)
-        if route_short_allow:
-            known &= {x.upper() for x in route_short_allow}
-        if not known:
-            vlog("WARN: no T*/M* for fallback")
-            return set()
-        if not allowed_parents_for_fallback:
-            allowed_parents_for_fallback = {
-                sid for sid, row in stops_map.items()
-                if (row.get("location_type") or "0").strip() == "1" and is_num_parent(sid)
-            }
-        fan = {(pid, rs) for pid in allowed_parents_for_fallback for rs in known}
-        vlog(f"pairs fallback: {len(fan)}")
-        return fan
-
-    raise RuntimeError("No station×route pairs; supply overrides or enable fallback.")
-
-# ---------------- Station index ----------------
-def route_suffix(rs: str) -> str:
-    rs = (rs or "").upper()
-    if rs.startswith("T") and len(rs) >= 2:
-        return rs[1:]
-    if rs.startswith("M"):
+# -----------------------------
+# Helpers
+# -----------------------------
+def normalize_line_code(short_name: str) -> Optional[str]:
+    """
+    Normalize route_short_name into "T1".."T9" or "M".
+    """
+    if not short_name:
+        return None
+    s = short_name.strip().upper()
+    if s == "M":
         return "M"
-    return rs or "?"
+    if s.startswith("T") and s[1:].isdigit():
+        return s
+    # Some feeds might use just digits for T lines
+    if s.isdigit():
+        return f"T{s}"
+    return None
 
-def load_station_index(
-    stops="stops.txt",
-    bbox: T.Optional[tuple[float, float, float, float]] = SYD_BBOX,
-    sid_whitelist: set[str] = set(),
-    name_whitelist: set[str] = set(),
-    allowed_parents: T.Optional[set[str]] = None,
-    allowed_pairs: T.Optional[set[tuple[str, str]]] = None,
-) -> dict[str, dict]:
-    if allowed_parents is None or allowed_pairs is None:
-        raise RuntimeError("allowed_parents and allowed_pairs are required")
 
-    parents: dict[str, dict] = {}
-    kids: dict[str, list[tuple[float, float]]] = {}
+# -----------------------------
+# Realtime fetch/join (minimal viable)
+# -----------------------------
+async def fetch_json(client: httpx.AsyncClient, url: str) -> dict:
+    headers = {"Authorization": f"apikey {TFNSW_API_KEY}"} if TFNSW_API_KEY else {}
+    r = await client.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    try:
+        return r.json()
+    except Exception:
+        return {}
 
-    with open(stops, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            lt = (r.get("location_type") or "0").strip()
-            sid = (r.get("stop_id") or "").strip()
-            parent = (r.get("parent_station") or "").strip()
-            name_raw = (r.get("stop_name") or "").strip()
-            lat_s, lon_s = r.get("stop_lat"), r.get("stop_lon")
-            lat = float(lat_s) if lat_s else None
-            lon = float(lon_s) if lon_s else None
-
-            if lt == "1":
-                if is_num_parent(sid) and sid in allowed_parents and not any(x in name_raw.lower() for x in EXCLUDE_SUB):
-                    parents[sid] = {"name": name_raw, "lat": lat, "lon": lon}
-            else:
-                if parent and lat is not None and lon is not None:
-                    if (bbox is None) or within_bbox(lat, lon, bbox):
-                        kids.setdefault(parent, []).append((lat, lon))
-
-    by_parent: dict[str, set[str]] = {}
-    for pid, rs in allowed_pairs:
-        by_parent.setdefault(pid, set()).add(rs)
-
-    idx: dict[str, dict] = {}
-    for pid, meta in parents.items():
-        base = clean_name(meta["name"])
-        lat, lon = meta["lat"], meta["lon"]
-        if (lat is None or lon is None) and pid in kids and kids[pid]:
-            lat = sum(t[0] for t in kids[pid]) / len(kids[pid])
-            lon = sum(t[1] for t in kids[pid]) / len(kids[pid])
-        if lat is None or lon is None:
+def join_tu_with_static(gtfs: StaticGTFS, tu_feed: dict, which: str) -> List[Tuple[str, str]]:
+    """
+    Return list of (trip_id, route_id) visible in TU feed.
+    This is deliberately simplified; adapt to your TU schema.
+    """
+    out = []
+    # TU is protobuf in reality; NSW API returns JSON wrapper.
+    # Expect structure like: { "entity": [ { "trip_update": { "trip": { "trip_id": "...", "route_id": "..." }, ... } } ] }
+    for ent in tu_feed.get("entity", []):
+        tu = ent.get("trip_update")
+        if not tu:
             continue
-        if (sid_whitelist or name_whitelist):
-            if not (pid in sid_whitelist or base.lower() in name_whitelist):
-                continue
-        if SYD_BBOX is not None and not within_bbox(lat, lon, SYD_BBOX) and pid not in kids:
-            continue
-
-        for rs in sorted(by_parent.get(pid, set())):
-            suf = route_suffix(rs)
-            key = f"{base}{suf}"
-            if key in idx:
-                key = f"{base}{suf} ({pid})"
-            idx[key] = {"stop_id": pid, "name": key, "lat": lat, "lon": lon, "route_short": rs, "base_name": base}
-
-    return idx
-
-# ---------------- Child→Parent map ----------------
-def build_child_to_parent(stops="stops.txt") -> dict[str, str]:
-    out: dict[str, str] = {}
-    with open(stops, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            sid = (r.get("stop_id") or "").strip()
-            pid = (r.get("parent_station") or "").strip()
-            lt = (r.get("location_type") or "0").strip()
-            if sid and pid and is_num_parent(pid):
-                out[sid] = pid
-            if sid and lt == "1" and is_num_parent(sid):
-                out.setdefault(sid, sid)
-    vlog(f"child→parent: {len(out)}")
+        trip = tu.get("trip", {})
+        trip_id = trip.get("trip_id")
+        route_id = trip.get("route_id")
+        # if route_id is missing, get from static trips
+        if not route_id and trip_id and trip_id in gtfs.trips:
+            route_id = gtfs.trips[trip_id].route_id
+        if trip_id and route_id:
+            out.append((trip_id, route_id))
+    log.info("[metroboard] collect_trips %s kept=%d", which, len(out))
     return out
 
-# ---------------- Static GTFS: trips ----------------
-TRIP_TO_ROUTEID: dict[str, str] = {}
-
-def load_trip_to_routeid(trips_path: str = "trips.txt") -> dict[str, str]:
-    out: dict[str, str] = {}
-    with open(trips_path, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            tid = (r.get("trip_id") or "").strip()
-            rid = (r.get("route_id") or "").strip()
-            if tid and rid:
-                out[tid] = rid
-    vlog(f"trip->route: {len(out)}")
-    return out
-
-# ---------------- GTFS-RT fetchers ----------------
-_FEED_CACHE_VP: T.Optional[rt.FeedMessage] = None
-_FEED_TS_VP = 0.0
-_FEED_CACHE_TU: T.Optional[rt.FeedMessage] = None
-_FEED_TS_TU = 0.0
-
-def _fetch_gtfsrt(urls: list[str]) -> rt.FeedMessage:
-    hdr = {
-        "Authorization": f"apikey {API_TOKEN}",
-        "Accept": "application/x-protobuf",
-        "Cache-Control": "no-cache",
-        "User-Agent": "metroboard/1.0",
-    }
-    s = _session()
-    time.sleep(random.uniform(0, 0.25))  # small jitter
-
-    merged = rt.FeedMessage()
-    merged.header.gtfs_realtime_version = "2.0"
-    for url in urls:
-        try:
-            r = s.get(url, headers=hdr, timeout=20)
-            r.raise_for_status()
-            msg = rt.FeedMessage()
-            msg.ParseFromString(r.content)
-            merged.entity.extend(msg.entity)
-            if "vehiclepos" in url:
-                veh = sum(1 for e in msg.entity if e.HasField("vehicle"))
-                vlog(f"fetched VP {url}: vehicles={veh}")
-            else:
-                ups = sum(1 for e in msg.entity if e.HasField("trip_update"))
-                vlog(f"fetched TU {url}: updates={ups}")
-        except Exception as e:
-            vlog("WARN fetch", url, e)
-    return merged
-
-def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
-    global _FEED_CACHE_VP, _FEED_TS_VP
-    now = time.time()
-    if _FEED_CACHE_VP is not None and (now - _FEED_TS_VP) < FEED_CACHE_SEC:
-        return _FEED_CACHE_VP, (now - _FEED_TS_VP)
-    _FEED_CACHE_VP = _fetch_gtfsrt(URLS_VP)
-    _FEED_TS_VP = now
-    return _FEED_CACHE_VP, 0.0
-
-def fetch_tu_cached() -> tuple[rt.FeedMessage, float]:
-    global _FEED_CACHE_TU, _FEED_TS_TU
-    now = time.time()
-    if _FEED_CACHE_TU is not None and (now - _FEED_TS_TU) < FEED_CACHE_SEC:
-        return _FEED_CACHE_TU, (now - _FEED_TS_TU)
-    _FEED_CACHE_TU = _fetch_gtfsrt(URLS_TU)
-    _FEED_TS_TU = now
-    return _FEED_CACHE_TU, 0.0
-
-# ---------------- TripUpdates indexing ----------------
-def index_trip_updates(feed: rt.FeedMessage) -> tuple[dict[str, str], set[str]]:
-    """Return (vehicleId->tripId, activeTripIds)."""
-    by_vehicle: dict[str, str] = {}
-    active_trips: set[str] = set()
-    for e in feed.entity:
-        if not e.HasField("trip_update"):
-            continue
-        tu = e.trip_update
-        tid = tu.trip.trip_id if tu.trip.HasField("trip_id") else ""
-        if tid:
-            active_trips.add(tid)
-        if tu.HasField("vehicle") and tu.vehicle.HasField("id") and tid:
-            by_vehicle[tu.vehicle.id] = tid
-    return by_vehicle, active_trips
-
-def build_trip_next_stop(feed: rt.FeedMessage) -> dict[str, tuple[str, int]]:
+def extract_upcoming_stops_from_tu(tu_feed: dict) -> Dict[str, List[str]]:
     """
-    For each trip_id in TU, select a 'current/next' stop_id with an approximate
-    status compatible with VP's VehicleStopStatus:
-      STOPPED_AT (1) if within ~[-60,+30]s of a timing point,
-      INCOMING_AT (0) if near-term window,
-      otherwise IN_TRANSIT_TO (2).
-    Returns: trip_id -> (child_stop_id, status)
+    Map trip_id -> ordered list of upcoming stop_ids.
     """
-    out: dict[str, tuple[str, int]] = {}
-    now = int(time.time())
-
-    for e in feed.entity:
-        if not e.HasField("trip_update"):
+    trip_to_stops: Dict[str, List[str]] = {}
+    for ent in tu_feed.get("entity", []):
+        tu = ent.get("trip_update")
+        if not tu:
             continue
-        tu = e.trip_update
-        tid = tu.trip.trip_id if tu.trip.HasField("trip_id") else ""
-        if not tid or not tu.stop_time_update:
+        trip = tu.get("trip", {})
+        trip_id = trip.get("trip_id")
+        if not trip_id:
             continue
+        stops = []
+        for stu in tu.get("stop_time_update", []):
+            sid = stu.get("stop_id")
+            if sid:
+                stops.append(sid)
+        if stops:
+            trip_to_stops[trip_id] = stops
+    return trip_to_stops
 
-        best = None  # (score, stop_id, status)
-        for stu in tu.stop_time_update:
-            sid = stu.stop_id
-            if not sid:
-                continue
-            arr_t = stu.arrival.time if stu.HasField("arrival") and hasattr(stu.arrival, "time") else None
-            dep_t = stu.departure.time if stu.HasField("departure") and hasattr(stu.departure, "time") else None
-
-            status = rt.VehiclePosition.IN_TRANSIT_TO
-            t_ref = arr_t or dep_t
-            if t_ref:
-                dt = t_ref - now
-                if -60 <= dt <= 30:
-                    status = rt.VehiclePosition.STOPPED_AT
-                elif -240 <= dt <= 180:
-                    status = rt.VehiclePosition.INCOMING_AT
-                score = abs(dt)
-            else:
-                score = 1_000_000
-
-            if best is None or score < best[0]:
-                best = (score, sid, status)
-
-        if best:
-            out[tid] = (best[1], best[2])
-    return out
-
-def build_trip_future_parents(feed: rt.FeedMessage, child_to_parent: dict[str, str]) -> dict[str, set[str]]:
-    """
-    For each trip_id, collect the set of parent_station ids the trip still has ahead
-    (including current/next), based on stop_time_update sequence. Used to gate
-    distance fallback so we don't light stations the trip will never serve.
-    """
-    out: dict[str, set[str]] = {}
-    now = int(time.time())
-    for e in feed.entity:
-        if not e.HasField("trip_update"):
+def build_train_obs(gtfs: StaticGTFS, pairs: List[Tuple[str, str]], upcoming: Dict[str, List[str]]) -> List[TrainObs]:
+    trains: List[TrainObs] = []
+    for trip_id, route_id in pairs:
+        route = gtfs.routes.get(route_id)
+        short = route.short if route else ""
+        stops = upcoming.get(trip_id, [])
+        if not stops:
+            # Fallback: if no TU stop list, we can’t bucket well. Skip or keep empty list.
             continue
-        tu = e.trip_update
-        tid = tu.trip.trip_id if tu.trip.HasField("trip_id") else ""
-        if not tid:
-            continue
-        parents: set[str] = set()
-        for stu in tu.stop_time_update:
-            sid = stu.stop_id
-            if not sid:
-                continue
-            arr_t = stu.arrival.time if stu.HasField("arrival") and hasattr(stu.arrival, "time") else None
-            dep_t = stu.departure.time if stu.HasField("departure") and hasattr(stu.departure, "time") else None
-            t_ref = dep_t or arr_t
-            if t_ref is not None and t_ref < (now - 90):  # already departed >90s ago
-                continue
-            parent = child_to_parent.get(sid) or (sid if sid.isdigit() else None)
-            if parent:
-                parents.add(parent)
-        if parents:
-            out[tid] = parents
-    return out
+        trains.append(TrainObs(trip_id=trip_id, route_id=route_id, route_short=short, upcoming_stop_ids=stops))
+    return trains
 
-# ---------------- Collect trains (with TU join) ----------------
-def collect_trains(
-    feed: rt.FeedMessage,
-    route_id_to_short: dict[str, str],
-    trip_to_routeid: dict[str, str],
-    tu_by_vehicle: dict[str, str],
-) -> tuple[
-    list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int, T.Optional[str], T.Optional[str]]],
-    dict[str, int],
-]:
-    """
-    Return:
-      [
-        (lat, lon, route_short_or_None, child_stop_id, status, trip_id, vehicle_id)
-      ],
-      plus counts by route_short.
-    """
-    trains = []
-    by_route: dict[str, int] = {}
+async def refresh_loop(state: LiveState):
+    if not TFNSW_API_KEY:
+        log.warning("TFNSW_API_KEY not set; realtime fetch will fail.")
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                # Fetch both Sydney Trains + Metro TU
+                tu_trains = await fetch_json(client, ENDPOINTS["tu_trains"])
+                tu_metro = await fetch_json(client, ENDPOINTS["tu_metro"])
 
-    for e in feed.entity:
-        if not e.HasField("vehicle"):
-            continue
-        v = e.vehicle
+                # Join TU with static
+                pairs_trains = join_tu_with_static(state.gtfs, tu_trains, "trains")
+                pairs_metro = join_tu_with_static(state.gtfs, tu_metro, "metro")
 
-        # lat/lon/stop/status
-        sid = getattr(v, "stop_id", "")
-        st  = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
-        lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
-        lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
+                # Upcoming stop_ids
+                up_trains = extract_upcoming_stops_from_tu(tu_trains)
+                up_metro = extract_upcoming_stops_from_tu(tu_metro)
 
-        # trip/vehicle ids
-        tid = v.trip.trip_id if v.HasField("trip") and v.trip.HasField("trip_id") else None
-        vid = v.vehicle.id if v.HasField("vehicle") and v.vehicle.HasField("id") else None
+                trains_obs = build_train_obs(state.gtfs, pairs_trains, up_trains)
+                metro_obs = build_train_obs(state.gtfs, pairs_metro, up_metro)
 
-        # resolve route short code robustly
-        rs = None
-        rid = v.trip.route_id if v.HasField("trip") and v.trip.HasField("route_id") else ""
-        if rid:
-            rs = route_id_to_short.get(rid, None)
-        if not rs and tid:
-            rid2 = trip_to_routeid.get(tid, "")
-            rs = route_id_to_short.get(rid2, None)
-        if not rs and vid:
-            tid2 = tu_by_vehicle.get(vid, "")
-            if tid2:
-                rid3 = trip_to_routeid.get(tid2, "")
-                rs = route_id_to_short.get(rid3, None)
+                all_obs = trains_obs + metro_obs
+                state.set_trains(all_obs)
 
-        rs = (rs or "").upper() or None
-        if rs and ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW:
-            continue
+                log.info(
+                    "[metroboard] processing trains=%d stations=%d prefer_tu=True",
+                    len(all_obs),
+                    len(state.gtfs.stops),
+                )
+            except Exception as e:
+                log.exception("refresh_loop error: %s", e)
+            await asyncio.sleep(POLL_SECONDS)
 
-        trains.append((lat, lon, rs, sid, st, tid, vid))
-        if rs:
-            by_route[rs] = by_route.get(rs, 0) + 1
 
-    vlog(f"collect_trains (with TU join) kept={len(trains)}")
-    return trains, by_route
+# -----------------------------
+# FastAPI
+# -----------------------------
+gtfs = StaticGTFS(GTFS_DIR)
+state = LiveState(gtfs)
 
-# ---------------- FastAPI app ----------------
-app = FastAPI()
-
-if CORS_ALLOW_ORIGIN:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=[o.strip() for o in CORS_ALLOW_ORIGIN.split(",")],
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
-
-ROUTE_ID_TO_SHORT: dict[str, str] = {}
-STATION_INDEX: dict[str, dict] = {}
-CHILD_TO_PARENT: dict[str, str] = {}
+app = FastAPI(title="Metroboard (line-separated)")
 
 @app.on_event("startup")
-def _startup():
-    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, TRIP_TO_ROUTEID
-
-    ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
-    TRIP_TO_ROUTEID   = load_trip_to_routeid("trips.txt")
-
-    allowed_parents = require_allowed_parents(
-        stops="stops.txt",
-        routes="routes.txt",
-        trips="trips.txt",
-        stop_times="stop_times.txt",
-        agency="agency.txt",
-        types=(1, 2),
-        agencies_allowed=AGENCY_NAME_ALLOW,
-        route_short_allow=ROUTE_SHORT_ALLOW,
-    )
-
-    allowed_pairs = require_allowed_pairs(
-        stops="stops.txt",
-        routes="routes.txt",
-        trips="trips.txt",
-        stop_times="stop_times.txt",
-        agency="agency.txt",
-        types=(1, 2),
-        agencies_allowed=AGENCY_NAME_ALLOW,
-        route_short_allow=ROUTE_SHORT_ALLOW,
-        allowed_parents_for_fallback=allowed_parents,
-    )
-
-    wl_path = os.getenv("STATION_WHITELIST_PATH", "stations_whitelist.txt")
-    sid_w, name_w = load_whitelist(wl_path)
-
-    STATION_INDEX = load_station_index(
-        "stops.txt",
-        bbox=SYD_BBOX,
-        sid_whitelist=sid_w,
-        name_whitelist=name_w,
-        allowed_parents=allowed_parents,
-        allowed_pairs=allowed_pairs,
-    )
-
-    CHILD_TO_PARENT = build_child_to_parent("stops.txt")
-
-    if not STATION_INDEX:
-        raise RuntimeError("No stations after filtering")
-    vlog(f"stations loaded: {len(STATION_INDEX)}")
-
-@app.get("/")
-def root():
-    return {"ok": True, "endpoints": ["/states", "/stations", "/healthz", "/debug", "/trains"]}
+async def _startup():
+    asyncio.create_task(refresh_loop(state))
+    log.info("Application startup complete.")
 
 @app.get("/healthz")
-def healthz():
-    age_vp = None if _FEED_TS_VP == 0 else (time.time() - _FEED_TS_VP)
-    age_tu = None if _FEED_TS_TU == 0 else (time.time() - _FEED_TS_TU)
-    return {"status": "ok", "stations": len(STATION_INDEX), "trains_last_fetch_s": {"vp": age_vp, "tu": age_tu}}
-
-@app.get("/debug")
-def debug():
-    vp, _ = fetch_vp_cached()
-    tu, _ = fetch_tu_cached()
-    tu_by_vehicle, active_trips = index_trip_updates(tu)
-    trains, by_route = collect_trains(vp, ROUTE_ID_TO_SHORT, TRIP_TO_ROUTEID, tu_by_vehicle)
-    return {
-        "stations_count": len(STATION_INDEX),
-        "bbox": list(SYD_BBOX) if SYD_BBOX else None,
-        "allowed_routes": sorted(ROUTE_SHORT_ALLOW) if ROUTE_SHORT_ALLOW else "all",
-        "allowed_agencies": sorted(AGENCY_NAME_ALLOW) if AGENCY_NAME_ALLOW else "all",
-        "cache_sec": FEED_CACHE_SEC,
-        "feeds": {"vp": URLS_VP, "tu": URLS_TU},
-        "verbose_logs": MB_VERBOSE,
-        "force_distance_mode": MB_FORCE_DISTANCE,
-        "prefer_tu": MB_PREFER_TU,
-        "distance_thresholds": {"solid": D_SOLID, "near": D_NEAR, "far": D_FAR},
-        "current_trains": {
-            "total": len(trains),
-            "by_route": by_route,
-            "active_trip_updates": len(active_trips),
-            "sample": [
-                {
-                    "route": t[2],
-                    "lat": t[0],
-                    "lon": t[1],
-                    "stop_id": t[3],
-                    "status": t[4],
-                    "trip_id": t[5],
-                    "vehicle_id": t[6],
-                } for t in trains[:25]
-            ],
-        },
-        "sample_stations": list(STATION_INDEX.keys())[:10],
-    }
-
-@app.get("/trains")
-def trains():
-    """Debug endpoint to see raw train data (now with filled route + trip/vehicle ids)."""
-    vp, _ = fetch_vp_cached()
-    tu, _ = fetch_tu_cached()
-    tu_by_vehicle, _ = index_trip_updates(tu)
-    trains, _ = collect_trains(vp, ROUTE_ID_TO_SHORT, TRIP_TO_ROUTEID, tu_by_vehicle)
-
-    def status_name(st: int) -> str:
-        return {0: "INCOMING_AT", 1: "STOPPED_AT", 2: "IN_TRANSIT_TO"}.get(st, "?")
-
-    out = []
-    for (lat, lon, rs, sid, st, tid, vid) in trains[:50]:
-        out.append({
-            "route": rs,
-            "lat": lat,
-            "lon": lon,
-            "stop_id": sid,
-            "status": status_name(st),
-            "trip_id": tid,
-            "vehicle_id": vid,
-            "parent_station": CHILD_TO_PARENT.get(sid, sid) if sid else None,
-        })
-    age_vp = None if _FEED_TS_VP == 0 else (time.time() - _FEED_TS_VP)
-    age_tu = None if _FEED_TS_TU == 0 else (time.time() - _FEED_TS_TU)
-    return {"feed_age_seconds": {"vp": age_vp, "tu": age_tu}, "total_trains": len(trains), "sample_trains": out}
-
-@app.get("/stations")
-def stations():
-    # Sorted by name for stable UI
-    return JSONResponse([STATION_INDEX[k] for k in sorted(STATION_INDEX.keys())])
+async def health():
+    return {"ok": True, "trains_cached": len(state.trains)}
 
 @app.get("/states")
-def states(only: T.Optional[str] = Query(None, description="Comma-separated station names")):
-    subset = STATION_INDEX
-    if only:
-        wanted = [x.strip() for x in only.split(",") if x.strip()]
-        subset = {n: STATION_INDEX[n] for n in wanted if n in STATION_INDEX}
-        if not subset:
-            return JSONResponse({})
+async def get_states(only: Optional[str] = Query(default=None)):
+    """
+    /states?only=Central4,Hornsby1,St%20MarysM
+    Returns a dict { token: count }
+    """
+    if not only:
+        # If no filter is supplied, return counts for *all* parent/line combos we currently know.
+        # This avoids huge payloads by returning just a compact summary.
+        # Aggregate a light summary per parent name: { "Central1": 5, "Central2": 3, ... }
+        # For brevity, return empty unless explicitly requested:
+        all_counts: Dict[str, int] = {}
+        return JSONResponse(all_counts)
 
-    # Fetch both feeds/caches
-    vp, _ = fetch_vp_cached()
-    tu, _ = fetch_tu_cached()
+    tokens = [t for t in only.split(",") if t.strip()]
+    counts = state.counts_for_tokens(tokens)
+    return JSONResponse(counts)
 
-    # Build TU-based indices
-    tu_by_vehicle, _active_trips = index_trip_updates(tu)
-    trip_next = build_trip_next_stop(tu)                    # trip_id -> (child_stop_id, VP-like status)
-    trip_future = build_trip_future_parents(tu, CHILD_TO_PARENT)  # trip_id -> {future parent stations}
 
-    # Get trains with line filled in where possible
-    trains, _by_route = collect_trains(vp, ROUTE_ID_TO_SHORT, TRIP_TO_ROUTEID, tu_by_vehicle)
-
-    if MB_VERBOSE:
-        vlog(f"processing trains={len(trains)} stations={len(subset)} prefer_tu={MB_PREFER_TU} force_distance={MB_FORCE_DISTANCE}")
-
-    if not trains:
-        return JSONResponse({k: 0 for k in subset.keys()})
-
-    # Group trains by route (rs bucket + None)
-    grouped: dict[T.Optional[str], list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int, T.Optional[str], T.Optional[str]]]] = {}
-    for t in trains:
-        grouped.setdefault(t[2], []).append(t)
-
-    VP_INCOMING = rt.VehiclePosition.INCOMING_AT
-    VP_STOPPED  = rt.VehiclePosition.STOPPED_AT
-
-    out: dict[str, int] = {}
-    matches = 0
-    dist_fb = 0
-    sched_used = 0
-
-    for name, meta in subset.items():
-        pid = meta["stop_id"]
-        slat, slon = meta["lat"], meta["lon"]
-        rs = (meta.get("route_short") or "").upper()
-
-        best = 0
-        best_d = None
-
-        # Look at trains for this route plus the None bucket (unknown route)
-        bucket = grouped.get(rs, []) + grouped.get(None, [])
-
-        for (tlat, tlon, trs, child_sid, st, tid, vid) in bucket:
-            # 1) TU schedule-first (if enabled and not forced to distance)
-            if not MB_FORCE_DISTANCE and MB_PREFER_TU and tid and tid in trip_next:
-                sched_sid, sched_st = trip_next[tid]
-                parent = CHILD_TO_PARENT.get(sched_sid) or (sched_sid if is_num_parent(sched_sid) else None)
-                if parent == pid:
-                    # translate sched_st to our 3/2/1
-                    if sched_st == VP_STOPPED:
-                        best = 3; matches += 1; sched_used += 1; break
-                    elif sched_st == VP_INCOMING:
-                        best = max(best, 2); matches += 1; sched_used += 1
-                    else:
-                        best = max(best, 1); matches += 1; sched_used += 1
-
-            # 2) VP.stop_id (if present) unless forcing distance
-            if not MB_FORCE_DISTANCE and child_sid:
-                parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
-                if parent == pid:
-                    if st == VP_STOPPED:
-                        best = 3; matches += 1; break
-                    elif st == VP_INCOMING:
-                        best = max(best, 2); matches += 1
-
-            # 3) Distance fallback — ONLY if this trip will actually visit pid
-            if best < 3 and tlat is not None and tlon is not None:
-                # If we know the trip_id, require pid in its future parents; otherwise allow (e.g., if some trains lack TU)
-                if (tid is None) or (pid in trip_future.get(tid, set())):
-                    d = hav_m(slat, slon, tlat, tlon)
-                    if best_d is None or d < best_d:
-                        best_d = d
-
-        if best == 0 and best_d is not None:
-            best = status_from_dist(best_d)
-            if best > 0:
-                dist_fb += 1
-
-        out[name] = best
-
-    if MB_VERBOSE:
-        act = sum(1 for v in out.values() if v > 0)
-        vlog(f"result active={act}/{len(subset)} matches={matches} sched_used={sched_used} distance_fb={dist_fb}")
-
-    return JSONResponse(out)
-
-# ---------------- run (dev) ----------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=os.getenv("RELOAD", "0") == "1")
+# -----------------------------
+# Run (for local dev)
+# -----------------------------
+# uvicorn app:app --host 0.0.0.0 --port 8000
