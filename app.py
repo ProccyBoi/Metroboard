@@ -22,6 +22,12 @@ GTFS_DIR = os.getenv("GTFS_DIR", "./gtfs")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "15"))
 GTFS_STATIC_ZIP_URL = os.getenv("GTFS_STATIC_ZIP_URL", "")  # optional: if set, will download & unpack on first start
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+# GitHub release download (API path)
+GH_OWNER = os.getenv("GTFS_GH_OWNER", "")
+GH_REPO  = os.getenv("GTFS_GH_REPO", "")
+GH_TAG   = os.getenv("GTFS_GH_TAG", "")
+GH_ASSET = os.getenv("GTFS_GH_ASSET", "")
+
 
 ENDPOINTS = {
     "tu_trains": "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains",
