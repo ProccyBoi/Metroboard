@@ -21,6 +21,7 @@ TFNSW_API_KEY = os.getenv("TFNSW_API_KEY", "")
 GTFS_DIR = os.getenv("GTFS_DIR", "./gtfs")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "15"))
 GTFS_STATIC_ZIP_URL = os.getenv("GTFS_STATIC_ZIP_URL", "")  # optional: if set, will download & unpack on first start
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
 ENDPOINTS = {
     "tu_trains": "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains",
@@ -84,8 +85,20 @@ class StaticGTFS:
         if GTFS_STATIC_ZIP_URL:
             os.makedirs(d, exist_ok=True)
             log.info("[metroboard] downloading GTFS static zip from %s ...", GTFS_STATIC_ZIP_URL)
-            r = requests.get(GTFS_STATIC_ZIP_URL, timeout=60)
-            r.raise_for_status()
+    
+            headers = {}
+            # If fetching from GitHub and a token is provided, use it
+            if "github.com" in GTFS_STATIC_ZIP_URL.lower() and GITHUB_TOKEN:
+                headers["Authorization"] = f"token {GITHUB_TOKEN}"
+                headers["Accept"] = "application/octet-stream"
+    
+            r = requests.get(GTFS_STATIC_ZIP_URL, headers=headers, timeout=120)
+            try:
+                r.raise_for_status()
+            except requests.HTTPError as e:
+                log.error("Failed to download GTFS zip (%s): %s", GTFS_STATIC_ZIP_URL, e)
+                raise
+    
             with zipfile.ZipFile(io.BytesIO(r.content)) as z:
                 z.extractall(d)
             log.info("[metroboard] GTFS static extracted to %s", d)
