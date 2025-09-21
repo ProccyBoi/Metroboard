@@ -94,26 +94,43 @@ class StaticGTFS:
         def open_csv(path):
             if not os.path.exists(path):
                 raise FileNotFoundError(f"Missing {os.path.basename(path)} in {d}")
-            return open(path, newline="", encoding="utf-8")
-
+            # utf-8-sig strips a possible BOM so 'stop_id' isn't read as '\ufeffstop_id'
+            return open(path, newline="", encoding="utf-8-sig")
+    
+        # routes.txt
         with open_csv(os.path.join(d, "routes.txt")) as f:
-            for row in csv.DictReader(f):
-                rid = row["route_id"]
+            rdr = csv.DictReader(f)
+            if not rdr.fieldnames:
+                raise ValueError("routes.txt has no header row")
+            for row in rdr:
+                rid = row.get("route_id", "").strip()
                 short = (row.get("route_short_name") or "").strip()
-                self.routes[rid] = Route(route_id=rid, short=short)
-
+                if rid:
+                    self.routes[rid] = Route(route_id=rid, short=short)
+    
+        # trips.txt
         with open_csv(os.path.join(d, "trips.txt")) as f:
-            for row in csv.DictReader(f):
-                self.trips[row["trip_id"]] = Trip(trip_id=row["trip_id"], route_id=row["route_id"])
-
+            rdr = csv.DictReader(f)
+            if not rdr.fieldnames:
+                raise ValueError("trips.txt has no header row")
+            for row in rdr:
+                tid = row.get("trip_id", "").strip()
+                rid = row.get("route_id", "").strip()
+                if tid and rid:
+                    self.trips[tid] = Trip(trip_id=tid, route_id=rid)
+    
+        # stops.txt
         with open_csv(os.path.join(d, "stops.txt")) as f:
-            for row in csv.DictReader(f):
-                parent = row.get("parent_station") or None
-                self.stops[row["stop_id"]] = Stop(
-                    stop_id=row["stop_id"],
-                    name=(row.get("stop_name") or "").strip(),
-                    parent_station=parent if parent else None,
-                )
+            rdr = csv.DictReader(f)
+            if not rdr.fieldnames or "stop_id" not in [h.strip().lstrip("\ufeff") for h in rdr.fieldnames]:
+                raise ValueError(f"stops.txt missing 'stop_id' header; got {rdr.fieldnames}")
+            for row in rdr:
+                sid = (row.get("stop_id") or row.get("\ufeffstop_id") or "").strip()
+                name = (row.get("stop_name") or "").strip()
+                parent = (row.get("parent_station") or "").strip() or None
+                if sid:
+                    self.stops[sid] = Stop(stop_id=sid, name=name, parent_station=parent)
+
 
     def _build_name_parent_index(self):
         name_to_parents: Dict[str, Set[str]] = defaultdict(set)
