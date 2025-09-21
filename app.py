@@ -64,8 +64,8 @@ if _FEEDS_TU_ENV:
     URLS_TU = [u.strip() for u in _FEEDS_TU_ENV.split(",") if u.strip()]
 else:
     URLS_TU = [
-        "https://api.transport.nsw.gov.au/v2/gtfs/tripupdate/sydneytrains",
-        "https://api.transport.nsw.gov.au/v2/gtfs/tripupdate/metro",
+    "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains",
+    "https://api.transport.nsw.gov.au/v2/gtfs/realtime/metro",
     ]
 
 # Distance thresholds (meters) for fallback
