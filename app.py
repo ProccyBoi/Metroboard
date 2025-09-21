@@ -659,7 +659,7 @@ async def get_states(only: Optional[str] = Query(default=None)):
         counts = state.counts_for_tokens(tokens)  # preferred
     else:
         log.warning("counts_for_tokens missing on LiveState; using fallback")
-        counts = _counts_for_tokens_fallback(state, tokens)
+        counts = state._counts_for_tokens_fallback(state, tokens)
     return JSONResponse(counts)
 
 
