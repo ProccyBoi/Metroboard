@@ -1,4 +1,4 @@
-# app.py — Metroboard (TU-based) with single GTFS source (no static 404s, no stop_times merge)
+# app.py — Metroboard (TU-based) with single GTFS source (no static 404s, selective extract)
 import os, io, zipfile, asyncio, csv, json, re, shutil
 from pathlib import Path
 from collections import defaultdict, Counter
@@ -37,7 +37,7 @@ ENDPOINTS = {
     "tu_metro":  "https://api.transport.nsw.gov.au/v2/gtfs/realtime/metro",
 }
 
-def vlog(*a): 
+def vlog(*a):
     if MB_VERBOSE: print("[metroboard]", *a)
 
 # -----------------------------
@@ -133,6 +133,32 @@ except Exception:
 # -----------------------------
 # Static GTFS (routes/trips/stops only)
 # -----------------------------
+def _extract_selected_gtfs(zip_bytes: bytes, out_dir: str,
+                           needed=("routes.txt","trips.txt","stops.txt")):
+    """Extract only the needed GTFS files from the zip (handles nested paths)."""
+    z = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    names = z.namelist()
+
+    def find_member(target: str) -> Optional[str]:
+        tl = target.lower()
+        for n in names:
+            nl = n.lower()
+            # match exact or ".../target"
+            if nl == tl or nl.endswith("/" + tl):
+                return n
+        return None
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    found = 0
+    for fname in needed:
+        member = find_member(fname)
+        if not member:
+            raise RuntimeError(f"{fname} not found in GTFS zip")
+        data = z.read(member)
+        (Path(out_dir)/fname).write_bytes(data)
+        found += 1
+    vlog(f"extracted {found}/{len(needed)} GTFS files into {out_dir}")
+
 class StaticGTFS:
     def __init__(self, gtfs_dir: str):
         self.routes: Dict[str, Route] = {}
@@ -193,23 +219,10 @@ class StaticGTFS:
                 print("[metroboard] WARN: fallback static zip failed", resp.status_code)
 
         if data:
-            with zipfile.ZipFile(io.BytesIO(data)) as z:
-                z.extractall(d)
-            self._promote_inner_gtfs_files(d)
-            vlog("GTFS extracted to", d)
+            # Extract ONLY the 3 required files — never stop_times.txt
+            _extract_selected_gtfs(data, d)
         else:
             raise FileNotFoundError("No static GTFS available (GH + fallback both unavailable)")
-
-    def _promote_inner_gtfs_files(self, d: str):
-        need = {"routes.txt","trips.txt","stops.txt"}
-        root = Path(d)
-        if all((root/f).exists() for f in need): return
-        for cand in sorted([p for p in root.rglob("*") if p.is_dir()], key=lambda p: len(p.parts)):
-            if all((cand/f).exists() for f in need):
-                for f in need:
-                    src, dst = cand/f, root/f
-                    if not dst.exists(): shutil.move(str(src), str(dst))
-                return
 
     def _load(self, d: str):
         def op(p: str):
