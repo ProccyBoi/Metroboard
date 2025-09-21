@@ -5,6 +5,7 @@ import zipfile
 import asyncio
 import csv
 import logging
+import json
 from collections import defaultdict, Counter
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional, Set
@@ -35,6 +36,15 @@ ENDPOINTS = {
     "tu_trains": "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains",
     "tu_metro":  "https://api.transport.nsw.gov.au/v2/gtfs/realtime/metro",
 }
+
+# Verbose logging flag
+MB_VERBOSE = str(os.getenv("MB_VERBOSE", "0")).lower() not in ("0", "", "false", "no")
+
+# Optional route-id -> short-name overrides from env
+try:
+    ROUTE_SHORT_OVERRIDES = json.loads(os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "{}"))
+except json.JSONDecodeError:
+    ROUTE_SHORT_OVERRIDES = {}
 
 # -----------------------------
 # Logging
@@ -310,7 +320,7 @@ class LiveState:
         bucket_counts: Counter[Tuple[str, str]] = Counter()
 
         for t in self.trains:
-            line = normalize_line_code(t.route_short)
+            line = t.route_short  # already normalized to 'T#' or 'M'
             if not line:
                 continue
             seen: Set[Tuple[str, str]] = set()
@@ -341,17 +351,41 @@ class LiveState:
 # -----------------------------
 # Helpers
 # -----------------------------
-def normalize_line_code(short_name: str) -> Optional[str]:
-    if not short_name:
+def normalize_line_code(val: str) -> Optional[str]:
+    if not val:
         return None
-    s = short_name.strip().upper()
-    if s == "M":
+    s = val.strip().upper()
+    # Handle Metro variants
+    if s in ("M", "M1", "METRO", "S_M1"):
         return "M"
+    # Handle Sydney Trains T-lines
     if s.startswith("T") and s[1:].isdigit():
-        return s
+        return f"T{int(s[1:])}"
     if s.isdigit():
-        return f"T{s}"
+        return f"T{int(s)}"
+    # Sometimes we get route ids like S_T4 or S_T1_MAIN — collapse to T#
+    if s.startswith("S_T"):
+        tail = s[3:]
+        if tail.isdigit():
+            return f"T{int(tail)}"
     return None
+
+def route_short_from_ids(route_id: str, route_short: str) -> Optional[str]:
+    """
+    Choose a sensible short code from either the GTFS short name or the route_id
+    using overrides if present, then normalize to 'T#' or 'M'.
+    """
+    cand = (route_short or "").strip()
+    if not cand and route_id:
+        cand = ROUTE_SHORT_OVERRIDES.get(route_id, "").strip()
+    # If overrides map contains keys like 'S_T1_MAIN' too:
+    if not cand and route_id and route_id in ROUTE_SHORT_OVERRIDES:
+        cand = ROUTE_SHORT_OVERRIDES[route_id]
+    # Normalize common route_id forms when short name is blank
+    if not cand and route_id:
+        cand = route_id
+    return normalize_line_code(cand)
+
 
 # -----------------------------
 # GTFS-RT fetch + parse (requests + protobuf)
@@ -407,22 +441,25 @@ def extract_upcoming_stops_from_tu(feed: gtfs_realtime_pb2.FeedMessage) -> Dict[
 def build_train_obs(gtfs: StaticGTFS, pairs: List[Tuple[str, str]], upcoming: Dict[str, List[str]]) -> List[TrainObs]:
     trains: List[TrainObs] = []
     for trip_id, route_id in pairs:
-        short = ""
+        short_raw = ""
         r = gtfs.routes.get(route_id)
         if r:
-            short = r.short
-        # In degraded mode (no routes.txt), try to infer 'M' vs 'T#' from route_id text as a fallback
-        if not short and route_id:
-            s = route_id.upper()
-            if s == "M" or s.startswith("METRO"):
-                short = "M"
-            elif s.startswith("T") and any(ch.isdigit() for ch in s[1:2]):
-                short = f"T{s[1:2]}"
+            short_raw = r.short
+        short = route_short_from_ids(route_id, short_raw)
+        if not short:
+            # last-ditch route_id heuristics
+            short = normalize_line_code(route_id)
         stops = upcoming.get(trip_id, [])
-        if not stops:
+        if not stops or not short:
             continue
-        trains.append(TrainObs(trip_id=trip_id, route_id=route_id, route_short=short, upcoming_stop_ids=stops))
+        trains.append(TrainObs(
+            trip_id=trip_id,
+            route_id=route_id,
+            route_short=short,            # <- already normalized (T# or M)
+            upcoming_stop_ids=stops
+        ))
     return trains
+
 
 # -----------------------------
 # Background refresh loop
