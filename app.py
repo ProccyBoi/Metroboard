@@ -63,6 +63,27 @@ class TrainObs:
 # -----------------------------
 # Static GTFS
 # -----------------------------
+def _download_release_asset_via_github(owner: str, repo: str, tag: str, asset_name: str, token: str) -> bytes:
+    """Fetch a release asset by name via the GitHub API (auth, no S3 redirect)."""
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN not set but GitHub release download was requested")
+    api_base = f"https://api.github.com/repos/{owner}/{repo}"
+    headers_json = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+    # 1) find the release by tag
+    rel = requests.get(f"{api_base}/releases/tags/{tag}", headers=headers_json, timeout=60)
+    rel.raise_for_status()
+    data = rel.json()
+    asset = next((a for a in data.get("assets", []) if a.get("name") == asset_name), None)
+    if not asset:
+        raise RuntimeError(f"Asset '{asset_name}' not found on release tag '{tag}'")
+    asset_id = asset["id"]
+    # 2) download the asset content (no redirect, content streamed)
+    headers_bin = {"Authorization": f"token {token}", "Accept": "application/octet-stream"}
+    dl = requests.get(f"{api_base}/releases/assets/{asset_id}", headers=headers_bin, timeout=300)
+    dl.raise_for_status()
+    return dl.content
+
+
 class StaticGTFS:
     def __init__(self, gtfs_dir: str):
         self.routes: Dict[str, Route] = {}
@@ -82,23 +103,28 @@ class StaticGTFS:
     def _ensure_dir_or_download(self, d: str):
         if os.path.isdir(d) and os.path.exists(os.path.join(d, "routes.txt")):
             return
-        if GTFS_STATIC_ZIP_URL:
-            os.makedirs(d, exist_ok=True)
-            log.info("[metroboard] downloading GTFS static zip from %s ...", GTFS_STATIC_ZIP_URL)
     
+        os.makedirs(d, exist_ok=True)
+    
+        # Prefer GitHub API path when owner/repo/tag/asset are provided
+        if GH_OWNER and GH_REPO and GH_TAG and GH_ASSET:
+            log.info("[metroboard] fetching GTFS via GitHub API owner=%s repo=%s tag=%s asset=%s",
+                     GH_OWNER, GH_REPO, GH_TAG, GH_ASSET)
+            content = _download_release_asset_via_github(GH_OWNER, GH_REPO, GH_TAG, GH_ASSET, GITHUB_TOKEN)
+            with zipfile.ZipFile(io.BytesIO(content)) as z:
+                z.extractall(d)
+            log.info("[metroboard] GTFS static extracted to %s", d)
+            return
+    
+        # Fallback: direct URL (works for public assets only or when your platform keeps auth on redirects)
+        if GTFS_STATIC_ZIP_URL:
+            log.info("[metroboard] downloading GTFS static zip from %s ...", GTFS_STATIC_ZIP_URL)
             headers = {}
-            # If fetching from GitHub and a token is provided, use it
             if "github.com" in GTFS_STATIC_ZIP_URL.lower() and GITHUB_TOKEN:
                 headers["Authorization"] = f"token {GITHUB_TOKEN}"
                 headers["Accept"] = "application/octet-stream"
-    
             r = requests.get(GTFS_STATIC_ZIP_URL, headers=headers, timeout=120)
-            try:
-                r.raise_for_status()
-            except requests.HTTPError as e:
-                log.error("Failed to download GTFS zip (%s): %s", GTFS_STATIC_ZIP_URL, e)
-                raise
-    
+            r.raise_for_status()
             with zipfile.ZipFile(io.BytesIO(r.content)) as z:
                 z.extractall(d)
             log.info("[metroboard] GTFS static extracted to %s", d)
