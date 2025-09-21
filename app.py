@@ -1,5 +1,6 @@
 # app.py — Metroboard backend (Rail + Metro) with multi-GTFS merge
 import os, time, csv, json, re, typing as T, random, requests, io, zipfile, shutil, tempfile
+import threading
 from pathlib import Path
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
@@ -86,6 +87,10 @@ MB_PERMISSIVE_PAIRS = os.getenv("MB_PERMISSIVE_PAIRS", "1") != "0"
 
 def vlog(*a):
     if MB_VERBOSE: print("[metroboard]", *a)
+
+INIT_DONE = False
+INIT_ERR: T.Optional[str] = None
+
 
 # ---------------- Utils ----------------
 EXCLUDE_SUB = ("wharf","light rail","interchange","motorway"," m2","b-line")
@@ -530,6 +535,35 @@ def collect_trains(feed,route_id_to_short: dict[str,str]):
     if MB_VERBOSE: vlog(f"collect_trains kept={len(trains)} by_route={by_route}")
     return trains,by_route
 
+def _init_gtfs_and_index():
+    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, INIT_DONE, INIT_ERR
+    try:
+        ensure_gtfs(GTFS_DIR)
+
+        routes_p     = str(Path(GTFS_DIR)/"routes.txt")
+        trips_p      = str(Path(GTFS_DIR)/"trips.txt")
+        stops_p      = str(Path(GTFS_DIR)/"stops.txt")
+        stop_times_p = str(Path(GTFS_DIR)/"stop_times.txt")
+        agency_p     = str(Path(GTFS_DIR)/"agency.txt")
+
+        ROUTE_ID_TO_SHORT = load_route_shortnames(routes_p)
+        allowed_parents   = require_allowed_parents(stops_p, routes_p, trips_p, stop_times_p, agency_p, ROUTE_TYPES_ALLOW)
+        allowed_pairs     = require_allowed_pairs(stops_p, routes_p, trips_p, stop_times_p, agency_p, ROUTE_TYPES_ALLOW,
+                                                  allowed_parents_for_fallback=allowed_parents)
+        STATION_INDEX     = load_station_index(stops_p, allowed_parents, allowed_pairs)
+        CHILD_TO_PARENT   = build_child_to_parent(stops_p)
+        if not STATION_INDEX:
+            raise RuntimeError("No stations after filtering")
+
+        vlog(f"GTFS ready: parents={len(allowed_parents)} stations={len(STATION_INDEX)}")
+        INIT_DONE = True
+        INIT_ERR  = None
+    except Exception as e:
+        INIT_ERR  = str(e)
+        INIT_DONE = False
+        vlog("ERROR initialization:", e)
+
+
 # ---------------- API ----------------
 app=FastAPI()
 if CORS_ALLOW_ORIGIN:
@@ -539,30 +573,24 @@ if CORS_ALLOW_ORIGIN:
 ROUTE_ID_TO_SHORT={}; STATION_INDEX={}; CHILD_TO_PARENT={}
 @app.on_event("startup")
 def _startup():
-    global ROUTE_ID_TO_SHORT,STATION_INDEX,CHILD_TO_PARENT
-    ensure_gtfs(GTFS_DIR)
-    routes_p     = str(Path(GTFS_DIR)/"routes.txt")
-    trips_p      = str(Path(GTFS_DIR)/"trips.txt")
-    stops_p      = str(Path(GTFS_DIR)/"stops.txt")
-    stop_times_p = str(Path(GTFS_DIR)/"stop_times.txt")
-    agency_p     = str(Path(GTFS_DIR)/"agency.txt")
+    t = threading.Thread(target=_init_gtfs_and_index, daemon=True)
+    t.start()
 
-    ROUTE_ID_TO_SHORT=load_route_shortnames(routes_p)
-    allowed_parents=require_allowed_parents(stops_p,routes_p,trips_p,stop_times_p,agency_p,ROUTE_TYPES_ALLOW)
-    allowed_pairs=require_allowed_pairs(stops_p,routes_p,trips_p,stop_times_p,agency_p,ROUTE_TYPES_ALLOW,
-                                        allowed_parents_for_fallback=allowed_parents)
-    STATION_INDEX=load_station_index(stops_p,allowed_parents,allowed_pairs)
-    CHILD_TO_PARENT=build_child_to_parent(stops_p)
-    if not STATION_INDEX: raise RuntimeError("No stations after filtering")
-    vlog(f"GTFS ready: parents={len(allowed_parents)} stations={len(STATION_INDEX)}")
 
 @app.get("/")
 def root(): return {"ok":True,"endpoints":["/states","/stations","/healthz","/debug","/trains"]}
 
 @app.get("/healthz")
 def healthz():
-    age=None if _FEED_TS==0 else (time.time()-_FEED_TS)
-    return {"status":"ok","stations":len(STATION_INDEX),"trains_last_fetch_s":age,"gtfs_dir":GTFS_DIR}
+    age = None if _FEED_TS == 0 else (time.time() - _FEED_TS)
+    status = "ok" if INIT_DONE else ("error" if INIT_ERR else "initializing")
+    return {
+        "status": status,
+        "error": INIT_ERR,
+        "stations": len(STATION_INDEX),
+        "trains_last_fetch_s": age,
+        "gtfs_dir": GTFS_DIR,
+    }
 
 @app.get("/debug")
 def debug():
@@ -579,6 +607,8 @@ def debug():
 
 @app.get("/trains")
 def trains():
+    if not INIT_DONE:
+        return {"status": "initializing", "total_trains": 0, "sample_trains": []}
     feed,age=fetch_vp_cached()
     trains,by_route=collect_trains(feed,ROUTE_ID_TO_SHORT)
     out=[{"route":rs,"lat":lat,"lon":lon,"stop_id":sid,"status":st,
@@ -588,10 +618,14 @@ def trains():
 
 @app.get("/stations")
 def stations():
+    if not INIT_DONE:
+        return JSONResponse({"status": "initializing", "stations": 0})
     return JSONResponse([STATION_INDEX[k] for k in sorted(STATION_INDEX.keys())])
 
 @app.get("/states")
 def states(only: T.Optional[str]=Query(None)):
+    if not INIT_DONE:
+        return JSONResponse({})
     subset = STATION_INDEX if not only else {
         n: STATION_INDEX[n] for n in [x.strip() for x in only.split(",") if x.strip()] if n in STATION_INDEX
     }
