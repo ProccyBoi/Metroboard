@@ -8,6 +8,8 @@ import logging
 from collections import defaultdict, Counter
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional, Set
+import shutil
+from pathlib import Path
 
 import requests
 from google.transit import gtfs_realtime_pb2
@@ -109,31 +111,36 @@ class StaticGTFS:
     def _ensure_dir_or_download(self, d: str):
         if os.path.isdir(d) and os.path.exists(os.path.join(d, "routes.txt")):
             return
-    
-        os.makedirs(d, exist_ok=True)
-    
-        # Prefer GitHub API path when owner/repo/tag/asset are provided
-        if GH_OWNER and GH_REPO and GH_TAG and GH_ASSET:
-            log.info("[metroboard] fetching GTFS via GitHub API owner=%s repo=%s tag=%s asset=%s",
-                     GH_OWNER, GH_REPO, GH_TAG, GH_ASSET)
-            content = _download_release_asset_via_github(GH_OWNER, GH_REPO, GH_TAG, GH_ASSET, GITHUB_TOKEN)
-            with zipfile.ZipFile(io.BytesIO(content)) as z:
-                z.extractall(d)
-            log.info("[metroboard] GTFS static extracted to %s", d)
-            return
-    
-        # Fallback: direct URL (works for public assets only or when your platform keeps auth on redirects)
-        if GTFS_STATIC_ZIP_URL:
-            log.info("[metroboard] downloading GTFS static zip from %s ...", GTFS_STATIC_ZIP_URL)
-            headers = {}
-            if "github.com" in GTFS_STATIC_ZIP_URL.lower() and GITHUB_TOKEN:
-                headers["Authorization"] = f"token {GITHUB_TOKEN}"
-                headers["Accept"] = "application/octet-stream"
-            r = requests.get(GTFS_STATIC_ZIP_URL, headers=headers, timeout=120)
-            r.raise_for_status()
+        if GTFS_STATIC_ZIP_URL or (os.getenv("GTFS_GH_OWNER") and os.getenv("GTFS_GH_REPO")):
+            os.makedirs(d, exist_ok=True)
+            # ... your current download code ...
             with zipfile.ZipFile(io.BytesIO(r.content)) as z:
                 z.extractall(d)
+            self._promote_inner_gtfs_files(d)   # <-- add this line
             log.info("[metroboard] GTFS static extracted to %s", d)
+
+    def _promote_inner_gtfs_files(self, d: str):
+        """
+        If routes.txt / trips.txt / stops.txt live in a single nested folder,
+        move them up to `d` so the loader can find them.
+        """
+        needed = {"routes.txt", "trips.txt", "stops.txt"}
+        root = Path(d)
+
+        # Already fine?
+        if all((root / f).exists() for f in needed):
+            return
+
+        # Search for first subdir that contains all needed files
+        candidates = [p for p in root.rglob("*") if p.is_dir()]
+        for cand in sorted(candidates, key=lambda p: len(p.parts)):  # shallow first
+            if all((cand / f).exists() for f in needed):
+                for f in needed:
+                    src = cand / f
+                    dst = root / f
+                    if not dst.exists():
+                        shutil.move(str(src), str(dst))
+                return
 
     def _load(self, d: str):
         def open_csv(path):
