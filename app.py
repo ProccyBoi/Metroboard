@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.transit import gtfs_realtime_pb2 as rt
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+import re
 
 # ---------------- Env ----------------
 def _get_csv_env(*names: str) -> set[str]:
@@ -31,6 +32,10 @@ def _get_json_env(*names: str, default="{}"):
         return json.loads(raw)
     except Exception:
         return json.loads(default)
+
+_PARENTS_ID_RE = re.compile(r"^[A-Za-z0-9._+-]+$")  # conservative, no spaces
+def is_num_parent(s: str) -> bool:
+    return bool(s and _PARENTS_ID_RE.match(s))
 
 API_TOKEN = os.getenv("TFNSW_API_KEY") or os.getenv("TFNSW_API_TOKEN")
 if not API_TOKEN:
@@ -352,8 +357,10 @@ def build_child_to_parent(stops: str):
             sid=(r.get("stop_id") or "").strip()
             pid=(r.get("parent_station") or "").strip()
             lt=(r.get("location_type") or "0").strip()
-            if sid and pid and is_num_parent(pid): out[sid]=pid
-            if sid and lt=="1" and is_num_parent(sid): out.setdefault(sid,sid)
+            if sid and pid: 
+                out[sid] = pid
+            if sid and lt == "1":
+                out.setdefault(sid, sid)
     return out
 
 # ---------------- Feed ----------------
