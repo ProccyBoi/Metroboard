@@ -120,8 +120,6 @@ def clean_name(n:str)->str:
         if n.endswith(suf): n=n[:-len(suf)]
     return n
 
-def is_num_parent(s:str)->bool: return s.isdigit()
-
 # ---------------- GTFS bootstrap ----------------
 def _promote_inner_gtfs_files(root: Path):
     needed = {"routes.txt","trips.txt","stops.txt","stop_times.txt","agency.txt"}
