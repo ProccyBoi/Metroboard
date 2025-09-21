@@ -2,19 +2,13 @@
 import os
 import asyncio
 import csv
-import json
 import logging
 from collections import defaultdict, Counter
 from dataclasses import dataclass
 from typing import Dict, Tuple, List, Optional, Set
 
-# --- optional httpx; we fall back to stdlib if it isn't installed
-try:
-    import httpx  # type: ignore
-except Exception:
-    httpx = None  # noqa: N816
-
-import urllib.request
+import requests
+from google.transit import gtfs_realtime_pb2
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
@@ -26,9 +20,7 @@ GTFS_DIR = os.getenv("GTFS_DIR", "./gtfs")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "15"))
 
 ENDPOINTS = {
-    "vp_trains": "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains",
     "tu_trains": "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains",
-    "vp_metro":  "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/metro",
     "tu_metro":  "https://api.transport.nsw.gov.au/v2/gtfs/realtime/metro",
 }
 
@@ -107,6 +99,7 @@ class StaticGTFS:
             parent = s.parent_station or s.stop_id
             name_to_parents[s.name].add(parent)
         for name, parents in name_to_parents.items():
+            # pick a stable parent id when multiple map to same name
             self.stopname_to_parentid[name] = sorted(parents)[0]
 
     def parent_of(self, stop_id: str) -> str:
@@ -145,6 +138,7 @@ class LiveState:
         if not token:
             return None
 
+        # split "Central4" → ("Central", "4"), "CentralM" → ("Central", "M")
         i = len(token) - 1
         while i >= 0 and (token[i].isdigit() or token[i].upper() == "M"):
             i -= 1
@@ -154,7 +148,7 @@ class LiveState:
         if not line_code:
             return None
 
-        # remove trailing "(12345)" if present
+        # strip optional " (12345)" suffix in names like "Central (200060)"
         if "(" in name_part and name_part.endswith(")"):
             name_part = name_part[: name_part.rfind("(")].strip()
 
@@ -171,6 +165,7 @@ class LiveState:
             if not line:
                 continue
             seen: Set[Tuple[str, str]] = set()
+            # cap lookahead so we don't double-count long through services
             for sid in t.upcoming_stop_ids[:40]:
                 parent = self.gtfs.parent_of(sid)
                 key = (parent, line)
@@ -200,56 +195,53 @@ def normalize_line_code(short_name: str) -> Optional[str]:
     return None
 
 # -----------------------------
-# HTTP fetchers (httpx or stdlib)
+# GTFS-RT fetch + parse (requests + protobuf)
 # -----------------------------
-async def fetch_json(url: str) -> dict:
+def _fetch_bytes(url: str) -> bytes:
     headers = {"Authorization": f"apikey {TFNSW_API_KEY}"} if TFNSW_API_KEY else {}
+    # TFNSW returns protobuf; explicitly request it
+    headers["Accept"] = "application/x-google-protobuf"
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.content
 
-    if httpx:
-        async with httpx.AsyncClient(timeout=20.0) as client:  # type: ignore
-            r = await client.get(url, headers=headers)
-            r.raise_for_status()
-            try:
-                return r.json()
-            except Exception:
-                return {}
-    # stdlib fallback (non-async) → run in thread
-    def _sync_get():
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=20) as resp:
-            raw = resp.read()
-            try:
-                return json.loads(raw.decode("utf-8"))
-            except Exception:
-                return {}
-    return await asyncio.to_thread(_sync_get)
+def fetch_tu_feed(url: str) -> gtfs_realtime_pb2.FeedMessage:
+    raw = _fetch_bytes(url)
+    feed = gtfs_realtime_pb2.FeedMessage()
+    feed.ParseFromString(raw)
+    return feed
 
-def join_tu_with_static(gtfs: StaticGTFS, tu_feed: dict, label: str) -> List[Tuple[str, str]]:
+def join_tu_with_static(gtfs: StaticGTFS, feed: gtfs_realtime_pb2.FeedMessage, label: str) -> List[Tuple[str, str]]:
     out: List[Tuple[str, str]] = []
-    for ent in tu_feed.get("entity", []):
-        tu = ent.get("trip_update")
-        if not tu:
+    kept = 0
+    for ent in feed.entity:
+        if not ent.HasField("trip_update"):
             continue
-        trip = tu.get("trip", {})
-        trip_id = trip.get("trip_id")
-        route_id = trip.get("route_id")
-        if not route_id and trip_id and trip_id in gtfs.trips:
+        tu = ent.trip_update
+        trip_id = tu.trip.trip_id
+        route_id = tu.trip.route_id
+        if not route_id and trip_id in gtfs.trips:
             route_id = gtfs.trips[trip_id].route_id
         if trip_id and route_id:
             out.append((trip_id, route_id))
-    log.info("[metroboard] collect_trips %s kept=%d", label, len(out))
+            kept += 1
+    log.info("[metroboard] collect_trips %s kept=%d", label, kept)
     return out
 
-def extract_upcoming_stops_from_tu(tu_feed: dict) -> Dict[str, List[str]]:
+def extract_upcoming_stops_from_tu(feed: gtfs_realtime_pb2.FeedMessage) -> Dict[str, List[str]]:
     trip_to_stops: Dict[str, List[str]] = {}
-    for ent in tu_feed.get("entity", []):
-        tu = ent.get("trip_update")
-        if not tu:
+    for ent in feed.entity:
+        if not ent.HasField("trip_update"):
             continue
-        trip_id = tu.get("trip", {}).get("trip_id")
+        tu = ent.trip_update
+        trip_id = tu.trip.trip_id
         if not trip_id:
             continue
-        stops = [stu.get("stop_id") for stu in tu.get("stop_time_update", []) if stu.get("stop_id")]
+        stops = []
+        for stu in tu.stop_time_update:
+            sid = stu.stop_id
+            if sid:
+                stops.append(sid)
         if stops:
             trip_to_stops[trip_id] = stops
     return trip_to_stops
@@ -265,14 +257,20 @@ def build_train_obs(gtfs: StaticGTFS, pairs: List[Tuple[str, str]], upcoming: Di
         trains.append(TrainObs(trip_id=trip_id, route_id=route_id, route_short=short, upcoming_stop_ids=stops))
     return trains
 
+# -----------------------------
+# Background refresh loop
+# -----------------------------
 async def refresh_loop(state: LiveState):
     if not TFNSW_API_KEY:
         log.warning("TFNSW_API_KEY not set; realtime fetch will fail.")
 
     while True:
         try:
-            tu_trains = await fetch_json(ENDPOINTS["tu_trains"])
-            tu_metro  = await fetch_json(ENDPOINTS["tu_metro"])
+            # run blocking requests in a thread so we don't block the event loop
+            tu_trains, tu_metro = await asyncio.gather(
+                asyncio.to_thread(fetch_tu_feed, ENDPOINTS["tu_trains"]),
+                asyncio.to_thread(fetch_tu_feed, ENDPOINTS["tu_metro"]),
+            )
 
             pairs_trains = join_tu_with_static(state.gtfs, tu_trains, "trains")
             pairs_metro  = join_tu_with_static(state.gtfs, tu_metro,  "metro")
@@ -317,4 +315,4 @@ async def get_states(only: Optional[str] = Query(default=None)):
     counts = state.counts_for_tokens(tokens)
     return JSONResponse(counts)
 
-# uvicorn app:app --host 0.0.0.0 --port 8000
+# run: uvicorn app:app --host 0.0.0.0 --port 8000
