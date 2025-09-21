@@ -111,6 +111,7 @@ class StaticGTFS:
         self.stopname_to_parentid: Dict[str, str] = {}
         self.available: bool = False
         self._ensure_dir_or_download(gtfs_dir)
+        self.parent_to_name: Dict[str, str] = {}
         try:
             self._load(gtfs_dir)
             self._build_name_parent_index()
@@ -230,8 +231,13 @@ class StaticGTFS:
         for s in self.stops.values():
             parent = s.parent_station or s.stop_id
             name_to_parents[s.name].add(parent)
+            # remember name for this parent
+            if parent not in self.parent_to_name:
+                self.parent_to_name[parent] = s.name
         for name, parents in name_to_parents.items():
+            # keep the “first” parent for legacy lookups
             self.stopname_to_parentid[name] = sorted(parents)[0]
+
 
     def parent_of(self, stop_id: str) -> str:
         """
@@ -317,37 +323,71 @@ class LiveState:
             return None
         return (parent, line_code)
 
-    def counts_for_tokens(self, tokens: List[str]) -> Dict[str, int]:
-        bucket_counts: Counter[Tuple[str, str]] = Counter()
-
-        for t in self.trains:
-            line = t.route_short  # already normalized to 'T#' or 'M'
-            if not line:
-                continue
-            seen: Set[Tuple[str, str]] = set()
-            for sid in t.upcoming_stop_ids[:40]:
-                parent = self.gtfs.parent_of(sid)
-                key = (parent, line)
-                if key not in seen:
-                    bucket_counts[key] += 1
-                    seen.add(key)
-
-        out: Dict[str, int] = {}
-        for tok in tokens:
-            parsed = self._parse_only_token(tok)
-            if parsed:
+        def counts_for_tokens(self, tokens: List[str]) -> Dict[str, int]:
+            bucket_counts: Counter[Tuple[str, str]] = Counter()
+    
+            # Build counts keyed by (parent_id, line)
+            for t in self.trains:
+                line = t.route_short  # already normalized to 'T#' or 'M'
+                if not line:
+                    continue
+                seen: Set[Tuple[str, str]] = set()
+                for sid in t.upcoming_stop_ids[:40]:
+                    parent = self.gtfs.parent_of(sid)
+                    key = (parent, line)
+                    if key not in seen:
+                        bucket_counts[key] += 1
+                        seen.add(key)
+    
+            out: Dict[str, int] = {}
+            for tok in tokens:
+                parsed = self._parse_only_token(tok)
+                if not parsed:
+                    out[tok] = 0
+                    continue
+    
                 parent, line = parsed
-                # also count stops whose IDs start with the parent (helps in degraded mode: '200060' vs '2000601')
-                total = bucket_counts.get(parsed, 0)
+    
+                # 1) Exact (parent_id, line)
+                total = bucket_counts.get((parent, line), 0)
+    
+                # 2) Prefix parent-id match (helps degraded mode like '200060' vs '2000601')
                 if total == 0:
-                    # try prefix match in degraded mode
                     for (p, l), v in bucket_counts.items():
                         if l == line and (p == parent or p.startswith(parent)):
                             total += v
+    
+                # 3) Name+line fallback for stations with multiple parents (e.g., heavy vs metro "Chatswood")
+                if total == 0:
+                    base_name = self._base_name_from_token(tok).lower()
+                    for (p, l), v in bucket_counts.items():
+                        if l != line:
+                            continue
+                        pname = self.gtfs.parent_to_name.get(p, "")
+                        if pname and pname.lower() == base_name:
+                            total += v
+    
                 out[tok] = total
-            else:
-                out[tok] = 0
-        return out
+            return out
+
+
+    @staticmethod
+    def _base_name_from_token(tok: str) -> str:
+        """
+        Strip optional ' (12345)' and trailing line suffix (digits or 'M') from a token.
+        e.g. 'ChatswoodM (211400)' -> 'Chatswood', 'Town Hall4' -> 'Town Hall'
+        """
+        t = tok.strip()
+        # Remove ' (12345)' if present
+        if "(" in t and t.endswith(")"):
+            t = t[: t.rfind("(")].strip()
+
+        # Remove trailing digits / 'M' suffix
+        i = len(t) - 1
+        while i >= 0 and (t[i].isdigit() or t[i].upper() == "M"):
+            i -= 1
+        return t[: i + 1].strip()
+
 
 # -----------------------------
 # Helpers
