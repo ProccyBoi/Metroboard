@@ -266,7 +266,7 @@ def require_allowed_pairs(stops: str,routes: str,trips: str,stop_times: str,agen
     with open(trips,encoding="utf-8-sig") as f:
         for r in csv.DictReader(f): trip_route[(r.get("trip_id") or "").strip()]=(r.get("route_id") or "").strip()
     stops_map,parents={},set()
-    with open(stops,encoding="utf-8-sig") as f):
+    with open(stops,encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             sid=(r.get("stop_id") or "").strip(); stops_map[sid]=r
             if (r.get("location_type") or "0").strip()=="1": parents.add(sid)
@@ -361,14 +361,13 @@ def fetch_vp_cached():
         except Exception as e: vlog("WARN fetch",url,e)
     _FEED_CACHE=merged; _FEED_TS=now; return merged,0.0
 
-# ---- NEW: robust short-name inference so Metro always buckets ----
+# ---- Metro-friendly short-name inference ----
 _TM_RE = re.compile(r'\b([TM]\d{1,2})\b', re.I)
 def _infer_short_from_ids(route_id: str, trip_id: str) -> T.Optional[str]:
     for text in (route_id or "", trip_id or ""):
         m = _TM_RE.search(text)
         if m:
             return m.group(1).upper()
-    # common Sydney Metro ids include "SMNW_M1", "SMCSW_M1", etc.
     s = (route_id or "") + " " + (trip_id or "")
     if "M1" in s.upper():
         return "M1"
@@ -383,7 +382,7 @@ def collect_trains(feed,route_id_to_short: dict[str,str]):
         tid = v.trip.trip_id  if v.HasField("trip") else ""
         rs  = (route_id_to_short.get(rid,"") or "").upper() or None
         if rs is None:
-            rs = _infer_short_from_ids(rid, tid)  # <-- Metro-friendly fallback
+            rs = _infer_short_from_ids(rid, tid)
         if ROUTE_SHORT_ALLOW and rs and rs not in ROUTE_SHORT_ALLOW:
             continue
         sid=getattr(v,"stop_id","")
