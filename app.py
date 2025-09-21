@@ -112,6 +112,8 @@ class StaticGTFS:
         self.available: bool = False
         self._ensure_dir_or_download(gtfs_dir)
         self.parent_to_name: Dict[str, str] = {}
+        self._name_norm_to_parentid: Dict[str, str] = {}
+        
         try:
             self._load(gtfs_dir)
             self._build_name_parent_index()
@@ -225,19 +227,19 @@ class StaticGTFS:
                 if sid:
                     self.stops[sid] = Stop(stop_id=sid, name=name, parent_station=parent)
 
-
     def _build_name_parent_index(self):
         name_to_parents: Dict[str, Set[str]] = defaultdict(set)
         for s in self.stops.values():
             parent = s.parent_station or s.stop_id
             name_to_parents[s.name].add(parent)
-            # remember name for this parent
             if parent not in self.parent_to_name:
                 self.parent_to_name[parent] = s.name
+    
         for name, parents in name_to_parents.items():
-            # keep the “first” parent for legacy lookups
-            self.stopname_to_parentid[name] = sorted(parents)[0]
-
+            first_parent = sorted(parents)[0]
+            self.stopname_to_parentid[name] = first_parent
+            # also index the normalized form
+            self._name_norm_to_parentid[self._norm_name(name)] = first_parent
 
     def parent_of(self, stop_id: str) -> str:
         """
@@ -258,7 +260,26 @@ class StaticGTFS:
         return digits if digits else stop_id
 
     def parent_by_name(self, name: str) -> Optional[str]:
-        return self.stopname_to_parentid.get(name)
+        # 1) exact match
+        p = self.stopname_to_parentid.get(name)
+        if p:
+            return p
+        # 2) normalized match
+        norm = self._norm_name(name)
+        return self._name_norm_to_parentid.get(norm)
+
+    @staticmethod
+    def _norm_name(s: str) -> str:
+        s = s.strip().lower()
+        # drop common suffixes
+        for suf in (" station", " railway station"):
+            if s.endswith(suf):
+                s = s[: -len(suf)]
+        # unify punctuation and whitespace
+        s = s.replace("&", "and")
+        s = "".join(ch for ch in s if ch.isalnum() or ch.isspace())
+        s = " ".join(s.split())
+        return s
 
 # -----------------------------
 # Live state
@@ -319,6 +340,9 @@ class LiveState:
         else:
             parent = self.gtfs.parent_by_name(base_name)
 
+        if not parent:
+            log.debug("[states] no parent for token base=%r (norm=%r)", base_name, self.gtfs._norm_name(base_name))
+                
         if not parent:
             return None
         return (parent, line_code)
