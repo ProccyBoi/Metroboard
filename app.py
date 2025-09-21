@@ -1,4 +1,4 @@
-# app.py — Metroboard backend (Rail + Metro) with multi-GTFS merge, async init, streaming-safe
+# app.py — Metroboard backend (Rail + Metro) with OOM-safe GTFS merge
 import os, time, csv, json, re, typing as T, random, requests, io, zipfile, shutil, tempfile, threading, gc
 from pathlib import Path
 from fastapi import FastAPI, Query
@@ -9,10 +9,14 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 """
-ENV TOGGLES (optional, all default to safe values):
-- MB_SKIP_PRIVATE=1             -> ignore the private GitHub API asset (useful if token/rate/size issues)
-- MB_ONLY_FIRST_SOURCE=1        -> after the first usable GTFS source, skip the rest (smallest memory footprint)
-- MB_MAX_STOP_TIMES=<int>       -> hard cap rows written to stop_times.txt (debug/testing only)
+ENV TOGGLES (optional):
+- MB_SKIP_PRIVATE=1              -> ignore the private GitHub API asset
+- MB_ONLY_FIRST_SOURCE=1         -> after the first usable GTFS source, skip the rest
+- MB_MAX_STOP_TIMES=<int>        -> cap rows written to stop_times.txt (debug/testing)
+- MB_STOP_TIMES_STRATEGY=first|append|dedup
+    first  = copy stop_times from the first source that has it (no dedup)  [default]
+    append = append stop_times from all sources (no dedup)
+    dedup  = dedup stop_times across sources (HIGH memory — not recommended)
 """
 
 # ---------------- Env helpers ----------------
@@ -61,7 +65,7 @@ GH_TAG   = os.getenv("GTFS_GH_TAG", "")
 GH_ASSET = os.getenv("GTFS_GH_ASSET", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
-# One or more direct zip URLs (e.g. your public Metro pseudo zip)
+# Direct/public zips (e.g. Metro pseudo)
 GTFS_STATIC_ZIP_URL  = os.getenv("GTFS_STATIC_ZIP_URL", "")
 GTFS_STATIC_ZIP_URLS = [u.strip() for u in os.getenv("GTFS_STATIC_ZIP_URLS", "").split(",") if u.strip()]
 if GTFS_STATIC_ZIP_URL and GTFS_STATIC_ZIP_URL not in GTFS_STATIC_ZIP_URLS:
@@ -72,6 +76,7 @@ MB_SKIP_PRIVATE       = os.getenv("MB_SKIP_PRIVATE", "0") in ("1", "true", "yes"
 MB_ONLY_FIRST_SOURCE  = os.getenv("MB_ONLY_FIRST_SOURCE", "0") in ("1", "true", "yes")
 MB_MAX_STOP_TIMES_RAW = os.getenv("MB_MAX_STOP_TIMES", "").strip()
 MB_MAX_STOP_TIMES     = int(MB_MAX_STOP_TIMES_RAW) if MB_MAX_STOP_TIMES_RAW.isdigit() else None
+MB_STOP_TIMES_STRATEGY = (os.getenv("MB_STOP_TIMES_STRATEGY", "first") or "first").lower()
 
 D_SOLID = int(os.getenv("MB_D_SOLID", "200"))
 D_NEAR  = int(os.getenv("MB_D_NEAR",  "800"))
@@ -181,7 +186,7 @@ def _download_release_asset_via_github(owner, repo, tag, asset_name, token) -> b
 def _download_sources_to_tempdirs() -> list[Path]:
     temp_dirs: list[Path] = []
 
-    # Private/full pack via GitHub API (unless explicitly skipped)
+    # Private/full pack via GitHub API
     if not MB_SKIP_PRIVATE and GH_OWNER and GH_REPO and GH_TAG and GH_ASSET:
         vlog(f"fetching GTFS via GitHub API {GH_OWNER}/{GH_REPO}@{GH_TAG} asset={GH_ASSET}")
         try:
@@ -202,7 +207,6 @@ def _download_sources_to_tempdirs() -> list[Path]:
         seen_urls.add(url)
         headers = {}
         if "github.com" in url.lower() and GITHUB_TOKEN:
-            # harmless even if the URL is public
             headers["Authorization"] = f"token {GITHUB_TOKEN}"
             headers["Accept"] = "application/octet-stream"
 
@@ -225,30 +229,112 @@ def _download_sources_to_tempdirs() -> list[Path]:
         raise RuntimeError("GTFS not present and no usable download source")
     return temp_dirs
 
+def _merge_stop_times(sources: list[Path], dest_dir: Path):
+    """OOM-safe: default 'first' strategy writes stop_times from the first source only (no dedup)."""
+    strategy = MB_STOP_TIMES_STRATEGY
+    out_path = dest_dir / "stop_times.txt"
+    tmp_path = dest_dir / "stop_times.txt.tmp"
+
+    def _copy_from(p: Path, writer: csv.DictWriter, wrote_header: bool, rows_written: int) -> tuple[bool,int]:
+        with p.open(encoding="utf-8-sig") as f:
+            r = csv.DictReader(f)
+            if not wrote_header:
+                writer.writeheader()
+                wrote_header = True
+            for row in r:
+                if MB_MAX_STOP_TIMES and rows_written >= MB_MAX_STOP_TIMES:
+                    break
+                writer.writerow({h: row.get(h, "") for h in writer.fieldnames})
+                rows_written += 1
+        return wrote_header, rows_written
+
+    # find first file for header
+    first_file = None
+    for src in sources:
+        p = src / "stop_times.txt"
+        if p.exists():
+            first_file = p
+            break
+    if not first_file:
+        raise RuntimeError("No stop_times.txt found in any source")
+
+    # open header to get fieldnames
+    with first_file.open(encoding="utf-8-sig") as f0:
+        r0 = csv.DictReader(f0)
+        header = r0.fieldnames or []
+    if not header:
+        raise RuntimeError("stop_times.txt has no header")
+
+    rows_written = 0
+    wrote_header = False
+    tmp_f = tmp_path.open("w", newline="", encoding="utf-8")
+    writer = csv.DictWriter(tmp_f, fieldnames=header)
+
+    try:
+        if strategy == "first":
+            wrote_header, rows_written = _copy_from(first_file, writer, wrote_header, rows_written)
+        elif strategy == "append":
+            for src in sources:
+                p = src / "stop_times.txt"
+                if not p.exists():
+                    continue
+                wrote_header, rows_written = _copy_from(p, writer, wrote_header, rows_written)
+                if MB_MAX_STOP_TIMES and rows_written >= MB_MAX_STOP_TIMES:
+                    break
+        elif strategy == "dedup":
+            # WARNING: memory-heavy; keep tiny LRU window only to avoid total explosion
+            seen = set()
+            writer.writeheader(); wrote_header=True
+            for src in sources:
+                p = src / "stop_times.txt"
+                if not p.exists():
+                    continue
+                with p.open(encoding="utf-8-sig") as f:
+                    r = csv.DictReader(f)
+                    for row in r:
+                        if MB_MAX_STOP_TIMES and rows_written >= MB_MAX_STOP_TIMES:
+                            break
+                        key = (row.get("trip_id","").strip(), row.get("stop_id","").strip(), row.get("stop_sequence","").strip())
+                        if key in seen:
+                            continue
+                        # keep set from growing without bound (sacrifice perfect dedup)
+                        if len(seen) > 500000:
+                            seen.clear()
+                            gc.collect()
+                        seen.add(key)
+                        writer.writerow({h: row.get(h, "") for h in header})
+                        rows_written += 1
+        else:
+            # fallback -> first
+            wrote_header, rows_written = _copy_from(first_file, writer, wrote_header, rows_written)
+    finally:
+        tmp_f.close()
+
+    tmp_path.replace(out_path)
+    vlog(f"merged stop_times.txt ({strategy}): rows={rows_written}")
+
 def _merge_csvs_streaming(sources: list[Path], dest_dir: Path):
     """
     Streaming, memory-safe merge:
-      - No in-memory out_rows list
-      - De-dup across sources using a small 'seen' key set
-      - Writes rows as they are read
+      - For all files EXCEPT stop_times.txt -> dedup across sources using a small set
+      - For stop_times.txt                   -> OOM-safe strategy (default 'first', no dedup)
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
 
+    # First handle normal files (no giant sets)
     keys = {
         "routes.txt":      ["route_id"],
         "trips.txt":       ["trip_id"],
         "stops.txt":       ["stop_id"],
-        "stop_times.txt":  ["trip_id", "stop_id", "stop_sequence"],
         "agency.txt":      ["agency_id"],
     }
 
-    for fname in NEEDED:
+    for fname in ["routes.txt","trips.txt","stops.txt","agency.txt"]:
         header: list[str] = []
         seen: set[tuple] = set()
         out_tmp = dest_dir / (fname + ".tmp")
         out_final = dest_dir / fname
 
-        # open output once; pick header from first source that has the file
         out_f = None
         writer = None
         written_rows = 0
@@ -262,13 +348,11 @@ def _merge_csvs_streaming(sources: list[Path], dest_dir: Path):
                     r = csv.DictReader(f)
                     if not header:
                         header = r.fieldnames or []
-                        # ensure output file exists with header
                         out_f = out_tmp.open("w", newline="", encoding="utf-8")
                         writer = csv.DictWriter(out_f, fieldnames=header)
                         writer.writeheader()
 
                     for row in r:
-                        # normalize key
                         pk_names = keys[fname]
                         if fname == "agency.txt" and not (row.get("agency_id") or "").strip():
                             row["agency_id"] = (row.get("agency_name") or "").strip() or f"AGENCY_{len(seen)+1}"
@@ -277,41 +361,33 @@ def _merge_csvs_streaming(sources: list[Path], dest_dir: Path):
                             continue
                         seen.add(key)
 
-                        # optional cap for stop_times (debug/testing only)
-                        if MB_MAX_STOP_TIMES and fname == "stop_times.txt" and written_rows >= MB_MAX_STOP_TIMES:
-                            continue
-
-                        # fill missing header fields
                         for h in header:
                             row.setdefault(h, "")
                         writer.writerow(row)
                         written_rows += 1
 
-                # free per-source file iterator memory
                 gc.collect()
 
             if not header:
                 raise RuntimeError(f"No header for {fname} after merge")
-
         finally:
             if out_f:
                 out_f.close()
 
-        # move into place
         if out_tmp.exists():
             out_tmp.replace(out_final)
-
         vlog(f"merged {fname}: rows={written_rows}")
 
-    # quick counts (avoid loading to memory)
+    # Then the big boy: stop_times (special handling)
+    _merge_stop_times(sources, dest_dir)
+
+    # quick counts
     def _count_rows(path: Path) -> int:
         try:
             with path.open(encoding="utf-8") as f:
-                # subtract header
                 return max(0, sum(1 for _ in f) - 1)
         except Exception:
             return 0
-
     vlog(
         f"Merged GTFS: routes={_count_rows(dest_dir/'routes.txt')}, "
         f"trips={_count_rows(dest_dir/'trips.txt')}, "
@@ -353,7 +429,6 @@ def load_route_overrides(path:str,json_env:str)->dict[str,str]:
         except Exception as e: vlog("WARN override env:",e)
     return out
 
-SHORT_RE = re.compile(r'\b([TM]\d{1,2})\b', re.I)
 def derive_short(rs,rl):
     rs=(rs or "").strip()
     if rs: return rs.upper()
@@ -407,7 +482,7 @@ def require_allowed_parents(stops: str,routes: str,trips: str,stop_times: str,ag
             p=parent_of((r.get("stop_id") or "").strip())
             if p and is_num_parent(p): allowed.add(p)
 
-    # 2) name-based parents (catches metro where static stop_times may be sparse)
+    # 2) name-based parents
     named=set()
     with open(stops,encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
