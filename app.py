@@ -452,53 +452,76 @@ class LiveState:
     # add this small wrapper:
     def counts_for_tokens(self, tokens: List[str]) -> Dict[str, int]:
         """
-        Robust counting:
-          1) exact (parent_id, line)
-          2) parent_id only (ignore line)
-          3) normalized name + line
-          4) normalized name only (ignore line)
+        Robust counting with both parent-id and normalized-name buckets.
+        Order of matching:
+          1) (parent_id, line)
+          2) (name_norm, line)
+          3) parent_id (any line)
+          4) name_norm (any line)
         """
-        # 1) Build buckets from cached trains
         from collections import Counter, defaultdict
 
+        # Build buckets from all upcoming stops (no 40-stop cap)
         by_parent_line: Counter[Tuple[str, str]] = Counter()
+        by_name_line:   Counter[Tuple[str, str]] = Counter()
         by_parent_only: Counter[str] = Counter()
-        name_norm_by_parent: Dict[str, str] = {}  # parent_id -> normed name
+        by_name_only:   Counter[str] = Counter()
+
+        # Map parent -> normed station name (stable, from static GTFS)
+        name_norm_by_parent: Dict[str, str] = {}
 
         for t in self.trains:
-            line = t.route_short  # 'T#' or 'M' (already normalized by your code)
+            line = t.route_short  # 'T#' or 'M'
             if not line:
                 continue
 
-            seen: Set[Tuple[str, str]] = set()
-            for sid in t.upcoming_stop_ids[:40]:
+            seen_parent_line: Set[Tuple[str, str]] = set()
+            seen_name_line:   Set[Tuple[str, str]] = set()
+            seen_parent:      Set[str] = set()
+            seen_name:        Set[str] = set()
+
+            for sid in t.upcoming_stop_ids:  # removed [:40]
                 parent = self.gtfs.parent_of(sid)
                 if not parent:
                     continue
-                key = (parent, line)
-                if key in seen:
-                    continue
-                seen.add(key)
-                by_parent_line[key] += 1
-                by_parent_only[parent] += 1
-                # cache a normalized name for fuzzy matching
+
                 if parent not in name_norm_by_parent:
                     pname = self.gtfs.parent_to_name.get(parent) or ""
                     name_norm_by_parent[parent] = self.gtfs._norm_name(pname)
+                name_norm = name_norm_by_parent[parent]
 
-        # Early out: if we somehow have nothing cached, return zeros quickly
-        if not by_parent_only:
+                # (parent,line)
+                kpl = (parent, line)
+                if kpl not in seen_parent_line:
+                    by_parent_line[kpl] += 1
+                    seen_parent_line.add(kpl)
+
+                # (name,line)
+                knl = (name_norm, line)
+                if name_norm and knl not in seen_name_line:
+                    by_name_line[knl] += 1
+                    seen_name_line.add(knl)
+
+                # parent only
+                if parent not in seen_parent:
+                    by_parent_only[parent] += 1
+                    seen_parent.add(parent)
+
+                # name only
+                if name_norm and name_norm not in seen_name:
+                    by_name_only[name_norm] += 1
+                    seen_name.add(name_norm)
+
+        if not by_parent_only and not by_name_only:
             return {tok: 0 for tok in tokens}
 
-        # 2) Small helpers reusing your token parsing and normalizer
-        def parse_tok(token: str) -> Optional[Tuple[str, str, str]]:
-            """Return (parent_id_from_name_lookup, line_code, normed_base_name) or None."""
+        def parse_tok(token: str):
+            """Return (parent_id_from_lookup, line_code, normed_base_name) or None."""
             token = token.strip()
             if not token:
                 return None
 
-            # strip optional ' (12345)' and split suffix (digits or 'M')
-            explicit_id: Optional[str] = None
+            explicit_id = None
             name_part = token
             if "(" in token and token.endswith(")"):
                 left = token.rfind("(")
@@ -519,11 +542,8 @@ class LiveState:
 
             parent = explicit_id if explicit_id else self.gtfs.parent_by_name(base_name)
             norm_name = self.gtfs._norm_name(base_name)
-            if not parent and not norm_name:
-                return None
             return (parent, line, norm_name)
 
-        # 3) Answer each token with layered matching
         out: Dict[str, int] = {}
         for tok in tokens:
             parsed = parse_tok(tok)
@@ -532,29 +552,32 @@ class LiveState:
                 continue
 
             parent, line, norm_name = parsed
-
             total = 0
-            # A) exact (parent, line)
+
+            # 1) exact (parent,line)
             if parent:
                 total = by_parent_line.get((parent, line), 0)
+                if total:
+                    out[tok] = total
+                    continue
 
-            # B) same parent, any line
-            if total == 0 and parent:
+            # 2) (name_norm,line)
+            if not total and norm_name:
+                total = by_name_line.get((norm_name, line), 0)
+                if total:
+                    out[tok] = total
+                    continue
+
+            # 3) parent only
+            if not total and parent:
                 total = by_parent_only.get(parent, 0)
+                if total:
+                    out[tok] = total
+                    continue
 
-            # C) normalized name + line
-            if total == 0 and norm_name:
-                for (p, l), v in by_parent_line.items():
-                    if l != line:
-                        continue
-                    if name_norm_by_parent.get(p) == norm_name:
-                        total += v
-
-            # D) normalized name, any line
-            if total == 0 and norm_name:
-                for p, v in by_parent_only.items():
-                    if name_norm_by_parent.get(p) == norm_name:
-                        total += v
+            # 4) name only
+            if not total and norm_name:
+                total = by_name_only.get(norm_name, 0)
 
             out[tok] = total
 
