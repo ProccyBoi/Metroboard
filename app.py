@@ -338,25 +338,24 @@ class LiveState:
         while i >= 0 and (t[i].isdigit() or t[i].upper() == "M"):
             i -= 1
         return t[: i + 1].strip()
-
-    def _counts_for_tokens_fallback(state: "LiveState", tokens: List[str]) -> Dict[str, int]:
+        
+    def _counts_for_tokens_fallback(self, tokens: List[str]) -> Dict[str, int]:
         from collections import Counter
         bucket_counts: Counter[Tuple[str, str]] = Counter()
     
         # Build counts keyed by (parent_id, line)
-        for t in state.trains:
+        for t in self.trains:
             line = t.route_short  # normalized 'T#' or 'M'
             if not line:
                 continue
             seen: Set[Tuple[str, str]] = set()
             for sid in t.upcoming_stop_ids[:40]:
-                parent = state.gtfs.parent_of(sid)
+                parent = self.gtfs.parent_of(sid)
                 key = (parent, line)
                 if key not in seen:
                     bucket_counts[key] += 1
                     seen.add(key)
     
-        # Helper to strip suffix/id from token -> base name
         def _base_name_from_token(tok: str) -> str:
             t = tok.strip()
             if "(" in t and t.endswith(")"):
@@ -366,7 +365,6 @@ class LiveState:
                 i -= 1
             return t[: i + 1].strip()
     
-        # Parse token "Central4", "ChatswoodM (211400)"
         def _parse_only_token(token: str) -> Optional[Tuple[str, str]]:
             token = token.strip()
             if not token:
@@ -384,7 +382,7 @@ class LiveState:
                 i -= 1
             base_name = name_part[: i + 1].strip()
             suffix_part = name_part[i + 1 :].strip()
-            # line code
+    
             s = suffix_part.upper()
             if s == "M":
                 line_code = "M"
@@ -394,11 +392,8 @@ class LiveState:
                 line_code = f"T{s}"
             else:
                 return None
-            # parent id
-            if explicit_id:
-                parent = explicit_id
-            else:
-                parent = state.gtfs.parent_by_name(base_name)
+    
+            parent = explicit_id if explicit_id else self.gtfs.parent_by_name(base_name)
             if not parent:
                 return None
             return (parent, line_code)
@@ -411,26 +406,28 @@ class LiveState:
                 continue
             parent, line = parsed
     
-            # 1) Exact (parent_id, line)
             total = bucket_counts.get((parent, line), 0)
     
-            # 2) Prefix match for degraded mode (e.g. '200060' vs '2000601')
             if total == 0:
                 for (p, l), v in bucket_counts.items():
                     if l == line and (p == parent or p.startswith(parent)):
                         total += v
     
-            # 3) Name+line fallback (heavy vs metro at same-named station)
             if total == 0:
                 base_name = _base_name_from_token(tok).lower()
                 for (p, l), v in bucket_counts.items():
                     if l != line:
                         continue
-                    pname = state.gtfs.parent_to_name.get(p, "")
+                    pname = self.gtfs.parent_to_name.get(p, "")
                     if pname and pname.lower() == base_name:
                         total += v
+    
             out[tok] = total
         return out
+    
+    # add this small wrapper:
+    def counts_for_tokens(self, tokens: List[str]) -> Dict[str, int]:
+        return self._counts_for_tokens_fallback(tokens)
 
 
 
@@ -655,12 +652,7 @@ async def get_states(only: Optional[str] = Query(default=None)):
     if not only:
         return JSONResponse({})
     tokens = [t for t in only.split(",") if t.strip()]
-    if hasattr(state, "counts_for_tokens"):
-        counts = state.counts_for_tokens(tokens)  # preferred
-    else:
-        log.warning("counts_for_tokens missing on LiveState; using fallback")
-        counts = state._counts_for_tokens_fallback(tokens)
+    counts = state.counts_for_tokens(tokens)
     return JSONResponse(counts)
-
 
 # run: uvicorn app:app --host 0.0.0.0 --port 8000
