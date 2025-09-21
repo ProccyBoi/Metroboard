@@ -448,6 +448,16 @@ async def refresh_loop(state: LiveState):
             metro_obs  = build_train_obs(state.gtfs, pairs_metro,  up_metro)
 
             state.set_trains(trains_obs + metro_obs)
+            if MB_VERBOSE:
+                sample = state.trains[:10]
+                for t in sample:
+                    log.info(
+                        "[debug] trip=%s route_id=%s short=%s first_stops=%s",
+                        t.trip_id,
+                        t.route_id,
+                        t.route_short,
+                        t.upcoming_stop_ids[:5],
+                    )
             log.info(
                 "[metroboard] processing trains=%d stations=%d static_available=%s",
                 len(state.trains),
