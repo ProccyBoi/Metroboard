@@ -1,18 +1,18 @@
-# app.py — Metroboard backend (Rail + Metro, schedule-first line assignment)
+# app.py — Metroboard backend (Rail + Metro, schedule-first + future-stop guard)
 # - Uses static GTFS (stops.txt, routes.txt, trips.txt, stop_times.txt, agency.txt)
 # - Filters to route_type in (1=subway/metro, 2=rail); optional agency allow-list
 # - Builds station×route keys like "Central1" (T1) and "CentralM" (M1)
-# - GTFS-RT from TfNSW: Sydney Trains + Sydney Metro VehiclePositions + TripUpdates
+# - GTFS-RT from TfNSW: VehiclePositions + TripUpdates (v2 /gtfs/realtime/)
 # - Logic:
 #     1) Prefer TripUpdates (schedule) to determine current/next stop & status, fill route
 #     2) Join TU with VP by trip_id and/or vehicle.id to fill missing route on VP
-#     3) Fallback to geo distance thresholds when schedule info is unavailable
+#     3) Fallback to geo distance thresholds, BUT only if the trip will actually visit that station (future-stop guard)
 # - Endpoints: /, /healthz, /debug, /stations, /states, /trains
 #
 # ENV (examples):
 #   TFNSW_API_TOKEN=...                 # required
 #   FEEDS=...                           # optional CSV of VehiclePositions feeds (default ST+Metro)
-#   FEEDS_TU=...                        # optional CSV of TripUpdates feeds (default ST+Metro)
+#   FEEDS_TU=...                        # optional CSV overrides for TripUpdates; defaults to v2 realtime endpoints
 #   FEED_CACHE_SEC=3
 #   MB_D_SOLID=300  MB_D_NEAR=1000  MB_D_FAR=2000
 #   MB_FORCE_DISTANCE=0               # if 1, ignore VP.stop_id/TU schedule and always use geo
@@ -27,7 +27,6 @@
 # Notes:
 # - Keep your static GTFS files next to this app.
 # - You MUST provide TFNSW API token via env.
-# - This file is safe to redeploy on Koyeb as-is.
 
 import os
 import time
@@ -58,17 +57,17 @@ else:
         "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/metro",
     ]
 
-# TripUpdates feeds
+# TripUpdates feeds (v2 realtime). You can override with FEEDS_TU if TfNSW rotates URLs.
 _FEEDS_TU_ENV = os.getenv("FEEDS_TU", "").strip()
 if _FEEDS_TU_ENV:
     URLS_TU = [u.strip() for u in _FEEDS_TU_ENV.split(",") if u.strip()]
 else:
     URLS_TU = [
-    "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains",
-    "https://api.transport.nsw.gov.au/v2/gtfs/realtime/metro",
+        "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains",
+        "https://api.transport.nsw.gov.au/v2/gtfs/realtime/metro",
     ]
 
-# Distance thresholds (meters) for fallback
+# Distance thresholds (meters) for fallback (tune via env)
 D_SOLID = int(os.getenv("MB_D_SOLID", "300"))
 D_NEAR  = int(os.getenv("MB_D_NEAR",  "1000"))
 D_FAR   = int(os.getenv("MB_D_FAR",   "2000"))
@@ -667,6 +666,38 @@ def build_trip_next_stop(feed: rt.FeedMessage) -> dict[str, tuple[str, int]]:
             out[tid] = (best[1], best[2])
     return out
 
+def build_trip_future_parents(feed: rt.FeedMessage, child_to_parent: dict[str, str]) -> dict[str, set[str]]:
+    """
+    For each trip_id, collect the set of parent_station ids the trip still has ahead
+    (including current/next), based on stop_time_update sequence. Used to gate
+    distance fallback so we don't light stations the trip will never serve.
+    """
+    out: dict[str, set[str]] = {}
+    now = int(time.time())
+    for e in feed.entity:
+        if not e.HasField("trip_update"):
+            continue
+        tu = e.trip_update
+        tid = tu.trip.trip_id if tu.trip.HasField("trip_id") else ""
+        if not tid:
+            continue
+        parents: set[str] = set()
+        for stu in tu.stop_time_update:
+            sid = stu.stop_id
+            if not sid:
+                continue
+            arr_t = stu.arrival.time if stu.HasField("arrival") and hasattr(stu.arrival, "time") else None
+            dep_t = stu.departure.time if stu.HasField("departure") and hasattr(stu.departure, "time") else None
+            t_ref = dep_t or arr_t
+            if t_ref is not None and t_ref < (now - 90):  # already departed >90s ago
+                continue
+            parent = child_to_parent.get(sid) or (sid if sid.isdigit() else None)
+            if parent:
+                parents.add(parent)
+        if parents:
+            out[tid] = parents
+    return out
+
 # ---------------- Collect trains (with TU join) ----------------
 def collect_trains(
     feed: rt.FeedMessage,
@@ -884,7 +915,8 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
 
     # Build TU-based indices
     tu_by_vehicle, _active_trips = index_trip_updates(tu)
-    trip_next = build_trip_next_stop(tu)  # trip_id -> (child_stop_id, status)
+    trip_next = build_trip_next_stop(tu)                    # trip_id -> (child_stop_id, VP-like status)
+    trip_future = build_trip_future_parents(tu, CHILD_TO_PARENT)  # trip_id -> {future parent stations}
 
     # Get trains with line filled in where possible
     trains, _by_route = collect_trains(vp, ROUTE_ID_TO_SHORT, TRIP_TO_ROUTEID, tu_by_vehicle)
@@ -942,11 +974,13 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
                     elif st == VP_INCOMING:
                         best = max(best, 2); matches += 1
 
-            # 3) Distance fallback
+            # 3) Distance fallback — ONLY if this trip will actually visit pid
             if best < 3 and tlat is not None and tlon is not None:
-                d = hav_m(slat, slon, tlat, tlon)
-                if best_d is None or d < best_d:
-                    best_d = d
+                # If we know the trip_id, require pid in its future parents; otherwise allow (e.g., if some trains lack TU)
+                if (tid is None) or (pid in trip_future.get(tid, set())):
+                    d = hav_m(slat, slon, tlat, tlon)
+                    if best_d is None or d < best_d:
+                        best_d = d
 
         if best == 0 and best_d is not None:
             best = status_from_dist(best_d)
