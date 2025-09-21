@@ -144,22 +144,63 @@ def _promote_inner_gtfs_files(root: Path):
                     shutil.move(str(src), str(dst))
             return
 
-def _download_release_asset_via_github(owner: str, repo: str, tag: str, asset_name: str, token: str) -> bytes:
-    if not token:
-        raise RuntimeError("GITHUB_TOKEN required for GitHub release download")
-    api_base = f"https://api.github.com/repos/{owner}/{repo}"
-    headers_json = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-    rel = requests.get(f"{api_base}/releases/tags/{tag}", headers=headers_json, timeout=60)
-    rel.raise_for_status()
-    data = rel.json()
-    asset = next((a for a in data.get("assets", []) if a.get("name") == asset_name), None)
-    if not asset:
-        raise RuntimeError(f"Asset '{asset_name}' not found on release tag '{tag}'")
-    asset_id = asset["id"]
-    headers_bin = {"Authorization": f"token {token}", "Accept": "application/octet-stream"}
-    dl = requests.get(f"{api_base}/releases/assets/{asset_id}", headers=headers_bin, timeout=300)
-    dl.raise_for_status()
-    return dl.content
+def _download_sources_to_tempdirs() -> list[Path]:
+    """Return list of temp dirs each containing a full set of GTFS base files."""
+    temp_dirs: list[Path] = []
+
+    # 1) Private/full pack via GitHub API (requires GITHUB_TOKEN)
+    if GH_OWNER and GH_REPO and GH_TAG and GH_ASSET:
+        vlog(f"fetching GTFS via GitHub API {GH_OWNER}/{GH_REPO}@{GH_TAG} asset={GH_ASSET}")
+        try:
+            data = _download_release_asset_via_github(GH_OWNER, GH_REPO, GH_TAG, GH_ASSET, GITHUB_TOKEN)
+            td = Path(tempfile.mkdtemp(prefix="gtfs_src_"))
+            _extract_zip_bytes(data, td)
+            temp_dirs.append(td)
+        except Exception as e:
+            # API path is the only supported way for private assets; if it fails, keep going
+            vlog("WARN GitHub API asset fetch failed:", e)
+
+    # 2) Public/direct zips — skip cleanly on 404/403/etc.
+    #    If someone accidentally includes a private releases/download URL here, we won't crash.
+    seen_urls: set[str] = set()
+    for url in GTFS_STATIC_ZIP_URLS:
+        if not url or url in seen_urls:
+            continue
+        seen_urls.add(url)
+        headers = {}
+        if "github.com" in url.lower() and GITHUB_TOKEN:
+            # This header does NOT grant access to private releases/download URLs, but harmless if present.
+            headers["Authorization"] = f"token {GITHUB_TOKEN}"
+            headers["Accept"] = "application/octet-stream"
+
+        vlog(f"downloading GTFS static zip: {url}")
+        try:
+            r = requests.get(url, headers=headers, timeout=300)
+            # Gracefully skip "not available" static sources
+            if r.status_code in (403, 404):
+                vlog(f"skip static GTFS (HTTP {r.status_code}): {url}")
+                continue
+            r.raise_for_status()
+            td = Path(tempfile.mkdtemp(prefix="gtfs_src_"))
+            _extract_zip_bytes(r.content, td)
+            temp_dirs.append(td)
+        except Exception as e:
+            vlog("WARN static GTFS download failed:", url, e)
+
+    if not temp_dirs:
+        raise RuntimeError("GTFS not present and no usable download source")
+
+    # sanity: every source must have the needed files
+    for td in temp_dirs:
+        missing = [f for f in NEEDED if not (td / f).exists()]
+        if missing:
+            vlog(f"WARN GTFS source at {td} missing: {missing} (skipping)")
+    temp_dirs = [td for td in temp_dirs if all((td / f).exists() for f in NEEDED)]
+    if not temp_dirs:
+        raise RuntimeError("GTFS sources fetched but incomplete after filtering")
+
+    return temp_dirs
+
 
 def _extract_zip_bytes(data: bytes, out_dir: Path):
     with zipfile.ZipFile(io.BytesIO(data)) as z:
