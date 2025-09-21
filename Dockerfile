@@ -1,18 +1,25 @@
+# Dockerfile
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# deps
+# Keep logs unbuffered & avoid pyc files
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# ---- Install deps ----
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# copy code and static GTFS (folder)
+# ---- App code ----
 COPY app.py .
-COPY gtfs/ /app/gtfs/
 
-# tell the app where GTFS lives (matches app default, but explicit is nice)
+# Ensure a place for GTFS to be extracted
+RUN mkdir -p /app/gtfs
 ENV GTFS_DIR=/app/gtfs
-ENV PYTHONUNBUFFERED=1
+
+# Default GTFS ZIP (can be overridden by env on your platform)
+ENV GTFS_STATIC_ZIP_URL=https://github.com/ProccyBoi/Metroboard/releases/download/v1.0-gtfs/gtfs.zip
 
 EXPOSE 8000
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
