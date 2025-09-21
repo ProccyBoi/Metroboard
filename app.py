@@ -258,18 +258,30 @@ class StaticGTFS:
         return True
 
     def _is_station_parent(self, pid: str) -> bool:
-        # must exist and be a location_type=1 "station"
+        # must exist and be a location_type=1 "station" (GTFS)
         s = self.stops.get(pid)
         if not s or s.location_type != 1:
             return False
+    
         nm = (s.name or "").lower()
-        # drop obvious bus/light-rail/bus-stand phrasing seen in your data
+    
+        # Keep this list VERY conservative. Do NOT exclude "platform" — many parents include it in this GTFS.
         bad_substrings = (
-            "stand ", "nightride", "light rail", " concourse", " opp ", " at "
+            " stand ",      # bus stand
+            " stand-",      # safety
+            " nightride",   # bus
+            " light rail",  # different mode
+            " concourse",   # concourse, not a platform/station parent we want
+            " opp ",        # bus naming pattern
+            " at ",         # bus naming pattern ("Rd at ...")
         )
-        if any(k in nm for k in bad_substrings):
+        # pad name with spaces so " stand " match is reliable
+        padded = f" {nm} "
+        if any(k in padded for k in bad_substrings):
             return False
-        return True
+
+    return True
+
 
     def _compute_allowed_sets(self):
         # 1) allowed routes (by type/agency)
@@ -604,6 +616,16 @@ def build_train_obs(gtfs: StaticGTFS, pairs: List[Tuple[str, str]], upcoming: Di
             continue
         # Keep only stops whose parent is allowed — trim noise even earlier
         filtered = [sid for sid in stops if gtfs.parent_of(sid) in gtfs.allowed_parent_ids]
+        if not filtered:
+            # DEBUG: show why this trip got dropped
+            for sid in stops[:6]:
+                parent = gtfs.parent_of(sid)
+                log.debug("[drop] trip=%s route=%s sid=%s parent=%s allowed=%s name=%s",
+                          trip_id, route_id, sid, parent,
+                          parent in gtfs.allowed_parent_ids,
+                          gtfs.parent_to_name.get(parent, ""))
+            continue
+
         if not filtered:
             continue
         trains.append(TrainObs(trip_id=trip_id, route_id=route_id, route_short=short, upcoming_stop_ids=filtered))
