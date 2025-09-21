@@ -144,6 +144,29 @@ def _promote_inner_gtfs_files(root: Path):
                     shutil.move(str(src), str(dst))
             return
 
+def _extract_zip_bytes(data: bytes, out_dir: Path):
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        z.extractall(out_dir)
+    _promote_inner_gtfs_files(out_dir)
+
+# --- GitHub release asset helper (private assets via API) ---
+def _download_release_asset_via_github(owner: str, repo: str, tag: str, asset_name: str, token: str) -> bytes:
+    if not token:
+        raise RuntimeError("GITHUB_TOKEN required for GitHub release download")
+    api_base = f"https://api.github.com/repos/{owner}/{repo}"
+    headers_json = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+    rel = requests.get(f"{api_base}/releases/tags/{tag}", headers=headers_json, timeout=60)
+    rel.raise_for_status()
+    data = rel.json()
+    asset = next((a for a in data.get("assets", []) if a.get("name") == asset_name), None)
+    if not asset:
+        raise RuntimeError(f"Asset '{asset_name}' not found on release tag '{tag}'")
+    asset_id = asset["id"]
+    headers_bin = {"Authorization": f"token {token}", "Accept": "application/octet-stream"}
+    dl = requests.get(f"{api_base}/releases/assets/{asset_id}", headers=headers_bin, timeout=300)
+    dl.raise_for_status()
+    return dl.content
+
 def _download_sources_to_tempdirs() -> list[Path]:
     """Return list of temp dirs each containing a full set of GTFS base files."""
     temp_dirs: list[Path] = []
@@ -157,11 +180,9 @@ def _download_sources_to_tempdirs() -> list[Path]:
             _extract_zip_bytes(data, td)
             temp_dirs.append(td)
         except Exception as e:
-            # API path is the only supported way for private assets; if it fails, keep going
             vlog("WARN GitHub API asset fetch failed:", e)
 
     # 2) Public/direct zips — skip cleanly on 404/403/etc.
-    #    If someone accidentally includes a private releases/download URL here, we won't crash.
     seen_urls: set[str] = set()
     for url in GTFS_STATIC_ZIP_URLS:
         if not url or url in seen_urls:
@@ -169,14 +190,13 @@ def _download_sources_to_tempdirs() -> list[Path]:
         seen_urls.add(url)
         headers = {}
         if "github.com" in url.lower() and GITHUB_TOKEN:
-            # This header does NOT grant access to private releases/download URLs, but harmless if present.
+            # Doesn't grant private /releases/download access, but harmless.
             headers["Authorization"] = f"token {GITHUB_TOKEN}"
             headers["Accept"] = "application/octet-stream"
 
         vlog(f"downloading GTFS static zip: {url}")
         try:
             r = requests.get(url, headers=headers, timeout=300)
-            # Gracefully skip "not available" static sources
             if r.status_code in (403, 404):
                 vlog(f"skip static GTFS (HTTP {r.status_code}): {url}")
                 continue
@@ -191,67 +211,28 @@ def _download_sources_to_tempdirs() -> list[Path]:
         raise RuntimeError("GTFS not present and no usable download source")
 
     # sanity: every source must have the needed files
+    filtered: list[Path] = []
     for td in temp_dirs:
         missing = [f for f in NEEDED if not (td / f).exists()]
         if missing:
             vlog(f"WARN GTFS source at {td} missing: {missing} (skipping)")
-    temp_dirs = [td for td in temp_dirs if all((td / f).exists() for f in NEEDED)]
-    if not temp_dirs:
+        else:
+            filtered.append(td)
+
+    if not filtered:
         raise RuntimeError("GTFS sources fetched but incomplete after filtering")
 
-    return temp_dirs
-
-
-def _extract_zip_bytes(data: bytes, out_dir: Path):
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
-        z.extractall(out_dir)
-    _promote_inner_gtfs_files(out_dir)
-
-def _download_sources_to_tempdirs() -> list[Path]:
-    """Return list of temp dirs each containing a full set of GTFS base files."""
-    temp_dirs: list[Path] = []
-
-    # GitHub asset (usually your 'full trains' pack)
-    if GH_OWNER and GH_REPO and GH_TAG and GH_ASSET:
-        vlog(f"fetching GTFS via GitHub API {GH_OWNER}/{GH_REPO}@{GH_TAG} asset={GH_ASSET}")
-        data = _download_release_asset_via_github(GH_OWNER, GH_REPO, GH_TAG, GH_ASSET, GITHUB_TOKEN)
-        td = Path(tempfile.mkdtemp(prefix="gtfs_src_"))
-        _extract_zip_bytes(data, td)
-        temp_dirs.append(td)
-
-    # Direct zips (e.g., your metro pseudo)
-    for url in GTFS_STATIC_ZIP_URLS:
-        headers = {}
-        if "github.com" in url.lower() and GITHUB_TOKEN:
-            headers["Authorization"] = f"token {GITHUB_TOKEN}"
-            headers["Accept"] = "application/octet-stream"
-        vlog(f"downloading GTFS static zip: {url}")
-        r = requests.get(url, headers=headers, timeout=300)
-        r.raise_for_status()
-        td = Path(tempfile.mkdtemp(prefix="gtfs_src_"))
-        _extract_zip_bytes(r.content, td)
-        temp_dirs.append(td)
-
-    if not temp_dirs:
-        raise RuntimeError("GTFS not present and no download source configured")
-
-    # sanity: every source must have the needed files
-    for td in temp_dirs:
-        missing = [f for f in NEEDED if not (td / f).exists()]
-        if missing:
-            raise RuntimeError(f"GTFS source at {td} missing: {missing}")
-    return temp_dirs
+    return filtered
 
 def _merge_csvs(sources: list[Path], dest_dir: Path):
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    # per-file primary keys
     keys = {
         "routes.txt":      ["route_id"],
         "trips.txt":       ["trip_id"],
         "stops.txt":       ["stop_id"],
         "stop_times.txt":  ["trip_id", "stop_id", "stop_sequence"],
-        "agency.txt":      ["agency_id"],  # if blank, we’ll fallback
+        "agency.txt":      ["agency_id"],
     }
 
     for fname in NEEDED:
@@ -259,22 +240,18 @@ def _merge_csvs(sources: list[Path], dest_dir: Path):
         out_rows: list[dict] = []
         header: list[str] = []
 
-        # collect in order
         for src in sources:
             p = src / fname
-            if not p.exists():  # should not happen thanks to earlier check
+            if not p.exists():
                 continue
             with p.open(encoding="utf-8-sig") as f:
                 r = csv.DictReader(f)
                 if not header:
                     header = r.fieldnames or []
                 for row in r:
-                    # normalize key
-                    pk_names = keys[fname]
                     if fname == "agency.txt" and not row.get("agency_id", "").strip():
-                        # try to synthesize a key
                         row["agency_id"] = (row.get("agency_name") or "").strip() or f"AGENCY_{len(seen)+1}"
-                    key = tuple((row.get(k) or "").strip() for k in pk_names)
+                    key = tuple((row.get(k) or "").strip() for k in keys[fname])
                     if key in seen:
                         continue
                     seen.add(key)
@@ -283,12 +260,10 @@ def _merge_csvs(sources: list[Path], dest_dir: Path):
         if not header:
             raise RuntimeError(f"No header for {fname} after merge")
 
-        # write merged
         with (dest_dir / fname).open("w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=header)
             w.writeheader()
             for row in out_rows:
-                # ensure all headers exist
                 for h in header:
                     row.setdefault(h, "")
                 w.writerow(row)
@@ -297,14 +272,6 @@ def _merge_csvs(sources: list[Path], dest_dir: Path):
          f"trips={sum(1 for _ in open(dest_dir/'trips.txt',encoding='utf-8'))-1}, "
          f"stops={sum(1 for _ in open(dest_dir/'stops.txt',encoding='utf-8'))-1}")
 
-def ensure_gtfs(dirpath: str):
-    root = Path(dirpath)
-    root.mkdir(parents=True, exist_ok=True)
-    if all((root / f).exists() for f in NEEDED):
-        return
-    src_dirs = _download_sources_to_tempdirs()
-    _merge_csvs(src_dirs, root)
-    # temp dirs auto-removed on container recycle; if you want, clean them here.
 
 # ---------------- Route/GTFS helpers ----------------
 def load_route_overrides(path:str,json_env:str)->dict[str,str]:
