@@ -31,7 +31,7 @@ GH_OWNER = os.getenv("GTFS_GH_OWNER", "")
 GH_REPO  = os.getenv("GTFS_GH_REPO", "")
 GH_TAG   = os.getenv("GTFS_GH_TAG", "")
 GH_ASSET = os.getenv("GTFS_GH_ASSET", "")
-
+STRICT_LINE_MATCH = str(os.getenv("STRICT_LINE_MATCH", "0")).lower() in ("1","true","yes")
 
 ENDPOINTS = {
     "tu_trains": "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains",
@@ -46,6 +46,11 @@ try:
     ROUTE_SHORT_OVERRIDES = json.loads(os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "{}"))
 except json.JSONDecodeError:
     ROUTE_SHORT_OVERRIDES = {}
+
+try:
+    LINE_ALIASES = json.loads(os.getenv("LINE_ALIASES_JSON", "{}"))
+except json.JSONDecodeError:
+    LINE_ALIASES = {}
 
 # -----------------------------
 # Logging
@@ -553,17 +558,18 @@ class LiveState:
 
             parent, line, norm_name = parsed
             total = 0
-
-            # 1) exact (parent,line)
+            aliases = LINE_ALIASES.get(line, [line])
+            
+            # 1) exact (parent, any_alias_line)
             if parent:
-                total = by_parent_line.get((parent, line), 0)
+                total = sum(by_parent_line.get((parent, al), 0) for al in aliases)
                 if total:
                     out[tok] = total
                     continue
-
-            # 2) (name_norm,line)
-            if not total and norm_name:
-                total = by_name_line.get((norm_name, line), 0)
+            
+            # 2) (name_norm, any_alias_line)
+            if norm_name:
+                total = sum(by_name_line.get((norm_name, al), 0) for al in aliases)
                 if total:
                     out[tok] = total
                     continue
@@ -575,11 +581,27 @@ class LiveState:
                     out[tok] = total
                     continue
 
-            # 4) name only
+            # 4) name only (any line)
             if not total and norm_name:
                 total = by_name_only.get(norm_name, 0)
+            
+            # If still zero and we're lenient, allow parent-only as final fallback
+            if not total and not STRICT_LINE_MATCH and parent:
+                total = max(total, by_parent_only.get(parent, 0))
 
             out[tok] = total
+
+            log.info("[states] buckets: parent_line=%d name_line=%d parent_only=%d name_only=%d",
+             len(by_parent_line), len(by_name_line), len(by_parent_only), len(by_name_only))
+    
+            # Optional: top lines and top station names
+            from collections import Counter
+            line_hist = Counter([ln for (_, ln) in by_parent_line.keys()])
+            log.info("[states] lines seen: %s", dict(line_hist.most_common(10)))
+            
+            sample_names = list(by_name_only.items())[:20]
+            log.info("[states] sample names: %s", [(k, v) for k, v in sample_names])
+
 
         return out
 
