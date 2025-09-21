@@ -1,5 +1,6 @@
-# app.py — Metroboard (TU-based) with single GTFS source (no static 404s, selective extract)
-import os, io, zipfile, asyncio, csv, json, re, shutil
+# app.py — Metroboard (TU-based) with single GTFS source
+# Minimal static: merges ONLY routes.txt, trips.txt, stops.txt from all subfolders
+import os, io, zipfile, asyncio, csv, json, re
 from pathlib import Path
 from collections import defaultdict, Counter
 from dataclasses import dataclass
@@ -26,8 +27,7 @@ GH_TAG   = os.getenv("GTFS_GH_TAG",   "")
 GH_ASSET = os.getenv("GTFS_GH_ASSET", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 
-# DO NOT set GTFS_STATIC_ZIP_URL; we intentionally ignore it to avoid 404 churn
-# If you insist on a fallback, set FALLBACK_STATIC_ZIP_URL (must be valid), else leave blank.
+# Optional single fallback (kept, but ignored unless GH asset fails)
 FALLBACK_STATIC_ZIP_URL = os.getenv("FALLBACK_STATIC_ZIP_URL", "").strip()
 
 MB_VERBOSE = os.getenv("MB_VERBOSE", "0") in ("1","true","yes")
@@ -133,31 +133,66 @@ except Exception:
 # -----------------------------
 # Static GTFS (routes/trips/stops only)
 # -----------------------------
-def _extract_selected_gtfs(zip_bytes: bytes, out_dir: str,
-                           needed=("routes.txt","trips.txt","stops.txt")):
-    """Extract only the needed GTFS files from the zip (handles nested paths)."""
-    z = zipfile.ZipFile(io.BytesIO(zip_bytes))
-    names = z.namelist()
-
-    def find_member(target: str) -> Optional[str]:
-        tl = target.lower()
-        for n in names:
-            nl = n.lower()
-            # match exact or ".../target"
-            if nl == tl or nl.endswith("/" + tl):
-                return n
-        return None
-
+def _merge_minimal_gtfs(zip_bytes: bytes, out_dir: str):
+    """
+    Merge ALL instances of routes.txt, trips.txt, stops.txt from the zip (across subfolders).
+    Dedup by key; do NOT touch stop_times.txt.
+    """
     Path(out_dir).mkdir(parents=True, exist_ok=True)
-    found = 0
-    for fname in needed:
-        member = find_member(fname)
-        if not member:
-            raise RuntimeError(f"{fname} not found in GTFS zip")
-        data = z.read(member)
-        (Path(out_dir)/fname).write_bytes(data)
-        found += 1
-    vlog(f"extracted {found}/{len(needed)} GTFS files into {out_dir}")
+    with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
+        names = z.namelist()
+
+        def want(fname: str, target: str) -> bool:
+            nl = fname.lower()
+            return nl == target or nl.endswith("/" + target)
+
+        plan = {
+            "routes.txt": {"key": ["route_id"], "rows": [], "seen": set(), "headers": []},
+            "trips.txt":  {"key": ["trip_id"],  "rows": [], "seen": set(), "headers": []},
+            "stops.txt":  {"key": ["stop_id"],  "rows": [], "seen": set(), "headers": []},
+        }
+
+        for target in plan.keys():
+            members = [n for n in names if want(n, target)]
+            if not members:
+                raise RuntimeError(f"{target} not found anywhere in GTFS zip")
+
+            for m in members:
+                with z.open(m) as fh:
+                    text = io.TextIOWrapper(fh, encoding="utf-8-sig", newline="")
+                    rdr = csv.DictReader(text)
+                    if not rdr.fieldnames:
+                        continue
+                    # union headers
+                    hdrs = [h for h in rdr.fieldnames if h is not None]
+                    plan[target]["headers"] = list(dict.fromkeys(plan[target]["headers"] + hdrs))
+                    for row in rdr:
+                        # build key
+                        k = tuple((row.get(kf) or "").strip() for kf in plan[target]["key"])
+                        if not all(k):  # any empty key part -> skip
+                            continue
+                        if k in plan[target]["seen"]:
+                            continue
+                        plan[target]["seen"].add(k)
+                        plan[target]["rows"].append({(kk or "").strip(): (vv or "").strip() for kk, vv in row.items()})
+
+        # write out
+        for target, agg in plan.items():
+            # ensure keys are present & first in header
+            keys = [h for h in plan[target]["key"] if h in agg["headers"]]
+            others = [h for h in agg["headers"] if h not in keys]
+            headers = keys + others
+            out_path = Path(out_dir) / target
+            with out_path.open("w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=headers)
+                w.writeheader()
+                for row in agg["rows"]:
+                    # make sure all headers exist
+                    for h in headers:
+                        row.setdefault(h, "")
+                    w.writerow(row)
+
+    vlog(f"merged routes={len(plan['routes.txt']['rows'])}, trips={len(plan['trips.txt']['rows'])}, stops={len(plan['stops.txt']['rows'])}")
 
 class StaticGTFS:
     def __init__(self, gtfs_dir: str):
@@ -219,8 +254,7 @@ class StaticGTFS:
                 print("[metroboard] WARN: fallback static zip failed", resp.status_code)
 
         if data:
-            # Extract ONLY the 3 required files — never stop_times.txt
-            _extract_selected_gtfs(data, d)
+            _merge_minimal_gtfs(data, d)   # << merge across all folders
         else:
             raise FileNotFoundError("No static GTFS available (GH + fallback both unavailable)")
 
@@ -246,7 +280,6 @@ class StaticGTFS:
 
         with op("stops.txt") as f:
             r=csv.DictReader(f)
-            # cope with BOM in header
             fns=[h.strip().lstrip("\ufeff") for h in (r.fieldnames or [])]
             if "stop_id" not in fns: raise ValueError("stops.txt missing stop_id")
             for row in r:
@@ -277,7 +310,6 @@ class StaticGTFS:
     def parent_of(self, stop_id: str) -> str:
         st = self.stops.get(stop_id)
         if st: return st.parent_station or st.stop_id
-        # lenient numeric prefix fallback (e.g. "2000123")
         digits = "".join(ch for ch in stop_id if ch.isdigit())
         return digits or stop_id
 
@@ -337,7 +369,6 @@ class LiveState:
             if "(" in tok and tok.endswith(")"):
                 left=tok.rfind("("); maybe=tok[left+1:-1].strip()
                 if maybe.isdigit(): explicit_id=maybe; name_part=tok[:left].strip()
-            # split base name + suffix
             i=len(name_part)-1
             while i>=0 and (name_part[i].isdigit() or name_part[i].upper()=="M"): i-=1
             base=name_part[:i+1].strip(); sfx=name_part[i+1:].strip()
