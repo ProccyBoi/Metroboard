@@ -109,15 +109,45 @@ class StaticGTFS:
             log.warning("[metroboard] static GTFS missing (%s). Running in degraded mode.", e)
 
     def _ensure_dir_or_download(self, d: str):
+        # If already present (top-level routes.txt), we're good.
         if os.path.isdir(d) and os.path.exists(os.path.join(d, "routes.txt")):
             return
-        if GTFS_STATIC_ZIP_URL or (os.getenv("GTFS_GH_OWNER") and os.getenv("GTFS_GH_REPO")):
-            os.makedirs(d, exist_ok=True)
-            # ... your current download code ...
-            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-                z.extractall(d)
-            self._promote_inner_gtfs_files(d)   # <-- add this line
-            log.info("[metroboard] GTFS static extracted to %s", d)
+    
+        os.makedirs(d, exist_ok=True)
+        data: Optional[bytes] = None
+    
+        # Prefer GitHub API envs if provided (owner/repo/tag/asset)
+        if GH_OWNER and GH_REPO and GH_TAG and GH_ASSET:
+            log.info(
+                "[metroboard] fetching GTFS via GitHub API owner=%s repo=%s tag=%s asset=%s",
+                GH_OWNER, GH_REPO, GH_TAG, GH_ASSET
+            )
+            data = _download_release_asset_via_github(
+                GH_OWNER, GH_REPO, GH_TAG, GH_ASSET, GITHUB_TOKEN
+            )
+    
+        # Otherwise fall back to direct URL, optionally with token if it's a GitHub URL
+        elif GTFS_STATIC_ZIP_URL:
+            log.info("[metroboard] downloading GTFS static zip from %s ...", GTFS_STATIC_ZIP_URL)
+            headers = {}
+            if "github.com" in GTFS_STATIC_ZIP_URL.lower() and GITHUB_TOKEN:
+                headers["Authorization"] = f"token {GITHUB_TOKEN}"
+                headers["Accept"] = "application/octet-stream"
+            resp = requests.get(GTFS_STATIC_ZIP_URL, headers=headers, timeout=300)
+            resp.raise_for_status()
+            data = resp.content
+    
+        # If we still have no data, just return (run in degraded mode)
+        if not data:
+            log.warning("[metroboard] no GTFS source configured; running in degraded mode.")
+            return
+    
+        # Extract, then promote nested files if needed
+        with zipfile.ZipFile(io.BytesIO(data)) as z:
+            z.extractall(d)
+        self._promote_inner_gtfs_files(d)
+        log.info("[metroboard] GTFS static extracted to %s", d)
+
 
     def _promote_inner_gtfs_files(self, d: str):
         """
