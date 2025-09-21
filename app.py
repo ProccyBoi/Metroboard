@@ -1,5 +1,7 @@
 # app.py
 import os
+import io
+import zipfile
 import asyncio
 import csv
 import logging
@@ -18,6 +20,7 @@ from fastapi.responses import JSONResponse
 TFNSW_API_KEY = os.getenv("TFNSW_API_KEY", "")
 GTFS_DIR = os.getenv("GTFS_DIR", "./gtfs")
 POLL_SECONDS = float(os.getenv("POLL_SECONDS", "15"))
+GTFS_STATIC_ZIP_URL = os.getenv("GTFS_STATIC_ZIP_URL", "")  # optional: if set, will download & unpack on first start
 
 ENDPOINTS = {
     "tu_trains": "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains",
@@ -65,8 +68,27 @@ class StaticGTFS:
         self.trips: Dict[str, Trip] = {}
         self.stops: Dict[str, Stop] = {}
         self.stopname_to_parentid: Dict[str, str] = {}
-        self._load(gtfs_dir)
-        self._build_name_parent_index()
+        self.available: bool = False
+        self._ensure_dir_or_download(gtfs_dir)
+        try:
+            self._load(gtfs_dir)
+            self._build_name_parent_index()
+            self.available = True
+            log.info("[metroboard] static GTFS loaded from %s", gtfs_dir)
+        except FileNotFoundError as e:
+            log.warning("[metroboard] static GTFS missing (%s). Running in degraded mode.", e)
+
+    def _ensure_dir_or_download(self, d: str):
+        if os.path.isdir(d) and os.path.exists(os.path.join(d, "routes.txt")):
+            return
+        if GTFS_STATIC_ZIP_URL:
+            os.makedirs(d, exist_ok=True)
+            log.info("[metroboard] downloading GTFS static zip from %s ...", GTFS_STATIC_ZIP_URL)
+            r = requests.get(GTFS_STATIC_ZIP_URL, timeout=60)
+            r.raise_for_status()
+            with zipfile.ZipFile(io.BytesIO(r.content)) as z:
+                z.extractall(d)
+            log.info("[metroboard] GTFS static extracted to %s", d)
 
     def _load(self, d: str):
         def open_csv(path):
@@ -99,14 +121,25 @@ class StaticGTFS:
             parent = s.parent_station or s.stop_id
             name_to_parents[s.name].add(parent)
         for name, parents in name_to_parents.items():
-            # pick a stable parent id when multiple map to same name
             self.stopname_to_parentid[name] = sorted(parents)[0]
 
     def parent_of(self, stop_id: str) -> str:
+        """
+        Returns a 'parent station' key for a given stop_id. If static GTFS is missing,
+        try to coerce a stable parent by stripping to the leading digits (e.g., '2000601' -> '200060').
+        Otherwise, fall back to the stop_id itself.
+        """
         s = self.stops.get(stop_id)
-        if not s:
-            return stop_id
-        return s.parent_station or s.stop_id
+        if s:
+            return s.parent_station or s.stop_id
+        # degraded mode heuristics
+        digits = ""
+        for ch in stop_id:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        return digits if digits else stop_id
 
     def parent_by_name(self, name: str) -> Optional[str]:
         return self.stopname_to_parentid.get(name)
@@ -134,25 +167,42 @@ class LiveState:
         return None
 
     def _parse_only_token(self, token: str) -> Optional[Tuple[str, str]]:
+        """
+        Supports:
+          - 'Central4' / 'CentralM'
+          - 'CentralM (200060)'  -> uses 200060 directly as the parent key
+        """
         token = token.strip()
         if not token:
             return None
 
-        # split "Central4" → ("Central", "4"), "CentralM" → ("Central", "M")
-        i = len(token) - 1
-        while i >= 0 and (token[i].isdigit() or token[i].upper() == "M"):
+        # extract optional ' (12345)' id
+        explicit_id: Optional[str] = None
+        name_part = token
+        if "(" in token and token.endswith(")"):
+            # e.g., 'CentralM (200060)'
+            left = token.rfind("(")
+            maybe_id = token[left + 1 : -1].strip()
+            if maybe_id.isdigit():
+                explicit_id = maybe_id
+                name_part = token[:left].strip()
+
+        # split suffix: 'Central4' -> name='Central', suffix='4'
+        i = len(name_part) - 1
+        while i >= 0 and (name_part[i].isdigit() or name_part[i].upper() == "M"):
             i -= 1
-        name_part = token[: i + 1].strip()
-        suffix_part = token[i + 1 :].strip()
+        base_name = name_part[: i + 1].strip()
+        suffix_part = name_part[i + 1 :].strip()
         line_code = self._suffix_to_line_code(suffix_part)
         if not line_code:
             return None
 
-        # strip optional " (12345)" suffix in names like "Central (200060)"
-        if "(" in name_part and name_part.endswith(")"):
-            name_part = name_part[: name_part.rfind("(")].strip()
+        parent: Optional[str] = None
+        if explicit_id:
+            parent = explicit_id
+        else:
+            parent = self.gtfs.parent_by_name(base_name)
 
-        parent = self.gtfs.parent_by_name(name_part)
         if not parent:
             return None
         return (parent, line_code)
@@ -165,7 +215,6 @@ class LiveState:
             if not line:
                 continue
             seen: Set[Tuple[str, str]] = set()
-            # cap lookahead so we don't double-count long through services
             for sid in t.upcoming_stop_ids[:40]:
                 parent = self.gtfs.parent_of(sid)
                 key = (parent, line)
@@ -176,7 +225,18 @@ class LiveState:
         out: Dict[str, int] = {}
         for tok in tokens:
             parsed = self._parse_only_token(tok)
-            out[tok] = bucket_counts.get(parsed, 0) if parsed else 0
+            if parsed:
+                parent, line = parsed
+                # also count stops whose IDs start with the parent (helps in degraded mode: '200060' vs '2000601')
+                total = bucket_counts.get(parsed, 0)
+                if total == 0:
+                    # try prefix match in degraded mode
+                    for (p, l), v in bucket_counts.items():
+                        if l == line and (p == parent or p.startswith(parent)):
+                            total += v
+                out[tok] = total
+            else:
+                out[tok] = 0
         return out
 
 # -----------------------------
@@ -199,7 +259,6 @@ def normalize_line_code(short_name: str) -> Optional[str]:
 # -----------------------------
 def _fetch_bytes(url: str) -> bytes:
     headers = {"Authorization": f"apikey {TFNSW_API_KEY}"} if TFNSW_API_KEY else {}
-    # TFNSW returns protobuf; explicitly request it
     headers["Accept"] = "application/x-google-protobuf"
     r = requests.get(url, headers=headers, timeout=20)
     r.raise_for_status()
@@ -249,8 +308,17 @@ def extract_upcoming_stops_from_tu(feed: gtfs_realtime_pb2.FeedMessage) -> Dict[
 def build_train_obs(gtfs: StaticGTFS, pairs: List[Tuple[str, str]], upcoming: Dict[str, List[str]]) -> List[TrainObs]:
     trains: List[TrainObs] = []
     for trip_id, route_id in pairs:
-        route = gtfs.routes.get(route_id)
-        short = route.short if route else ""
+        short = ""
+        r = gtfs.routes.get(route_id)
+        if r:
+            short = r.short
+        # In degraded mode (no routes.txt), try to infer 'M' vs 'T#' from route_id text as a fallback
+        if not short and route_id:
+            s = route_id.upper()
+            if s == "M" or s.startswith("METRO"):
+                short = "M"
+            elif s.startswith("T") and any(ch.isdigit() for ch in s[1:2]):
+                short = f"T{s[1:2]}"
         stops = upcoming.get(trip_id, [])
         if not stops:
             continue
@@ -266,7 +334,6 @@ async def refresh_loop(state: LiveState):
 
     while True:
         try:
-            # run blocking requests in a thread so we don't block the event loop
             tu_trains, tu_metro = await asyncio.gather(
                 asyncio.to_thread(fetch_tu_feed, ENDPOINTS["tu_trains"]),
                 asyncio.to_thread(fetch_tu_feed, ENDPOINTS["tu_metro"]),
@@ -283,8 +350,10 @@ async def refresh_loop(state: LiveState):
 
             state.set_trains(trains_obs + metro_obs)
             log.info(
-                "[metroboard] processing trains=%d stations=%d prefer_tu=True",
-                len(state.trains), len(state.gtfs.stops),
+                "[metroboard] processing trains=%d stations=%d static_available=%s",
+                len(state.trains),
+                len(state.gtfs.stops) if state.gtfs.available else 0,
+                state.gtfs.available,
             )
         except Exception as e:
             log.exception("refresh_loop error: %s", e)
@@ -305,7 +374,12 @@ async def _startup():
 
 @app.get("/healthz")
 async def health():
-    return {"ok": True, "trains_cached": len(state.trains)}
+    return {
+        "ok": True,
+        "trains_cached": len(state.trains),
+        "static_gtfs_available": state.gtfs.available,
+        "gtfs_dir": GTFS_DIR,
+    }
 
 @app.get("/states")
 async def get_states(only: Optional[str] = Query(default=None)):
