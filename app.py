@@ -1,5 +1,5 @@
-# app.py — Metroboard backend (Rail+Metro) with line separation + GTFS_DIR bootstrap
-import os, time, csv, json, re, typing as T, random, requests, io, zipfile, shutil
+# app.py — Metroboard backend (Rail + Metro) with multi-GTFS merge
+import os, time, csv, json, re, typing as T, random, requests, io, zipfile, shutil, tempfile
 from pathlib import Path
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
@@ -7,9 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.transit import gtfs_realtime_pb2 as rt
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import re
 
-# ---------------- Env ----------------
+# ---------------- Env helpers ----------------
 def _get_csv_env(*names: str) -> set[str]:
     raw = ""
     for n in names:
@@ -33,7 +32,7 @@ def _get_json_env(*names: str, default="{}"):
     except Exception:
         return json.loads(default)
 
-_PARENTS_ID_RE = re.compile(r"^[A-Za-z0-9._+-]+$")  # conservative, no spaces
+_PARENTS_ID_RE = re.compile(r"^[A-Za-z0-9._+-]+$")
 def is_num_parent(s: str) -> bool:
     return bool(s and _PARENTS_ID_RE.match(s))
 
@@ -47,12 +46,19 @@ URLS_VP = [
 ]
 
 GTFS_DIR = os.getenv("GTFS_DIR", "./gtfs")
-GTFS_STATIC_ZIP_URL = os.getenv("GTFS_STATIC_ZIP_URL", "")
+
+# GitHub source (for your "full trains" pack)
 GH_OWNER = os.getenv("GTFS_GH_OWNER", "")
 GH_REPO  = os.getenv("GTFS_GH_REPO", "")
 GH_TAG   = os.getenv("GTFS_GH_TAG", "")
 GH_ASSET = os.getenv("GTFS_GH_ASSET", "")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
+
+# One or more direct zip URLs (e.g. your public Metro pseudo zip)
+GTFS_STATIC_ZIP_URL  = os.getenv("GTFS_STATIC_ZIP_URL", "")  # legacy single
+GTFS_STATIC_ZIP_URLS = [u.strip() for u in os.getenv("GTFS_STATIC_ZIP_URLS", "").split(",") if u.strip()]
+if GTFS_STATIC_ZIP_URL and GTFS_STATIC_ZIP_URL not in GTFS_STATIC_ZIP_URLS:
+    GTFS_STATIC_ZIP_URLS.append(GTFS_STATIC_ZIP_URL)
 
 D_SOLID = int(os.getenv("MB_D_SOLID", "200"))
 D_NEAR  = int(os.getenv("MB_D_NEAR",  "800"))
@@ -76,9 +82,13 @@ FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
 CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN")
 MB_VERBOSE = os.getenv("MB_VERBOSE", "1") == "1"
 MB_FORCE_DISTANCE = os.getenv("MB_FORCE_DISTANCE", "0") == "1"
+MB_PERMISSIVE_PAIRS = os.getenv("MB_PERMISSIVE_PAIRS", "1") != "0"
+
+def vlog(*a):
+    if MB_VERBOSE: print("[metroboard]", *a)
 
 # ---------------- Utils ----------------
-EXCLUDE_SUB = ("wharf","light rail","b-line","interchange","motorway"," m2")
+EXCLUDE_SUB = ("wharf","light rail","interchange","motorway"," m2","b-line")
 SHORT_RE = re.compile(r'\b([TM]\d{1,2})\b', re.I)
 
 def _sess():
@@ -89,9 +99,6 @@ def _sess():
         allowed_methods=frozenset(["GET"]),
         raise_on_status=False)))
     return s
-
-def vlog(*a):
-    if MB_VERBOSE: print("[metroboard]",*a)
 
 def _valid_ll(x,y):
     try: x=float(x); y=float(y)
@@ -120,9 +127,12 @@ def clean_name(n:str)->str:
         if n.endswith(suf): n=n[:-len(suf)]
     return n
 
-# ---------------- GTFS bootstrap ----------------
+# ---------------- GTFS merge helpers ----------------
+NEEDED = ["routes.txt","trips.txt","stops.txt","stop_times.txt","agency.txt"]
+
 def _promote_inner_gtfs_files(root: Path):
-    needed = {"routes.txt","trips.txt","stops.txt","stop_times.txt","agency.txt"}
+    """If a GTFS zip extracted with nested folder(s), move core files up one level."""
+    needed = set(NEEDED)
     if all((root / f).exists() for f in needed):
         return
     for cand in sorted([p for p in root.rglob("*") if p.is_dir()], key=lambda p: len(p.parts)):
@@ -151,32 +161,109 @@ def _download_release_asset_via_github(owner: str, repo: str, tag: str, asset_na
     dl.raise_for_status()
     return dl.content
 
-def ensure_gtfs(dirpath: str):
-    root = Path(dirpath)
-    root.mkdir(parents=True, exist_ok=True)
-    needed = ["routes.txt","trips.txt","stops.txt","stop_times.txt","agency.txt"]
-    if all((root / f).exists() for f in needed):
-        return
-    data = None
+def _extract_zip_bytes(data: bytes, out_dir: Path):
+    with zipfile.ZipFile(io.BytesIO(data)) as z:
+        z.extractall(out_dir)
+    _promote_inner_gtfs_files(out_dir)
+
+def _download_sources_to_tempdirs() -> list[Path]:
+    """Return list of temp dirs each containing a full set of GTFS base files."""
+    temp_dirs: list[Path] = []
+
+    # GitHub asset (usually your 'full trains' pack)
     if GH_OWNER and GH_REPO and GH_TAG and GH_ASSET:
         vlog(f"fetching GTFS via GitHub API {GH_OWNER}/{GH_REPO}@{GH_TAG} asset={GH_ASSET}")
         data = _download_release_asset_via_github(GH_OWNER, GH_REPO, GH_TAG, GH_ASSET, GITHUB_TOKEN)
-    elif GTFS_STATIC_ZIP_URL:
-        vlog(f"downloading GTFS static zip from {GTFS_STATIC_ZIP_URL}")
+        td = Path(tempfile.mkdtemp(prefix="gtfs_src_"))
+        _extract_zip_bytes(data, td)
+        temp_dirs.append(td)
+
+    # Direct zips (e.g., your metro pseudo)
+    for url in GTFS_STATIC_ZIP_URLS:
         headers = {}
-        if "github.com" in GTFS_STATIC_ZIP_URL.lower() and GITHUB_TOKEN:
+        if "github.com" in url.lower() and GITHUB_TOKEN:
             headers["Authorization"] = f"token {GITHUB_TOKEN}"
             headers["Accept"] = "application/octet-stream"
-        r = requests.get(GTFS_STATIC_ZIP_URL, headers=headers, timeout=300)
+        vlog(f"downloading GTFS static zip: {url}")
+        r = requests.get(url, headers=headers, timeout=300)
         r.raise_for_status()
-        data = r.content
-    else:
+        td = Path(tempfile.mkdtemp(prefix="gtfs_src_"))
+        _extract_zip_bytes(r.content, td)
+        temp_dirs.append(td)
+
+    if not temp_dirs:
         raise RuntimeError("GTFS not present and no download source configured")
-    with zipfile.ZipFile(io.BytesIO(data)) as z:
-        z.extractall(root)
-    _promote_inner_gtfs_files(root)
-    if not all((root / f).exists() for f in needed):
-        raise RuntimeError("GTFS zip did not contain required files")
+
+    # sanity: every source must have the needed files
+    for td in temp_dirs:
+        missing = [f for f in NEEDED if not (td / f).exists()]
+        if missing:
+            raise RuntimeError(f"GTFS source at {td} missing: {missing}")
+    return temp_dirs
+
+def _merge_csvs(sources: list[Path], dest_dir: Path):
+    dest_dir.mkdir(parents=True, exist_ok=True)
+
+    # per-file primary keys
+    keys = {
+        "routes.txt":      ["route_id"],
+        "trips.txt":       ["trip_id"],
+        "stops.txt":       ["stop_id"],
+        "stop_times.txt":  ["trip_id", "stop_id", "stop_sequence"],
+        "agency.txt":      ["agency_id"],  # if blank, we’ll fallback
+    }
+
+    for fname in NEEDED:
+        seen: set[tuple] = set()
+        out_rows: list[dict] = []
+        header: list[str] = []
+
+        # collect in order
+        for src in sources:
+            p = src / fname
+            if not p.exists():  # should not happen thanks to earlier check
+                continue
+            with p.open(encoding="utf-8-sig") as f:
+                r = csv.DictReader(f)
+                if not header:
+                    header = r.fieldnames or []
+                for row in r:
+                    # normalize key
+                    pk_names = keys[fname]
+                    if fname == "agency.txt" and not row.get("agency_id", "").strip():
+                        # try to synthesize a key
+                        row["agency_id"] = (row.get("agency_name") or "").strip() or f"AGENCY_{len(seen)+1}"
+                    key = tuple((row.get(k) or "").strip() for k in pk_names)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    out_rows.append(row)
+
+        if not header:
+            raise RuntimeError(f"No header for {fname} after merge")
+
+        # write merged
+        with (dest_dir / fname).open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=header)
+            w.writeheader()
+            for row in out_rows:
+                # ensure all headers exist
+                for h in header:
+                    row.setdefault(h, "")
+                w.writerow(row)
+
+    vlog(f"Merged GTFS: routes={sum(1 for _ in open(dest_dir/'routes.txt',encoding='utf-8'))-1}, "
+         f"trips={sum(1 for _ in open(dest_dir/'trips.txt',encoding='utf-8'))-1}, "
+         f"stops={sum(1 for _ in open(dest_dir/'stops.txt',encoding='utf-8'))-1}")
+
+def ensure_gtfs(dirpath: str):
+    root = Path(dirpath)
+    root.mkdir(parents=True, exist_ok=True)
+    if all((root / f).exists() for f in NEEDED):
+        return
+    src_dirs = _download_sources_to_tempdirs()
+    _merge_csvs(src_dirs, root)
+    # temp dirs auto-removed on container recycle; if you want, clean them here.
 
 # ---------------- Route/GTFS helpers ----------------
 def load_route_overrides(path:str,json_env:str)->dict[str,str]:
@@ -239,10 +326,11 @@ def require_allowed_parents(stops: str,routes: str,trips: str,stop_times: str,ag
             sid=(r.get("stop_id") or "").strip(); stops_map[sid]=r
             if (r.get("location_type") or "0").strip()=="1": parents.add(sid)
     def parent_of(sid):
-        row=stops_map.get(sid); 
+        row=stops_map.get(sid)
         if not row: return None
         p=(row.get("parent_station") or "").strip()
         return p or (sid if sid in parents else None)
+
     # 1) parents proven by stop_times (trips)
     allowed=set()
     with open(stop_times,encoding="utf-8-sig") as f:
@@ -253,7 +341,8 @@ def require_allowed_parents(stops: str,routes: str,trips: str,stop_times: str,ag
             if AGENCY_ALLOW and ag not in AGENCY_ALLOW: continue
             p=parent_of((r.get("stop_id") or "").strip())
             if p and is_num_parent(p): allowed.add(p)
-    # 2) name-based parents (catches Metro where static stop_times may be sparse)
+
+    # 2) name-based parents (catches metro where static stop_times may be sparse)
     named=set()
     with open(stops,encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
@@ -267,8 +356,7 @@ def require_allowed_parents(stops: str,routes: str,trips: str,stop_times: str,ag
                 named.add(pid)
     union=allowed|named
     if MB_VERBOSE:
-        addl=len(union)-len(allowed)
-        vlog(f"parents by trips+names: {len(union)} (trips={len(allowed)}, names+={addl})")
+        vlog(f"parents by trips+names: {len(union)} (trips={len(allowed)}, names+={len(union)-len(allowed)})")
     return union
 
 def require_allowed_pairs(stops: str,routes: str,trips: str,stop_times: str,agency: str,types: set[int],allowed_parents_for_fallback=None):
@@ -291,10 +379,11 @@ def require_allowed_pairs(stops: str,routes: str,trips: str,stop_times: str,agen
             sid=(r.get("stop_id") or "").strip(); stops_map[sid]=r
             if (r.get("location_type") or "0").strip()=="1": parents.add(sid)
     def parent_of(sid):
-        row=stops_map.get(sid); 
+        row=stops_map.get(sid)
         if not row: return None
         p=(row.get("parent_station") or "").strip()
         return p or (sid if sid in parents else None)
+
     rshort=load_route_shortnames(routes)
     pairs=set()
     with open(stop_times,encoding="utf-8-sig") as f:
@@ -308,52 +397,22 @@ def require_allowed_pairs(stops: str,routes: str,trips: str,stop_times: str,agen
             if ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW: continue
             p=parent_of((r.get("stop_id") or "").strip())
             if p and is_num_parent(p): pairs.add((p,rs))
+
     # permissive fallback (generate station×line for known T*/M* shortnames)
-    if not pairs and os.getenv("MB_PERMISSIVE_PAIRS","1")!="0":
-        known={ (rs or "").upper().strip() for rs in rshort.values() if re.fullmatch(r"[TM]\d{1,2}", (rs or "").upper().strip()) }
-        if ROUTE_SHORT_ALLOW: known &= {x.upper() for x in ROUTE_SHORT_ALLOW}
+    if not pairs and MB_PERMISSIVE_PAIRS:
+        known={ (rs or "").upper().strip()
+                for rs in rshort.values()
+                if re.fullmatch(r"[TM]\d{1,2}", (rs or "").upper().strip()) }
+        for rs_env in ROUTE_SHORT_ALLOW:
+            if re.fullmatch(r"[TM]\d{1,2}", rs_env):
+                known.add(rs_env)
+        if ROUTE_SHORT_ALLOW:
+            known &= {x.upper() for x in ROUTE_SHORT_ALLOW}
         if known:
             if not allowed_parents_for_fallback:
                 allowed_parents_for_fallback={sid for sid,row in stops_map.items()
                                               if (row.get("location_type") or "0").strip()=="1" and is_num_parent(sid)}
             pairs={(pid,rs) for pid in allowed_parents_for_fallback for rs in known}
-    # permissive fallback (generate station×line for known T*/M* shortnames)
-    if not pairs and os.getenv("MB_PERMISSIVE_PAIRS","1")!="0":
-        known = { (rs or "").upper().strip()
-                  for rs in rshort.values()
-                  if re.fullmatch(r"[TM]\d{1,2}", (rs or "").upper().strip()) }
-        # Also allow shortnames explicitly requested via env, even if missing from routes.txt
-        for rs_env in ROUTE_SHORT_ALLOW:
-            if re.fullmatch(r"[TM]\d{1,2}", rs_env):
-                known.add(rs_env)
-
-        if ROUTE_SHORT_ALLOW:
-            known &= {x.upper() for x in ROUTE_SHORT_ALLOW}
-
-        if known:
-            if not allowed_parents_for_fallback:
-                # limit parents to likely metro corridor when injecting M1
-                metro_names = {  # can also read from an env JSON if you prefer
-                    "Tallawong","Rouse Hill","Kellyville","Bella Vista","Norwest",
-                    "Hills Showground","Castle Hill","Cherrybrook",
-                    "Epping","Macquarie University","Macquarie Park","North Ryde",
-                    "Chatswood"
-                }
-                allowed_parents_for_fallback = {
-                    sid for sid,row in stops_map.items()
-                    if (row.get("location_type") or "0").strip()=="1"
-                    and is_num_parent(sid)
-                    and clean_name(row.get("stop_name","")) in metro_names
-                }
-                # if we failed to identify any metro parents, fall back to all
-                if not allowed_parents_for_fallback:
-                    allowed_parents_for_fallback = {
-                        sid for sid,row in stops_map.items()
-                        if (row.get("location_type") or "0").strip()=="1" and is_num_parent(sid)
-                    }
-
-            pairs = { (pid, rs) for pid in allowed_parents_for_fallback for rs in known }
-
     return pairs
 
 def route_suffix(rs:str)->str:
@@ -375,8 +434,7 @@ def load_station_index(stops: str, allowed_parents: set[str], allowed_pairs: set
     for pid,rs in allowed_pairs: by_parent.setdefault(pid,set()).add(rs)
     idx={}
     for pid,meta in parents.items():
-        base=clean_name(meta["name"])
-        lat,lon=meta["lat"],meta["lon"]
+        base=clean_name(meta["name"]); lat,lon=meta["lat"],meta["lon"]
         for rs in sorted(by_parent.get(pid,set())):
             for rs_eff in LINE_ALIASES.get(rs,[rs]):  # expand aliasing
                 suf=route_suffix(rs_eff); key=f"{base}{suf}"
@@ -392,7 +450,7 @@ def build_child_to_parent(stops: str):
             sid=(r.get("stop_id") or "").strip()
             pid=(r.get("parent_station") or "").strip()
             lt=(r.get("location_type") or "0").strip()
-            if sid and pid: 
+            if sid and pid:
                 out[sid] = pid
             if sid and lt == "1":
                 out.setdefault(sid, sid)
