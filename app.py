@@ -355,36 +355,47 @@ def normalize_line_code(val: str) -> Optional[str]:
     if not val:
         return None
     s = val.strip().upper()
-    # Handle Metro variants
+    # Metro
     if s in ("M", "M1", "METRO", "S_M1"):
         return "M"
-    # Handle Sydney Trains T-lines
+    # T lines
     if s.startswith("T") and s[1:].isdigit():
         return f"T{int(s[1:])}"
     if s.isdigit():
         return f"T{int(s)}"
-    # Sometimes we get route ids like S_T4 or S_T1_MAIN — collapse to T#
+    # Collapse forms like S_T1, S_T1_MAIN, etc.
     if s.startswith("S_T"):
         tail = s[3:]
-        if tail.isdigit():
-            return f"T{int(tail)}"
+        # tail could be '1', '1_MAIN', etc. Pull leading digits.
+        digits = ""
+        for ch in tail:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if digits:
+            return f"T{int(digits)}"
     return None
+
 
 def route_short_from_ids(route_id: str, route_short: str) -> Optional[str]:
     """
     Choose a sensible short code from either the GTFS short name or the route_id
     using overrides if present, then normalize to 'T#' or 'M'.
     """
+    # 1) start with routes.txt short_name if present
     cand = (route_short or "").strip()
-    if not cand and route_id:
-        cand = ROUTE_SHORT_OVERRIDES.get(route_id, "").strip()
-    # If overrides map contains keys like 'S_T1_MAIN' too:
-    if not cand and route_id and route_id in ROUTE_SHORT_OVERRIDES:
+
+    # 2) overlay env overrides by exact route_id
+    if route_id and route_id in ROUTE_SHORT_OVERRIDES:
         cand = ROUTE_SHORT_OVERRIDES[route_id]
-    # Normalize common route_id forms when short name is blank
+
+    # 3) if still blank, try the route_id itself
     if not cand and route_id:
         cand = route_id
+
     return normalize_line_code(cand)
+
 
 
 # -----------------------------
@@ -441,24 +452,22 @@ def extract_upcoming_stops_from_tu(feed: gtfs_realtime_pb2.FeedMessage) -> Dict[
 def build_train_obs(gtfs: StaticGTFS, pairs: List[Tuple[str, str]], upcoming: Dict[str, List[str]]) -> List[TrainObs]:
     trains: List[TrainObs] = []
     for trip_id, route_id in pairs:
-        short_raw = ""
         r = gtfs.routes.get(route_id)
-        if r:
-            short_raw = r.short
-        short = route_short_from_ids(route_id, short_raw)
-        if not short:
-            # last-ditch route_id heuristics
-            short = normalize_line_code(route_id)
+        short_raw = r.short if r else ""
+        short = route_short_from_ids(route_id, short_raw) or normalize_line_code(route_id)
         stops = upcoming.get(trip_id, [])
+
         if not stops or not short:
             continue
+
         trains.append(TrainObs(
             trip_id=trip_id,
             route_id=route_id,
-            route_short=short,            # <- already normalized (T# or M)
+            route_short=short,        # already normalized to 'T#' or 'M'
             upcoming_stop_ids=stops
         ))
     return trains
+
 
 
 # -----------------------------
@@ -481,6 +490,10 @@ async def refresh_loop(state: LiveState):
             up_trains = extract_upcoming_stops_from_tu(tu_trains)
             up_metro  = extract_upcoming_stops_from_tu(tu_metro)
 
+            if MB_VERBOSE:
+                log.info("[debug] upcoming dict sizes: trains=%d metro=%d", len(up_trains), len(up_metro))
+
+            
             trains_obs = build_train_obs(state.gtfs, pairs_trains, up_trains)
             metro_obs  = build_train_obs(state.gtfs, pairs_metro,  up_metro)
 
