@@ -120,10 +120,8 @@ def is_num_parent(s:str)->bool: return s.isdigit()
 # ---------------- GTFS bootstrap ----------------
 def _promote_inner_gtfs_files(root: Path):
     needed = {"routes.txt","trips.txt","stops.txt","stop_times.txt","agency.txt"}
-    # already present?
     if all((root / f).exists() for f in needed):
         return
-    # find a subdir that contains the needed files and move them up
     for cand in sorted([p for p in root.rglob("*") if p.is_dir()], key=lambda p: len(p.parts)):
         if all((cand / f).exists() for f in needed):
             for f in needed:
@@ -174,7 +172,6 @@ def ensure_gtfs(dirpath: str):
     with zipfile.ZipFile(io.BytesIO(data)) as z:
         z.extractall(root)
     _promote_inner_gtfs_files(root)
-    # sanity check
     if not all((root / f).exists() for f in needed):
         raise RuntimeError("GTFS zip did not contain required files")
 
@@ -255,7 +252,6 @@ def require_allowed_parents(stops: str,routes: str,trips: str,stop_times: str,ag
     return allowed
 
 def require_allowed_pairs(stops: str,routes: str,trips: str,stop_times: str,agency: str,types: set[int],allowed_parents_for_fallback=None):
-    # route types + agencies
     ag_name={}
     with open(agency,encoding="utf-8-sig") as f:
         for r in csv.DictReader(f): ag_name[(r.get("agency_id") or "").strip()]=(r.get("agency_name") or "").strip()
@@ -270,7 +266,7 @@ def require_allowed_pairs(stops: str,routes: str,trips: str,stop_times: str,agen
     with open(trips,encoding="utf-8-sig") as f:
         for r in csv.DictReader(f): trip_route[(r.get("trip_id") or "").strip()]=(r.get("route_id") or "").strip()
     stops_map,parents={},set()
-    with open(stops,encoding="utf-8-sig") as f:
+    with open(stops,encoding="utf-8-sig") as f):
         for r in csv.DictReader(f):
             sid=(r.get("stop_id") or "").strip(); stops_map[sid]=r
             if (r.get("location_type") or "0").strip()=="1": parents.add(sid)
@@ -292,7 +288,6 @@ def require_allowed_pairs(stops: str,routes: str,trips: str,stop_times: str,agen
             if ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW: continue
             p=parent_of((r.get("stop_id") or "").strip())
             if p and is_num_parent(p): pairs.add((p,rs))
-    # permissive fallback (optional)
     if not pairs and os.getenv("MB_PERMISSIVE_PAIRS","1")!="0":
         known={ (rs or "").upper().strip() for rs in rshort.values() if re.fullmatch(r"[TM]\d{1,2}", (rs or "").upper().strip()) }
         if ROUTE_SHORT_ALLOW: known &= {x.upper() for x in ROUTE_SHORT_ALLOW}
@@ -327,6 +322,7 @@ def load_station_index(stops: str, allowed_parents: set[str], allowed_pairs: set
         base=clean_name(meta["name"])
         lat,lon=meta["lat"],meta["lon"]
         for rs in sorted(by_parent.get(pid,set())):
+            # expand aliasing at station-key creation time
             for rs_eff in LINE_ALIASES.get(rs,[rs]):
                 suf=route_suffix(rs_eff); key=f"{base}{suf}"
                 if key in idx: key=f"{base}{suf} ({pid})"
@@ -365,21 +361,38 @@ def fetch_vp_cached():
         except Exception as e: vlog("WARN fetch",url,e)
     _FEED_CACHE=merged; _FEED_TS=now; return merged,0.0
 
+# ---- NEW: robust short-name inference so Metro always buckets ----
+_TM_RE = re.compile(r'\b([TM]\d{1,2})\b', re.I)
+def _infer_short_from_ids(route_id: str, trip_id: str) -> T.Optional[str]:
+    for text in (route_id or "", trip_id or ""):
+        m = _TM_RE.search(text)
+        if m:
+            return m.group(1).upper()
+    # common Sydney Metro ids include "SMNW_M1", "SMCSW_M1", etc.
+    s = (route_id or "") + " " + (trip_id or "")
+    if "M1" in s.upper():
+        return "M1"
+    return None
+
 def collect_trains(feed,route_id_to_short: dict[str,str]):
     trains=[]; by_route={}
     for e in feed.entity:
         if not e.HasField("vehicle"): continue
         v=e.vehicle
-        rid=v.trip.route_id if v.HasField("trip") else ""
-        rs=(route_id_to_short.get(rid,"") or "").upper() or None
-        if ROUTE_SHORT_ALLOW and rs and rs not in ROUTE_SHORT_ALLOW: continue
+        rid = v.trip.route_id if v.HasField("trip") else ""
+        tid = v.trip.trip_id  if v.HasField("trip") else ""
+        rs  = (route_id_to_short.get(rid,"") or "").upper() or None
+        if rs is None:
+            rs = _infer_short_from_ids(rid, tid)  # <-- Metro-friendly fallback
+        if ROUTE_SHORT_ALLOW and rs and rs not in ROUTE_SHORT_ALLOW:
+            continue
         sid=getattr(v,"stop_id","")
         st=int(getattr(v,"current_status",rt.VehiclePosition.IN_TRANSIT_TO))
         lat=getattr(v.position,"latitude",None) if v.HasField("position") else None
         lon=getattr(v.position,"longitude",None) if v.HasField("position") else None
         trains.append((lat,lon,rs,sid,st))
         if rs: by_route[rs]=by_route.get(rs,0)+1
-    if MB_VERBOSE: vlog(f"collect_trains kept={len(trains)}")
+    if MB_VERBOSE: vlog(f"collect_trains kept={len(trains)} by_route={by_route}")
     return trains,by_route
 
 # ---------------- API ----------------
@@ -392,7 +405,6 @@ ROUTE_ID_TO_SHORT={}; STATION_INDEX={}; CHILD_TO_PARENT={}
 @app.on_event("startup")
 def _startup():
     global ROUTE_ID_TO_SHORT,STATION_INDEX,CHILD_TO_PARENT
-    # ensure GTFS present
     ensure_gtfs(GTFS_DIR)
     routes_p     = str(Path(GTFS_DIR)/"routes.txt")
     trips_p      = str(Path(GTFS_DIR)/"trips.txt")
@@ -455,7 +467,6 @@ def states(only: T.Optional[str]=Query(None)):
     if MB_VERBOSE: vlog(f"processing trains={len(trains)} stations={len(subset)}")
     if not trains: return JSONResponse({k:0 for k in subset.keys()})
 
-    # Group vehicles by resolved route short name
     grouped: dict[T.Optional[str], list[tuple]] = {}
     for t in trains:
         grouped.setdefault(t[2], []).append(t)
@@ -467,7 +478,7 @@ def states(only: T.Optional[str]=Query(None)):
     for name,meta in subset.items():
         pid=meta["stop_id"]; slat,slon=meta["lat"],meta["lon"]; rs=(meta.get("route_short") or "").upper()
 
-        # honor STRICT_LINE_MATCH; optionally expand aliases
+        # exact when strict; otherwise expand aliases
         rs_list = [rs] if rs else []
         if not STRICT_LINE_MATCH and rs:
             rs_list = LINE_ALIASES.get(rs, [rs])
@@ -476,17 +487,14 @@ def states(only: T.Optional[str]=Query(None)):
         cand_trains = []
         for rsi in rs_list:
             cand_trains.extend(grouped.get(rsi, []))
-        # include trains with unknown route bucket for distance-only fallback
-        cand_trains.extend(grouped.get(None, []))
+        cand_trains.extend(grouped.get(None, []))  # distance-only bucket
 
         for (tlat,tlon,trs,child_sid,st) in cand_trains:
-            # parent match (exact)
             if not MB_FORCE_DISTANCE and child_sid:
                 parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
                 if parent == pid:
                     if st == VP_STOPPED: best=3; matches+=1; break
                     elif st == VP_INCOMING: best=max(best,2); matches+=1
-            # distance fallback
             if best<3 and tlat is not None and tlon is not None:
                 d = hav_m(slat,slon,tlat,tlon)
                 if best_d is None or d<best_d: best_d=d
