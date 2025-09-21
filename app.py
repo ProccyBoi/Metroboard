@@ -240,6 +240,7 @@ def require_allowed_parents(stops: str,routes: str,trips: str,stop_times: str,ag
         if not row: return None
         p=(row.get("parent_station") or "").strip()
         return p or (sid if sid in parents else None)
+    # 1) parents proven by stop_times (trips)
     allowed=set()
     with open(stop_times,encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
@@ -249,81 +250,71 @@ def require_allowed_parents(stops: str,routes: str,trips: str,stop_times: str,ag
             if AGENCY_ALLOW and ag not in AGENCY_ALLOW: continue
             p=parent_of((r.get("stop_id") or "").strip())
             if p and is_num_parent(p): allowed.add(p)
-    return allowed
-
-def require_allowed_parents(stops: str, routes: str, trips: str, stop_times: str, agency: str, types: set[int]):
-    ag_name = {}
-    with open(agency, encoding="utf-8-sig") as f:
+    # 2) name-based parents (catches Metro where static stop_times may be sparse)
+    named=set()
+    with open(stops,encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
-            ag_name[(r.get("agency_id") or "").strip()] = (r.get("agency_name") or "").strip()
-
-    route_meta = {}
-    with open(routes, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            rid = (r.get("route_id") or "").strip()
-            try:
-                rtype = int((r.get("route_type") or "3").strip() or "3")
-            except:
-                rtype = 3
-            route_meta[rid] = (rtype, ag_name.get((r.get("agency_id") or "").strip(), ""))
-
-    trip_route = {}
-    with open(trips, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            trip_route[(r.get("trip_id") or "").strip()] = (r.get("route_id") or "").strip()
-
-    stops_map, parents = {}, set()
-    with open(stops, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            sid = (r.get("stop_id") or "").strip()
-            stops_map[sid] = r
-            if (r.get("location_type") or "0").strip() == "1":
-                parents.add(sid)
-
-    def parent_of(sid):
-        row = stops_map.get(sid)
-        if not row:
-            return None
-        p = (row.get("parent_station") or "").strip()
-        return p or (sid if sid in parents else None)
-
-    # 1) parents proven by stop_times (trips)
-    allowed = set()
-    with open(stop_times, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            rid = trip_route.get((r.get("trip_id") or "").strip(), "")
-            rtype, ag = route_meta.get(rid, (None, ""))
-            if rtype is None or rtype not in types:
-                continue
-            if AGENCY_ALLOW and ag not in AGENCY_ALLOW:
-                continue
-            p = parent_of((r.get("stop_id") or "").strip())
-            if p and is_num_parent(p):
-                allowed.add(p)
-
-    # 2) name-based parents (catches Metro where static stop_times are missing)
-    named = set()
-    with open(stops, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            if (r.get("location_type") or "0").strip() != "1":
-                continue
-            pid = (r.get("stop_id") or "").strip()
-            if not is_num_parent(pid):
-                continue
-            n = (r.get("stop_name") or "")
-            # keep the same exclusions you use elsewhere
-            n_low = n.lower().strip()
-            if any(x in n_low for x in EXCLUDE_SUB):
-                continue
-            # looks like a real station
+            if (r.get("location_type") or "0").strip()!="1": continue
+            pid=(r.get("stop_id") or "").strip()
+            if not is_num_parent(pid): continue
+            n=(r.get("stop_name") or "")
+            n_low=n.lower().strip()
+            if any(x in n_low for x in EXCLUDE_SUB): continue
             if n_low.endswith(" station") or n_low.endswith(" railway station"):
                 named.add(pid)
-
-    union = allowed | named
+    union=allowed|named
     if MB_VERBOSE:
-        addl = len(union) - len(allowed)
+        addl=len(union)-len(allowed)
         vlog(f"parents by trips+names: {len(union)} (trips={len(allowed)}, names+={addl})")
     return union
+
+def require_allowed_pairs(stops: str,routes: str,trips: str,stop_times: str,agency: str,types: set[int],allowed_parents_for_fallback=None):
+    ag_name={}
+    with open(agency,encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f): ag_name[(r.get("agency_id") or "").strip()]=(r.get("agency_name") or "").strip()
+    rt_meta={}
+    with open(routes,encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            rid=(r.get("route_id") or "").strip()
+            try: rtype=int((r.get("route_type") or "3").strip() or "3")
+            except: rtype=3
+            rt_meta[rid]=(rtype,ag_name.get((r.get("agency_id") or "").strip(),""))
+    trip_route={}
+    with open(trips,encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f): trip_route[(r.get("trip_id") or "").strip()]=(r.get("route_id") or "").strip()
+    stops_map,parents={},set()
+    with open(stops,encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            sid=(r.get("stop_id") or "").strip(); stops_map[sid]=r
+            if (r.get("location_type") or "0").strip()=="1": parents.add(sid)
+    def parent_of(sid):
+        row=stops_map.get(sid); 
+        if not row: return None
+        p=(row.get("parent_station") or "").strip()
+        return p or (sid if sid in parents else None)
+    rshort=load_route_shortnames(routes)
+    pairs=set()
+    with open(stop_times,encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            rid=trip_route.get((r.get("trip_id") or "").strip(),"")
+            rtype,ag=rt_meta.get(rid,(None,""))
+            if rtype is None or rtype not in types: continue
+            if AGENCY_ALLOW and ag not in AGENCY_ALLOW: continue
+            rs=(rshort.get(rid,"") or "").upper()
+            if not rs: continue
+            if ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW: continue
+            p=parent_of((r.get("stop_id") or "").strip())
+            if p and is_num_parent(p): pairs.add((p,rs))
+    # permissive fallback (generate station×line for known T*/M* shortnames)
+    if not pairs and os.getenv("MB_PERMISSIVE_PAIRS","1")!="0":
+        known={ (rs or "").upper().strip() for rs in rshort.values() if re.fullmatch(r"[TM]\d{1,2}", (rs or "").upper().strip()) }
+        if ROUTE_SHORT_ALLOW: known &= {x.upper() for x in ROUTE_SHORT_ALLOW}
+        if known:
+            if not allowed_parents_for_fallback:
+                allowed_parents_for_fallback={sid for sid,row in stops_map.items()
+                                              if (row.get("location_type") or "0").strip()=="1" and is_num_parent(sid)}
+            pairs={(pid,rs) for pid in allowed_parents_for_fallback for rs in known}
+    return pairs
 
 def route_suffix(rs:str)->str:
     rs=(rs or "").upper()
@@ -347,8 +338,7 @@ def load_station_index(stops: str, allowed_parents: set[str], allowed_pairs: set
         base=clean_name(meta["name"])
         lat,lon=meta["lat"],meta["lon"]
         for rs in sorted(by_parent.get(pid,set())):
-            # expand aliasing at station-key creation time
-            for rs_eff in LINE_ALIASES.get(rs,[rs]):
+            for rs_eff in LINE_ALIASES.get(rs,[rs]):  # expand aliasing
                 suf=route_suffix(rs_eff); key=f"{base}{suf}"
                 if key in idx: key=f"{base}{suf} ({pid})"
                 idx[key]={"stop_id":pid,"name":key,"lat":lat,"lon":lon,
