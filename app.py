@@ -12,7 +12,7 @@ from typing import Dict, Tuple, List, Optional, Set
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from urllib3.util_retry import Retry
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from google.transit import gtfs_realtime_pb2 as rt
@@ -121,7 +121,8 @@ def infer_line_code_from_text(*texts: str) -> Optional[str]:
         m = _LINE_PAT.search(s)
         if m: return f"T{int(m.group(2))}"
         if s.startswith("S_T") and len(s) > 3 and s[3].isdigit():
-            return f"T{int(s[3])]}"
+            # FIXED: removed stray bracket
+            return f"T{int(s[3])}"
     return None
 
 def route_short_from_ids(route_id: str, route_short: str, trip_id: Optional[str]=None)->Optional[str]:
