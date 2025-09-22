@@ -12,7 +12,7 @@ from typing import Dict, Tuple, List, Optional, Set
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util_retry import Retry
+from urllib3.util.retry import Retry
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 from google.transit import gtfs_realtime_pb2 as rt
