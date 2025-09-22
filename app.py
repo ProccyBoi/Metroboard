@@ -1,8 +1,8 @@
-# app.py — Metroboard (VP-based) with single GTFS source
-# - Downloads/merges ONLY routes.txt, trips.txt, stops.txt from GH asset (or one fallback zip)
-# - Uses Vehicle Positions (sydneytrains + metro) for real-time
-# - Counts by parent station; if stop_id missing, falls back to nearest parent by lat/lon
-# - No stop_times, no multi-GB merges, no static-zip 404 loops
+# app.py — Metroboard (TU+VP join)
+# - Minimal static GTFS (routes/trips/stops) from a single GH asset or one fallback URL
+# - Uses TU to infer line short codes (T1..T9/M), VP to locate trains (stop_id or lat/lon)
+# - Counts by parent station + line; optional fallback to any-line when STRICT_LINE_MATCH=0
+# - No stop_times merge; no multi-GB memory spikes; no 404 loops
 
 import os, io, zipfile, asyncio, csv, json, re, math
 from pathlib import Path
@@ -34,14 +34,18 @@ GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 # Optional single fallback if GH asset is unavailable (must be valid)
 FALLBACK_STATIC_ZIP_URL = os.getenv("FALLBACK_STATIC_ZIP_URL", "").strip()
 
-# Distance matching thresholds (meters) for VP geofallback
+# Distance thresholds for VP geofallback (meters)
 D_SOLID = int(os.getenv("MB_D_SOLID", "250"))
 D_NEAR  = int(os.getenv("MB_D_NEAR",  "900"))
 D_FAR   = int(os.getenv("MB_D_FAR",   "1600"))
 
 MB_VERBOSE = os.getenv("MB_VERBOSE", "0").lower() in ("1","true","yes")
 
-VP_ENDPOINTS = {
+ENDPOINTS_TU = {
+    "trains": "https://api.transport.nsw.gov.au/v2/gtfs/realtime/sydneytrains",
+    "metro":  "https://api.transport.nsw.gov.au/v2/gtfs/realtime/metro",
+}
+ENDPOINTS_VP = {
     "trains": "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/sydneytrains",
     "metro":  "https://api.transport.nsw.gov.au/v2/gtfs/vehiclepos/metro",
 }
@@ -63,7 +67,7 @@ def _fetch_bytes(url: str) -> bytes:
     s=_sess()
     headers={"Accept":"application/x-protobuf"}
     if TFNSW_API_KEY: headers["Authorization"]=f"apikey {TFNSW_API_KEY}"
-    r=s.get(url, headers=headers, timeout=20)
+    r=s.get(url, headers=headers, timeout=25)
     r.raise_for_status()
     return r.content
 
@@ -91,7 +95,7 @@ class Stop:
 @dataclass
 class TrainObs:
     route_short: Optional[str]
-    parent_guess: Optional[str]  # parent station id resolved for this VP (by stop_id or distance)
+    parent_guess: Optional[str]
 
 # -----------------------------
 # Line helpers
@@ -117,7 +121,7 @@ def infer_line_code_from_text(*texts: str) -> Optional[str]:
         m = _LINE_PAT.search(s)
         if m: return f"T{int(m.group(2))}"
         if s.startswith("S_T") and len(s) > 3 and s[3].isdigit():
-            return f"T{int(s[3])}"
+            return f"T{int(s[3])]}"
     return None
 
 def route_short_from_ids(route_id: str, route_short: str, trip_id: Optional[str]=None)->Optional[str]:
@@ -146,7 +150,7 @@ except Exception:
 STRICT_LINE_MATCH = os.getenv("STRICT_LINE_MATCH","1").lower() in ("1","true","yes")
 
 # -----------------------------
-# Static GTFS (routes/trips/stops only)
+# Minimal static GTFS (routes/trips/stops only)
 # -----------------------------
 def _merge_minimal_gtfs(zip_bytes: bytes, out_dir: str):
     """Merge ALL instances of routes.txt, trips.txt, stops.txt from the zip (across subfolders)."""
@@ -246,8 +250,7 @@ class StaticGTFS:
         data = self._download_release_asset(GH_OWNER, GH_REPO, GH_TAG, GH_ASSET, GITHUB_TOKEN)
         if data is None and FALLBACK_STATIC_ZIP_URL:
             print("[metroboard] GH download unavailable. Using fallback static zip…")
-            s=_sess()
-            resp = s.get(FALLBACK_STATIC_ZIP_URL, timeout=300)
+            s=_sess(); resp = s.get(FALLBACK_STATIC_ZIP_URL, timeout=300)
             if resp.status_code == 200:
                 data = resp.content
             else:
@@ -309,7 +312,7 @@ class StaticGTFS:
             name_to_parents[st.name].add(parent)
             self.parent_to_name.setdefault(parent, st.name)
 
-        # parent coords prefer parent rows; if missing, take any child's coords
+        # parent coords prefer parent rows; otherwise use any child's coords
         for st in self.stops.values():
             pid = st.parent_station or st.stop_id
             if pid not in self.parent_coords:
@@ -327,7 +330,6 @@ class StaticGTFS:
     def parent_of(self, stop_id: str) -> Optional[str]:
         st = self.stops.get(stop_id)
         if st: return st.parent_station or st.stop_id
-        # numeric-only fallback (e.g. child ids that differ by suffix)
         digits = "".join(ch for ch in stop_id if ch.isdigit())
         return digits or None
 
@@ -352,7 +354,7 @@ def haversine_m(a,b,c,d):
     return 2*R*asin(sqrt(max(0.0,min(1.0,t))))
 
 # -----------------------------
-# Live state & matching (VP-based)
+# Live state & matching
 # -----------------------------
 class LiveState:
     def __init__(self, gtfs: StaticGTFS):
@@ -411,19 +413,37 @@ class LiveState:
         return out
 
 # -----------------------------
-# VP fetch + parse
+# TU + VP fetch/parse
 # -----------------------------
+def fetch_tu(url: str) -> rt.FeedMessage:
+    feed=rt.FeedMessage(); feed.ParseFromString(_fetch_bytes(url)); return feed
+
 def fetch_vp(url: str) -> rt.FeedMessage:
-    feed=rt.FeedMessage()
-    feed.ParseFromString(_fetch_bytes(url))
-    return feed
+    feed=rt.FeedMessage(); feed.ParseFromString(_fetch_bytes(url)); return feed
+
+def build_line_map_from_tu(gtfs: StaticGTFS, feed: rt.FeedMessage, label: str) -> Dict[str,str]:
+    """trip_id -> short line code (T#/M) derived from TU route_id/short."""
+    m: Dict[str,str] = {}
+    kept = 0
+    for e in feed.entity:
+        if not e.HasField("trip_update"): continue
+        tu = e.trip_update
+        tid = tu.trip.trip_id
+        rid = tu.trip.route_id
+        if not tid: continue
+        short = route_short_from_ids(rid, gtfs.routes.get(rid, Route(rid,"")).short if rid in gtfs.routes else "", tid)
+        if short:
+            m[tid] = short
+            kept += 1
+    vlog(f"line_map_from_tu {label}: trips_with_label={kept}")
+    return m
 
 def infer_parent_for_vp(gtfs: StaticGTFS, stop_id: Optional[str], lat: Optional[float], lon: Optional[float]) -> Optional[str]:
     # 1) exact via stop_id -> parent
     if stop_id:
         p = gtfs.parent_of(stop_id)
         if p: return p
-    # 2) geofallback to nearest parent within FAR
+    # 2) geofallback nearest parent within FAR
     if lat is None or lon is None: return None
     best=None; bestd=float("inf")
     for pid,(slat,slon) in gtfs.parent_coords.items():
@@ -435,14 +455,14 @@ def infer_parent_for_vp(gtfs: StaticGTFS, stop_id: Optional[str], lat: Optional[
         return best
     return None
 
-def collect_from_vp(gtfs: StaticGTFS, feed: rt.FeedMessage, label: str) -> List[TrainObs]:
+def collect_from_vp(gtfs: StaticGTFS, feed: rt.FeedMessage, line_by_trip: Dict[str,str], label: str) -> List[TrainObs]:
     keep=0; out: List[TrainObs]=[]
     for e in feed.entity:
         if not e.HasField("vehicle"): continue
         v=e.vehicle
-        rid = v.trip.route_id if v.HasField("trip") else ""
         tid = v.trip.trip_id  if v.HasField("trip") else ""
-        rs  = route_short_from_ids(rid, gtfs.routes.get(rid, Route(rid,"")).short if rid in gtfs.routes else "", tid)
+        rid = v.trip.route_id if v.HasField("trip") else ""
+        rs  = line_by_trip.get(tid) or route_short_from_ids(rid, gtfs.routes.get(rid, Route(rid,"")).short if rid in gtfs.routes else "", tid)
 
         sid = getattr(v, "stop_id", "") or (v.stop_id if hasattr(v,"stop_id") else "")
         lat = v.position.latitude  if v.HasField("position") else None
@@ -463,11 +483,21 @@ async def refresh_loop(state: LiveState):
         print("[metroboard] WARN: TFNSW_API_KEY not set; realtime fetch will fail.")
     while True:
         try:
-            vp_trains, vp_metro = await asyncio.gather(
-                asyncio.to_thread(fetch_vp, VP_ENDPOINTS["trains"]),
-                asyncio.to_thread(fetch_vp, VP_ENDPOINTS["metro"]),
+            tu_trains, tu_metro, vp_trains, vp_metro = await asyncio.gather(
+                asyncio.to_thread(fetch_tu, ENDPOINTS_TU["trains"]),
+                asyncio.to_thread(fetch_tu, ENDPOINTS_TU["metro"]),
+                asyncio.to_thread(fetch_vp, ENDPOINTS_VP["trains"]),
+                asyncio.to_thread(fetch_vp, ENDPOINTS_VP["metro"]),
             )
-            obs = collect_from_vp(state.gtfs, vp_trains, "trains") + collect_from_vp(state.gtfs, vp_metro, "metro")
+            # line map from TU (authoritative for line labels)
+            line_map = {}
+            line_map.update(build_line_map_from_tu(state.gtfs, tu_trains, "trains"))
+            line_map.update(build_line_map_from_tu(state.gtfs, tu_metro,  "metro"))
+
+            # vehicles from VP (location/stop)
+            obs = collect_from_vp(state.gtfs, vp_trains, line_map, "trains") \
+                + collect_from_vp(state.gtfs, vp_metro,  line_map, "metro")
+
             state.set_trains(obs)
             vlog("refresh: vehicles=", len(state.trains), " static=", state.gtfs.available)
         except Exception as e:
@@ -478,7 +508,6 @@ async def refresh_loop(state: LiveState):
 # FastAPI app
 # -----------------------------
 def _boot_gtfs(dirpath: str) -> StaticGTFS:
-    # Prepare static GTFS once
     Path(dirpath).mkdir(parents=True, exist_ok=True)
     if not all((Path(dirpath)/f).exists() for f in ("routes.txt","trips.txt","stops.txt")):
         data = StaticGTFS._download_release_asset(GH_OWNER, GH_REPO, GH_TAG, GH_ASSET, GITHUB_TOKEN)
@@ -496,7 +525,7 @@ def _boot_gtfs(dirpath: str) -> StaticGTFS:
 
 gtfs = _boot_gtfs(GTFS_DIR)
 state = LiveState(gtfs)
-app = FastAPI(title="Metroboard (VP-based)")
+app = FastAPI(title="Metroboard (TU+VP)")
 
 @app.on_event("startup")
 async def _startup():
