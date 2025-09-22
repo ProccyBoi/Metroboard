@@ -1,4 +1,2 @@
-*.txt filter=lfs diff=lfs merge=lfs -text
-gtfs/*.txt filter=lfs diff=lfs merge=lfs -text
 gtfs/stop_times.txt filter=lfs diff=lfs merge=lfs -text
 gtfs/trips.txt filter=lfs diff=lfs merge=lfs -text
