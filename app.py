@@ -1,10 +1,9 @@
-# app.py — Metroboard backend (Rail + Metro) [route-safe matching]
+# app.py — Metroboard backend (Rail + Metro)
 # - Uses static GTFS (stops.txt, routes.txt, trips.txt, stop_times.txt, agency.txt)
 # - Filters to route_type in (1=subway/metro, 2=rail); optional agency allow-list
 # - Builds station×route keys like "Central1" (T1) and "CentralM" (M1)
 # - GTFS-RT from TfNSW: Sydney Trains + Sydney Metro vehicle positions
-# - States logic: route-safe (never VP-match unknown-route trains to all lines at a station)
-# - Unknown-route handling via MB_UNKNOWN_ROUTE_MODE: ignore | distance_low (default) | distance_full
+# - States logic: prefer VP.stop_id -> parent match; fallback to distance thresholds
 # - Endpoints: /, /healthz, /debug, /stations, /states, /trains
 
 import os
@@ -40,12 +39,6 @@ else:
 D_SOLID = int(os.getenv("MB_D_SOLID", "200"))
 D_NEAR  = int(os.getenv("MB_D_NEAR",  "800"))
 D_FAR   = int(os.getenv("MB_D_FAR",   "1500"))
-
-# Unknown-route handling (when vehicle route cannot be inferred)
-#   "ignore"        → drop unknown-route trains entirely
-#   "distance_low"  → allow distance fallback but cap max state to 1 (dim)
-#   "distance_full" → treat unknown like known for distance (not recommended)
-MB_UNKNOWN_ROUTE_MODE = os.getenv("MB_UNKNOWN_ROUTE_MODE", "distance_low").strip().lower()
 
 # Allowlists (empty=set() means all)
 AGENCY_NAME_ALLOW: set[str] = {a.strip() for a in os.getenv("MB_AGENCIES", "").split(",") if a.strip()}
@@ -219,18 +212,6 @@ def load_route_shortnames(routes_path: str = "routes.txt") -> dict[str, str]:
             if rs:
                 out[rid] = rs
     vlog(f"route_short: {len(out)} (ov={len(ov)})")
-    return out
-
-# Trip→Route map (for route inference when GTFS-RT lacks route_id)
-def load_trip_to_route(trips_path: str = "trips.txt") -> dict[str, str]:
-    out: dict[str, str] = {}
-    with open(trips_path, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            tid = (r.get("trip_id") or "").strip()
-            rid = (r.get("route_id") or "").strip()
-            if tid and rid:
-                out[tid] = rid
-    vlog(f"trip→route: {len(out)}")
     return out
 
 # ---------------- Static GTFS filters: allowed parents & pairs ----------------
@@ -567,16 +548,8 @@ def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
     vlog("feed merged vehicles", total)
     return merged, 0.0
 
-# Collect trains with route inference (trip_id→route_id fallback)
-def collect_trains(
-    feed: rt.FeedMessage,
-    route_id_to_short: dict[str, str],
-    trip_to_route: dict[str, str] | None = None,
-) -> tuple[list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]], dict[str, int]]:
+def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> tuple[list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]], dict[str, int]]:
     """Return [(lat,lon,route_short_or_None,child_stop_id,status)], plus counts by route_short."""
-    if trip_to_route is None:
-        trip_to_route = {}
-
     trains: list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]] = []
     by_route: dict[str, int] = {}
 
@@ -584,19 +557,8 @@ def collect_trains(
         if not e.HasField("vehicle"):
             continue
         v = e.vehicle
-
-        # route inference
-        rid = ""
-        rs: T.Optional[str] = None
-        if v.HasField("trip"):
-            rid = v.trip.route_id or ""
-            if not rid:
-                tid = getattr(v.trip, "trip_id", "")
-                if tid:
-                    rid = trip_to_route.get(tid, "")
-        if rid:
-            rs = (route_id_to_short.get(rid, "") or "").upper() or None
-
+        rid = v.trip.route_id if v.HasField("trip") else ""
+        rs = (route_id_to_short.get(rid, "") or "").upper() or None
         if rs and ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW:
             continue
 
@@ -625,16 +587,14 @@ if CORS_ALLOW_ORIGIN:
     )
 
 ROUTE_ID_TO_SHORT: dict[str, str] = {}
-TRIP_TO_ROUTE: dict[str, str] = {}
 STATION_INDEX: dict[str, dict] = {}
 CHILD_TO_PARENT: dict[str, str] = {}
 
 @app.on_event("startup")
 def _startup():
-    global ROUTE_ID_TO_SHORT, TRIP_TO_ROUTE, STATION_INDEX, CHILD_TO_PARENT
+    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT
 
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
-    TRIP_TO_ROUTE = load_trip_to_route("trips.txt")
 
     allowed_parents = require_allowed_parents(
         stops="stops.txt",
@@ -689,7 +649,7 @@ def healthz():
 @app.get("/debug")
 def debug():
     feed, _ = fetch_vp_cached()
-    trains, by_route = collect_trains(feed, ROUTE_ID_TO_SHORT, TRIP_TO_ROUTE)
+    trains, by_route = collect_trains(feed, ROUTE_ID_TO_SHORT)
     return {
         "stations_count": len(STATION_INDEX),
         "bbox": list(SYD_BBOX) if SYD_BBOX else None,
@@ -699,7 +659,6 @@ def debug():
         "feeds": URLS_VP,
         "verbose_logs": MB_VERBOSE,
         "force_distance_mode": MB_FORCE_DISTANCE,
-        "unknown_route_mode": MB_UNKNOWN_ROUTE_MODE,
         "distance_thresholds": {"solid": D_SOLID, "near": D_NEAR, "far": D_FAR},
         "sample_stations": list(STATION_INDEX.keys())[:10],
         "current_trains": {
@@ -712,7 +671,7 @@ def debug():
 def trains():
     """Debug endpoint to see raw train data"""
     feed, age = fetch_vp_cached()
-    trains, _ = collect_trains(feed, ROUTE_ID_TO_SHORT, TRIP_TO_ROUTE)
+    trains, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
 
     # rt.VehiclePosition.VehicleStopStatus:
     # INCOMING_AT=0, STOPPED_AT=1, IN_TRANSIT_TO=2
@@ -747,7 +706,7 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
             return JSONResponse({})
 
     feed, _ = fetch_vp_cached()
-    trains, _by_route = collect_trains(feed, ROUTE_ID_TO_SHORT, TRIP_TO_ROUTE)
+    trains, _by_route = collect_trains(feed, ROUTE_ID_TO_SHORT)
 
     if MB_VERBOSE:
         vlog(f"processing trains={len(trains)} stations={len(subset)}")
@@ -755,7 +714,7 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
     if not trains:
         return JSONResponse({k: 0 for k in subset.keys()})
 
-    # group by route (and keep None bucket for distance-only trains if enabled)
+    # group by route (and keep None bucket for distance-only trains)
     grouped: dict[T.Optional[str], list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]]] = {}
     for t in trains:
         grouped.setdefault(t[2], []).append(t)
@@ -767,19 +726,17 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
     matches = 0
     dist_fb = 0
 
-    allow_unknown = MB_UNKNOWN_ROUTE_MODE in ("distance_low", "distance_full")
-
     for name, meta in subset.items():
         pid = meta["stop_id"]
         slat, slon = meta["lat"], meta["lon"]
         rs = (meta.get("route_short") or "").upper()
 
         best = 0
-        best_d_known: T.Optional[float] = None
-        best_d_unknown: T.Optional[float] = None
+        best_d = None
 
-        # 1) Route-matched trains: VP match first (unless forced distance)
-        for (tlat, tlon, trs, child_sid, st) in grouped.get(rs, []):
+        # look at trains on this route, plus the None bucket (unknown route)
+        for (tlat, tlon, trs, child_sid, st) in grouped.get(rs, []) + grouped.get(None, []):
+            # VP match first (unless forced distance)
             if not MB_FORCE_DISTANCE and child_sid:
                 parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
                 if parent == pid:
@@ -790,33 +747,14 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
                     elif st == VP_INCOMING:
                         best = max(best, 2)
                         matches += 1
-            # track distance for route-matched trains
+
             if best < 3 and tlat is not None and tlon is not None:
                 d = hav_m(slat, slon, tlat, tlon)
-                if best_d_known is None or d < best_d_known:
-                    best_d_known = d
-        if best == 3:
-            out[name] = best
-            continue
+                if best_d is None or d < best_d:
+                    best_d = d
 
-        # 2) Unknown-route trains: never VP-match; only distance per policy
-        if allow_unknown:
-            for (tlat, tlon, trs, child_sid, st) in grouped.get(None, []):
-                if tlat is None or tlon is None:
-                    continue
-                d = hav_m(slat, slon, tlat, tlon)
-                if best_d_unknown is None or d < best_d_unknown:
-                    best_d_unknown = d
-
-        # 3) Distance fallback (known first, then unknown as configured)
-        if best == 0:
-            if best_d_known is not None:
-                best = status_from_dist(best_d_known)
-            if best == 0 and best_d_unknown is not None:
-                unk_state = status_from_dist(best_d_unknown)
-                if MB_UNKNOWN_ROUTE_MODE == "distance_low":
-                    unk_state = min(unk_state, 1)  # cap at dim
-                best = max(best, unk_state)
+        if best == 0 and best_d is not None:
+            best = status_from_dist(best_d)
             if best > 0:
                 dist_fb += 1
 
