@@ -109,10 +109,20 @@ def stop(stop_id: str):
     return get_json(url)
 
 
+
 @app.get("/states")
-def states(ids: str = Query(...)):
-    """Roughly match the HTML logic: 0–3 state per stop_id"""
-    id_list = [i.strip() for i in ids.split(",") if i.strip()]
+def states(
+    ids: str | None = Query(None),
+    only: str | None = Query(None)
+):
+    """
+    Allows ?ids=... or ?only=... for backwards compatibility.
+    """
+    query = ids or only
+    if not query:
+        return JSONResponse({"error": "Provide ?ids=... or ?only=..."}), 400
+
+    id_list = [s.strip() for s in query.split(",") if s.strip()]
     now = int(time.time())
     out = {}
     for sid in id_list:
