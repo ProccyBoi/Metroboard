@@ -43,18 +43,37 @@ def vlog(*a):
 
 
 def cached_get(url: str) -> dict:
-    """Fetch with small cache & optional proxy"""
+    """Fetch JSON safely with cache & AnyTrip-friendly headers"""
     now = time.time()
     if url in CACHE and (now - CACHE[url][0]) < CACHE_TTL:
         return CACHE[url][1]
 
     proxy_url = PROXY + url if PROXY else url
-    headers = {"X-Requested-With": "XMLHttpRequest", "Accept": "application/json"}
-    resp = session.get(proxy_url, headers=headers, timeout=10)
-    resp.raise_for_status()
-    data = resp.json()
-    CACHE[url] = (now, data)
-    return data
+    headers = {
+        "Accept": "application/json, text/plain, */*",
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/119.0 Safari/537.36",
+        "Referer": "https://anytrip.com.au/",
+        "Origin": "https://anytrip.com.au",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+
+    try:
+        resp = session.get(proxy_url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            vlog("WARN non-200", resp.status_code, url)
+            return {}
+        # handle empty / HTML bodies gracefully
+        if not resp.text.strip().startswith("{") and not resp.text.strip().startswith("["):
+            vlog("WARN non-JSON response", url)
+            return {}
+        data = resp.json()
+        CACHE[url] = (now, data)
+        return data
+    except Exception as e:
+        vlog("WARN cached_get failed", url, e)
+        return {}
+
 
 
 def extract_line_code(name: str | None) -> str:
