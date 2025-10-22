@@ -550,46 +550,48 @@ def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
     return merged, 0.0
 
 def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> tuple[list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]], dict[str, int]]:
-    """Return [(lat,lon,route_short_or_None,child_stop_id,status)], plus counts by route_short."""
+    """Return [(lat, lon, route_short_or_None, child_stop_id, status)], plus counts by route_short."""
     trains: list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]] = []
     by_route: dict[str, int] = {}
     missing_routes: dict[str, int] = {}
+
+    # Prefix → route mappings (lists allow ambiguity)
+    ROUTE_PREFIX_MAP: dict[str, list[str]] = {
+        # Definite prefixes
+        "BMT": ["T1"],
+        "CMB": ["T2"],
+        "IWL": ["T4"],
+        "OLY": ["T7"],
+        "RTTA": ["T6"],
+        "SCO": ["SCO"],
+        "WST": ["T1"],
+        "M": ["M1"],
+        "T6": ["T6"],
+        "CTY": ["T2"],
+        "ESI": ["T4"],
+        "CCN": ["CCN"],
+        "NSN": ["T9"],
+        "SMNW": ["M1"],
+        "T3": ["T3"],
+
+        # Ambiguous prefixes — deterministically pick one per trip
+        "APS": ["T1", "T9"],  # Northern or Western Line
+        "NTH": ["T1", "T9"],  # North Shore or Northern
+        "SHL": ["T9", "T1"],  # Shuttle/local overlap
+    }
 
     for e in feed.entity:
         if not e.HasField("vehicle"):
             continue
         v = e.vehicle
-                ROUTE_PREFIX_MAP = {
-            # Suburban — single mappings
-            "BMT": ["T1"],
-            "CMB": ["T2"],
-            "IWL": ["T4"],
-            "OLY": ["T7"],
-            "RTTA": ["T6"],
-            "SCO": ["SCO"],
-            "WST": ["T1"],
-            "M": ["M1"],
-            "T6": ["T6"],
-            "CTY": ["T2"],
-            "ESI": ["T4"],
-            "CCN": ["CCN"],
-            "NSN": ["T9"],
-            "SMNW": ["M1"],
-            "T3": ["T3"],
 
-            # Ambiguous prefixes — randomly pick one when uncertain
-            "APS": ["T1", "T9"],  # e.g. can be Northern or Western Line
-            "NTH": ["T1", "T9"],  # North Shore or Northern
-            "SHL": ["T9", "T1"],  # Shuttle/local overlap areas
-        }
-        
         rid = v.trip.route_id if v.HasField("trip") else ""
         tripid = v.trip.trip_id if v.HasField("trip") else ""
-        
+
         # Try route_id → short mapping
         rs = (route_id_to_short.get(rid, "") or "").upper()
-        
-        # Fallback: extract T/M number if present
+
+        # Fallback 1: extract T/M code from trip_id or route_id
         if not rs:
             for src in (rid, tripid):
                 if not src:
@@ -599,22 +601,27 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                     rs = match.group(1).upper()
                     vlog(f"[fallback] extracted route_short={rs} from {src}")
                     break
-        
-        # Prefix-based inference with random selection if ambiguous
+
+        # Fallback 2: use prefix map with deterministic selection
         if not rs and rid:
             prefix = rid.split("_", 1)[0].upper()
             if prefix in ROUTE_PREFIX_MAP:
                 opts = ROUTE_PREFIX_MAP[prefix]
-                rs = random.choice(opts)
+                if len(opts) == 1:
+                    rs = opts[0]
+                else:
+                    # Deterministic choice per trip_id using hash
+                    seed_val = abs(hash(tripid or rid)) % len(opts)
+                    rs = opts[seed_val]
                 vlog(f"[prefix-map] inferred route_short={rs} from prefix={prefix} (choices={opts})")
-                
+
         if not rs:
             rs = None
 
-        # Track missing routes for debugging
+        # Track missing routes
         if not rs and rid:
             missing_routes[rid] = missing_routes.get(rid, 0) + 1
-        
+
         if rs and ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW:
             continue
 
@@ -631,9 +638,10 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         vlog(f"WARNING: {len(missing_routes)} route_ids without short codes (showing top 10):")
         for rid in sorted(missing_routes.keys(), key=lambda k: missing_routes[k], reverse=True)[:10]:
             vlog(f"  - {rid} ({missing_routes[rid]} trains)")
-    
+
     vlog(f"collect_trains kept={len(trains)}, with routes={len(by_route)}, without routes={len([t for t in trains if t[2] is None])}")
     return trains, by_route
+
 
 # ---------------- FastAPI app ----------------
 app = FastAPI()
