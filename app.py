@@ -559,26 +559,28 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         if not e.HasField("vehicle"):
             continue
         v = e.vehicle
-        ROUTE_PREFIX_MAP = {
-            # Suburban
-            "APS": "T1",
-            "BMT": "T1",
-            "CMB": "T2",
-            "IWL": "T4",
-            "NTH": "T9",
-            "OLY": "T7",
-            "RTTA": "T6",
-            "SCO": "SCO",
-            "WST": "T1",
-            "M": "M1",
-            "T6": "T6",        # already handled, but keeps "T6_2a" safe
-            "CTY": "T2",       # City Circle – assign to T2 for now
-            "SHL": "T9",       # shuttle/local – Northern sector
-            "ESI": "T4",     # or "SCO" if you prefer South Coast behaviour
-            "CCN": "CCN",
-            "NSN": "T9",
-            "SMNW": "M1",    # Metro Northwest/C&SW
-            "T3": "T3",      # some trip_ids already start with T3_
+                ROUTE_PREFIX_MAP = {
+            # Suburban — single mappings
+            "BMT": ["T1"],
+            "CMB": ["T2"],
+            "IWL": ["T4"],
+            "OLY": ["T7"],
+            "RTTA": ["T6"],
+            "SCO": ["SCO"],
+            "WST": ["T1"],
+            "M": ["M1"],
+            "T6": ["T6"],
+            "CTY": ["T2"],
+            "ESI": ["T4"],
+            "CCN": ["CCN"],
+            "NSN": ["T9"],
+            "SMNW": ["M1"],
+            "T3": ["T3"],
+
+            # Ambiguous prefixes — randomly pick one when uncertain
+            "APS": ["T1", "T9"],  # e.g. can be Northern or Western Line
+            "NTH": ["T1", "T9"],  # North Shore or Northern
+            "SHL": ["T9", "T1"],  # Shuttle/local overlap areas
         }
         
         rid = v.trip.route_id if v.HasField("trip") else ""
@@ -598,13 +600,14 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                     vlog(f"[fallback] extracted route_short={rs} from {src}")
                     break
         
-        # Prefix-based inference for control codes
+        # Prefix-based inference with random selection if ambiguous
         if not rs and rid:
             prefix = rid.split("_", 1)[0].upper()
-            rs = ROUTE_PREFIX_MAP.get(prefix)
-            if rs:
-                vlog(f"[prefix-map] inferred route_short={rs} from prefix={prefix}")
-        
+            if prefix in ROUTE_PREFIX_MAP:
+                opts = ROUTE_PREFIX_MAP[prefix]
+                rs = random.choice(opts)
+                vlog(f"[prefix-map] inferred route_short={rs} from prefix={prefix} (choices={opts})")
+                
         if not rs:
             rs = None
 
