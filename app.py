@@ -561,15 +561,29 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
     route_debug = {}
 
     ROUTE_PREFIX_MAP = {
-        "BMT": ["T1"], "CMB": ["T5"], "IWL": ["T4"], "OLY": ["T7"], "RTTA": ["T6"],
-        "SCO": ["SCO"], "CCN": ["CCN"], "WST": ["T1"], "CTY": ["T2"], "ESI": ["T4"],
-        "NSN": ["T9"], "SMNW": ["M1"], "T3": ["T3"], "APS": ["T1", "T9"],
-        "NTH": ["T1", "T9"], "SHL": ["T9", "T1"],
-        # new extended prefixes
-        "SOUTHCOAST": ["SCO"], "CENTRALCOAST": ["CCN"], "MOUNTAINS": ["T1"],
-        "CUMBERLAND": ["T5"], "WOLLONGONG": ["SCO"], "LIVERPOOL": ["T3"],
-        "SEFTON": ["T3", "T6"], "BLACKTOWN": ["T1"], "LIDCOMBE": ["T1", "T7"],
+        # Core prefixes
+        "BMT": ["T1"], "NTH": ["T1", "T9"], "WST": ["T1"], "APS": ["T1", "T9"],
+        "CTY": ["T2"], "T3": ["T3"], "IWL": ["T4"], "ESI": ["T4"],
+        "CMB": ["T5"], "RTTA": ["T6"], "T6": ["T6"],  # include T6_1a / T6_2a variants
+        "OLY": ["T7"], "T7": ["T7"],
+        "NSN": ["T9"], "SHL": ["T9", "T1"],
+    
+        # Regional lines
+        "SCO": ["SCO"], "CCN": ["CCN"],
+    
+        # Metro
+        "SMNW": ["M1"], "M1": ["M1"],
+    
+        # Extended/new identifiers from static GTFS
+        "SOUTHCOAST": ["SCO"], "CENTRALCOAST": ["CCN"],
+        "MOUNTAINS": ["T1"], "CUMBERLAND": ["T5"], "WOLLONGONG": ["SCO"],
+        "LIVERPOOL": ["T3"], "SEFTON": ["T3", "T6"],
+        "BLACKTOWN": ["T1"], "LIDCOMBE": ["T1", "T7"],
+    
+        # Defensive catch for stray codes
+        "": ["T1"],  # blank/unknown — default to T1 to avoid None
     }
+
 
     for e in feed.entity:
         if not e.HasField("vehicle"):
