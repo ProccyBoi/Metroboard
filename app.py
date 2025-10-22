@@ -549,76 +549,62 @@ def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
     vlog("feed merged vehicles", total)
     return merged, 0.0
 
-def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> tuple[list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]], dict[str, int]]:
-    """Return [(lat, lon, route_short_or_None, child_stop_id, status)], plus counts by route_short."""
-    trains: list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]] = []
-    by_route: dict[str, int] = {}
-    missing_routes: dict[str, int] = {}
+def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> tuple[
+    list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]],
+    dict[str, int],
+    dict[str, str],
+]:
+    """Return (trains, counts, route_debug)."""
+    trains = []
+    by_route = {}
+    missing_routes = {}
+    route_debug = {}
 
-    # Prefix → route mappings (lists allow ambiguity)
-    ROUTE_PREFIX_MAP: dict[str, list[str]] = {
-        # Definite prefixes
-        "BMT": ["T1"],
-        "CMB": ["T2"],
-        "IWL": ["T4"],
-        "OLY": ["T7"],
-        "RTTA": ["T6"],
-        "SCO": ["SCO"],
-        "WST": ["T1"],
-        "M": ["M1"],
-        "T6": ["T6"],
-        "CTY": ["T2"],
-        "ESI": ["T4"],
-        "CCN": ["CCN"],
-        "NSN": ["T9"],
-        "SMNW": ["M1"],
-        "T3": ["T3"],
-
-        # Ambiguous prefixes — deterministically pick one per trip
-        "APS": ["T1", "T9"],  # Northern or Western Line
-        "NTH": ["T1", "T9"],  # North Shore or Northern
-        "SHL": ["T9", "T1"],  # Shuttle/local overlap
+    ROUTE_PREFIX_MAP = {
+        "BMT": ["T1"], "CMB": ["T5"], "IWL": ["T4"], "OLY": ["T7"], "RTTA": ["T6"],
+        "SCO": ["SCO"], "CCN": ["CCN"], "WST": ["T1"], "CTY": ["T2"], "ESI": ["T4"],
+        "NSN": ["T9"], "SMNW": ["M1"], "T3": ["T3"], "APS": ["T1", "T9"],
+        "NTH": ["T1", "T9"], "SHL": ["T9", "T1"],
+        # new extended prefixes
+        "SOUTHCOAST": ["SCO"], "CENTRALCOAST": ["CCN"], "MOUNTAINS": ["T1"],
+        "CUMBERLAND": ["T5"], "WOLLONGONG": ["SCO"], "LIVERPOOL": ["T3"],
+        "SEFTON": ["T3", "T6"], "BLACKTOWN": ["T1"], "LIDCOMBE": ["T1", "T7"],
     }
 
     for e in feed.entity:
         if not e.HasField("vehicle"):
             continue
         v = e.vehicle
-
         rid = v.trip.route_id if v.HasField("trip") else ""
         tripid = v.trip.trip_id if v.HasField("trip") else ""
 
-        # Try route_id → short mapping
         rs = (route_id_to_short.get(rid, "") or "").upper()
 
-        # Fallback 1: extract T/M code from trip_id or route_id
+        # Fallback: extract T/M code
         if not rs:
             for src in (rid, tripid):
                 if not src:
                     continue
-                match = re.search(r"\b([TM]\d{1,2})\b", src, re.I)
-                if match:
-                    rs = match.group(1).upper()
-                    vlog(f"[fallback] extracted route_short={rs} from {src}")
+                m = re.search(r"\b([TM]\d{1,2})\b", src, re.I)
+                if m:
+                    rs = m.group(1).upper()
                     break
 
-        # Fallback 2: use prefix map with deterministic selection
+        # Fallback: prefix mapping
         if not rs and rid:
-            prefix = rid.split("_", 1)[0].upper()
+            prefix = rid.split("_", 1)[0].split(".")[0].upper()
             if prefix in ROUTE_PREFIX_MAP:
                 opts = ROUTE_PREFIX_MAP[prefix]
-                if len(opts) == 1:
-                    rs = opts[0]
-                else:
-                    # Deterministic choice per trip_id using hash
-                    seed_val = abs(hash(tripid or rid)) % len(opts)
-                    rs = opts[seed_val]
-                vlog(f"[prefix-map] inferred route_short={rs} from prefix={prefix} (choices={opts})")
+                rs = opts[abs(hash(tripid or rid)) % len(opts)]
+            else:
+                # check substrings for looser match
+                for key, opts in ROUTE_PREFIX_MAP.items():
+                    if key in prefix:
+                        rs = opts[abs(hash(tripid or rid)) % len(opts)]
+                        break
 
-        if not rs:
-            rs = None
-
-        # Track missing routes
+        rs = rs or None
+        route_debug[rid] = rs
         if not rs and rid:
             missing_routes[rid] = missing_routes.get(rid, 0) + 1
 
@@ -629,18 +615,12 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         status = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
         lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
         lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
-
         trains.append((lat, lon, rs, sid, status))
         if rs:
             by_route[rs] = by_route.get(rs, 0) + 1
 
-    if missing_routes and MB_VERBOSE:
-        vlog(f"WARNING: {len(missing_routes)} route_ids without short codes (showing top 10):")
-        for rid in sorted(missing_routes.keys(), key=lambda k: missing_routes[k], reverse=True)[:10]:
-            vlog(f"  - {rid} ({missing_routes[rid]} trains)")
-
-    vlog(f"collect_trains kept={len(trains)}, with routes={len(by_route)}, without routes={len([t for t in trains if t[2] is None])}")
-    return trains, by_route
+    vlog(f"collect_trains kept={len(trains)}, routes={len(by_route)}, null_routes={len([t for t in trains if t[2] is None])}")
+    return trains, by_route, route_debug
 
 
 # ---------------- FastAPI app ----------------
@@ -715,25 +695,19 @@ def healthz():
     age = None if _FEED_TS == 0 else (time.time() - _FEED_TS)
     return {"status": "ok", "stations": len(STATION_INDEX), "trains_last_fetch_s": age}
 
+
 @app.get("/debug")
 def debug():
     feed, _ = fetch_vp_cached()
-    trains, by_route = collect_trains(feed, ROUTE_ID_TO_SHORT)
+    trains, by_route, route_debug = collect_trains(feed, ROUTE_ID_TO_SHORT)
     return {
         "stations_count": len(STATION_INDEX),
         "bbox": list(SYD_BBOX) if SYD_BBOX else None,
-        "allowed_routes": sorted(ROUTE_SHORT_ALLOW) if ROUTE_SHORT_ALLOW else "all",
-        "allowed_agencies": sorted(AGENCY_NAME_ALLOW) if AGENCY_NAME_ALLOW else "all",
-        "cache_sec": FEED_CACHE_SEC,
         "feeds": URLS_VP,
-        "verbose_logs": MB_VERBOSE,
-        "force_distance_mode": MB_FORCE_DISTANCE,
-        "distance_thresholds": {"solid": D_SOLID, "near": D_NEAR, "far": D_FAR},
-        "sample_stations": list(STATION_INDEX.keys())[:10],
-        "current_trains": {
-            "total": len(trains),
-            "by_route": by_route,
-        },
+        "total_trains": len(trains),
+        "routes_found": sorted(by_route.keys()),
+        "routes_missing": [r for r, v in route_debug.items() if v is None],
+        "routes_resolved": route_debug,
     }
 
 @app.get("/trains")
