@@ -257,6 +257,19 @@ def debug():
         "feeds":URLS_VP,
         "stations":len(STATION_INDEX)
     }
+    feed, _ = fetch_vp_cached()
+    sample = []
+    for e in feed.entity[:10]:
+        if not e.HasField("vehicle"):
+            continue
+        v = e.vehicle
+        sample.append({
+            "trip_id": v.trip.trip_id,
+            "route_id": v.trip.route_id,
+            "vehicle_id": v.vehicle.id,
+        })
+    print(json.dumps(sample, indent=2))
+
 
 @app.get("/trains")
 def trains():
