@@ -36,6 +36,28 @@ def vlog(*a):
 
 EXCLUDE_SUB = ("wharf", "light rail", "b-line", "interchange", "motorway")
 
+ROUTE_PREFIX_MAP = {
+    # Suburban
+    "APS": "T1",
+    "BMT": "T1",
+    "CMB": "T2",
+    "IWL": "T4",
+    "NTH": "T9",
+    "OLY": "T7",
+    "RTTA": "T6",
+    "SCO": "SCO",
+    "WST": "T1",
+    "M": "M1",
+    "T6": "T6",        # already handled, but keeps "T6_2a" safe
+    "CTY": "T2",       # City Circle – assign to T2 for now
+    "SHL": "T9",       # shuttle/local – Northern sector
+    "ESI": "T4",       # or "SCO" if you prefer South Coast behaviour
+    "CCN": "CCN",
+    "NSN": "T9",
+    "SMNW": "M1",      # Metro Northwest/C&SW
+    "T3": "T3",        # some trip_ids already start with T3_
+}
+
 # ---------------- Utilities ----------------
 def _session():
     s = requests.Session()
@@ -152,7 +174,7 @@ def collect_trains(feed: rt.FeedMessage, trip_to_short: dict[str, str]):
     by_route = {}
     dropped = 0
     missing_trip = 0
-    missing_route = 0
+    prefix_fallback = 0
 
     for e in feed.entity:
         if not e.HasField("vehicle"):
@@ -166,10 +188,22 @@ def collect_trains(feed: rt.FeedMessage, trip_to_short: dict[str, str]):
             dropped += 1
             continue
 
-        # ✅ Try mapping by trip_id first, then route_id fallback
+        # ✅ 1. Trip ID exact match
         rs = trip_to_short.get(tripid)
+
+        # ✅ 2. Route ID fallback
         if not rs and rid:
             rs = ROUTE_ID_TO_SHORT.get(rid)
+
+        # ✅ 3. Prefix fallback (e.g. APS12345 → T1)
+        if not rs:
+            prefix = tripid.split(".")[0].split("_")[0][:5]  # get up to 5 chars for cases like "SMNW_"
+            for key, val in ROUTE_PREFIX_MAP.items():
+                if prefix.startswith(key):
+                    rs = val
+                    prefix_fallback += 1
+                    break
+
         if not rs:
             missing_trip += 1
             continue
@@ -184,7 +218,7 @@ def collect_trains(feed: rt.FeedMessage, trip_to_short: dict[str, str]):
 
     vlog(
         f"collect_trains kept={len(trains)} dropped={dropped} "
-        f"missing_trip={missing_trip} by_route={len(by_route)}"
+        f"missing_trip={missing_trip} prefix_fallback={prefix_fallback} by_route={len(by_route)}"
     )
     return trains, by_route
 
