@@ -1,9 +1,10 @@
-# app.py — Metroboard backend (Rail + Metro)
+# app.py — Metroboard backend (Rail + Metro) - FIXED LINE FILTERING
 # - Uses static GTFS (stops.txt, routes.txt, trips.txt, stop_times.txt, agency.txt)
 # - Filters to route_type in (1=subway/metro, 2=rail); optional agency allow-list
 # - Builds station×route keys like "Central1" (T1) and "CentralM" (M1)
 # - GTFS-RT from TfNSW: Sydney Trains + Sydney Metro vehicle positions
 # - States logic: prefer VP.stop_id -> parent match; fallback to distance thresholds
+# - **FIX**: Only match trains to stations with the EXACT same route_short
 # - Endpoints: /, /healthz, /debug, /stations, /states, /trains
 
 import os
@@ -698,6 +699,11 @@ def stations():
 
 @app.get("/states")
 def states(only: T.Optional[str] = Query(None, description="Comma-separated station names")):
+    """
+    *** FIXED VERSION ***
+    Returns status for each station, but ONLY considers trains on the SAME route_short.
+    This prevents T1 trains from lighting up T2/T3/etc stations.
+    """
     subset = STATION_INDEX
     if only:
         wanted = [x.strip() for x in only.split(",") if x.strip()]
@@ -714,11 +720,6 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
     if not trains:
         return JSONResponse({k: 0 for k in subset.keys()})
 
-    # group by route (and keep None bucket for distance-only trains)
-    grouped: dict[T.Optional[str], list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]]] = {}
-    for t in trains:
-        grouped.setdefault(t[2], []).append(t)
-
     VP_INCOMING = rt.VehiclePosition.INCOMING_AT
     VP_STOPPED  = rt.VehiclePosition.STOPPED_AT
 
@@ -729,13 +730,19 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
     for name, meta in subset.items():
         pid = meta["stop_id"]
         slat, slon = meta["lat"], meta["lon"]
-        rs = (meta.get("route_short") or "").upper()
+        # THIS IS THE KEY FIX: Each station has its specific route_short
+        station_route = (meta.get("route_short") or "").upper()
 
         best = 0
         best_d = None
 
-        # look at trains on this route, plus the None bucket (unknown route)
-        for (tlat, tlon, trs, child_sid, st) in grouped.get(rs, []) + grouped.get(None, []):
+        # CRITICAL: Only look at trains that match THIS station's route
+        for (tlat, tlon, train_route, child_sid, st) in trains:
+            # SKIP trains that don't match this station's route
+            # Allow None train_route to fall through to distance-only matching
+            if train_route is not None and train_route != station_route:
+                continue
+
             # VP match first (unless forced distance)
             if not MB_FORCE_DISTANCE and child_sid:
                 parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
@@ -748,6 +755,7 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
                         best = max(best, 2)
                         matches += 1
 
+            # Distance fallback (only for trains on the correct route or unknown route)
             if best < 3 and tlat is not None and tlon is not None:
                 d = hav_m(slat, slon, tlat, tlon)
                 if best_d is None or d < best_d:
