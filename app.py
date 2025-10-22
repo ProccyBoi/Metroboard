@@ -560,17 +560,39 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
             continue
         v = e.vehicle
         rid = v.trip.route_id if v.HasField("trip") else ""
+        tripid = v.trip.trip_id if v.HasField("trip") else ""
         
-        # Try to get route_short from mapping
-        rs = (route_id_to_short.get(rid, "") or "").upper() or None
+        # Try route_id → short mapping
+        rs = (route_id_to_short.get(rid, "") or "").upper()
         
-        # FALLBACK: Try to extract from trip_id or route_id directly
+        # Fallbacks
+        if not rs:
+            # Common TfNSW pattern: "T3_1a" or "M1_2c"
+            for src in (rid, tripid):
+                if not src:
+                    continue
+                # Look for T/M followed by digits (e.g., T1, T2, M1)
+                match = re.search(r"\b([TM]\d{1,2})\b", src, re.I)
+                if match:
+                    rs = match.group(1).upper()
+                    vlog(f"[fallback] extracted route_short={rs} from {src}")
+                    break
+        
+        # Still nothing? try prefix map for known patterns
         if not rs and rid:
-            # Many TfNSW feeds embed the line code in the route_id
-            match = SHORT_RE.search(rid)
-            if match:
-                rs = match.group(1).upper()
-                vlog(f"Extracted {rs} from route_id {rid}")
+            for prefix, code in {
+                "APS": "T1", "BMT": "T1", "CMB": "T2", "IWL": "T8",
+                "NTH": "T9", "OLY": "T7", "SCO": "SCO", "RTTA": "T6",
+                "WST": "T1", "M": "M1"
+            }.items():
+                if rid.upper().startswith(prefix):
+                    rs = code
+                    vlog(f"[map] inferred {rs} from prefix {prefix}")
+                    break
+        
+        if not rs:
+            rs = None
+
         
         # Track missing routes for debugging
         if not rs and rid:
