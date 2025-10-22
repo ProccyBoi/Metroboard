@@ -571,8 +571,9 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
             "SCO": "SCO",
             "WST": "T1",
             "M": "M1",
-        
-            # Intercity / New prefixes
+            "T6": "T6",        # already handled, but keeps "T6_2a" safe
+            "CTY": "T2",       # City Circle – assign to T2 for now
+            "SHL": "T9",       # shuttle/local – Northern sector
             "ESI": "T4",     # or "SCO" if you prefer South Coast behaviour
             "CCN": "CCN",
             "NSN": "T9",
