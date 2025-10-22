@@ -131,25 +131,48 @@ def fetch_vp_cached():
     return merged,0.0
 
 # ---------------- Train collector ----------------
-def collect_trains(feed, trip_to_short):
-    trains=[]; by_route={}; missing={}
+def collect_trains(feed: rt.FeedMessage, trip_to_short: dict[str, str]):
+    """
+    Extract scheduled trains with route_short_name using trip→route mapping.
+    Filters out NonTimetabled/test trains.
+    """
+    trains: list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]] = []
+    by_route: dict[str, int] = {}
+    missing: dict[str, int] = {}
+
     for e in feed.entity:
-        if not e.HasField("vehicle"): continue
-        v=e.vehicle
-        tripid=v.trip.trip_id if v.HasField("trip") else ""
-        rid=v.trip.route_id if v.HasField("trip") else ""
-        rs=trip_to_short.get(tripid) or ""
-        if not rs: missing[rid or tripid]=missing.get(rid or tripid,0)+1
-        if rs and ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW: continue
-        sid=getattr(v,"stop_id","")
-        st=int(getattr(v,"current_status",rt.VehiclePosition.IN_TRANSIT_TO))
-        lat=getattr(v.position,"latitude",None) if v.HasField("position") else None
-        lon=getattr(v.position,"longitude",None) if v.HasField("position") else None
-        trains.append((lat,lon,rs or None,sid,st))
-        if rs: by_route[rs]=by_route.get(rs,0)+1
-    if missing: vlog(f"missing short_names: {len(missing)} sample={list(missing)[:8]}")
-    vlog(f"collect_trains kept={len(trains)} by_route={len(by_route)}")
-    return trains,by_route
+        if not e.HasField("vehicle"):
+            continue
+        v = e.vehicle
+        tripid = v.trip.trip_id if v.HasField("trip") else ""
+        rid = v.trip.route_id if v.HasField("trip") else ""
+
+        # 🚫 Skip non-scheduled trains
+        if tripid.startswith(("NonTimetabled", "Test")) or rid.startswith(("NonTimetabled", "Test")):
+            continue
+
+        # Map trip → route short name
+        rs = trip_to_short.get(tripid, "")
+        if not rs:
+            missing[rid or tripid] = missing.get(rid or tripid, 0) + 1
+
+        if rs and ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW:
+            continue
+
+        sid = getattr(v, "stop_id", "")
+        status = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
+        lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
+        lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
+
+        trains.append((lat, lon, rs or None, sid, status))
+        if rs:
+            by_route[rs] = by_route.get(rs, 0) + 1
+
+    if missing and MB_VERBOSE:
+        vlog(f"missing short_names: {len(missing)} (sample: {list(missing.keys())[:6]})")
+
+    vlog(f"collect_trains kept={len(trains)} scheduled_by_route={len(by_route)}")
+    return trains, by_route
 
 # ---------------- FastAPI ----------------
 app=FastAPI()
@@ -199,12 +222,75 @@ def trains():
     return {"total":len(trains),"sample":out}
 
 @app.get("/states")
-def states():
-    feed,_=fetch_vp_cached()
-    trains,_=collect_trains(feed,TRIP_TO_ROUTE_SHORT)
-    # Example minimal logic: counts trains by route
-    out={rs:v for rs,v in sorted(((r or "UNK"),n) for r,n in dict((t[2],0) for t in trains).items())}
-    return out
+def states(only: T.Optional[str] = Query(None, description="Comma-separated station names")):
+    """
+    Full LED state engine:
+      - Uses trip→route_short mapping
+      - Filters to scheduled trains only
+      - Matches only same route_short
+      - Uses VP.stop_id match first, then distance fallback
+    """
+    subset = STATION_INDEX
+    if only:
+        wanted = [x.strip() for x in only.split(",") if x.strip()]
+        subset = {n: STATION_INDEX[n] for n in wanted if n in STATION_INDEX}
+        if not subset:
+            return JSONResponse({})
+
+    feed, _ = fetch_vp_cached()
+    trains, _ = collect_trains(feed, TRIP_TO_ROUTE_SHORT)
+    if MB_VERBOSE:
+        vlog(f"processing {len(trains)} trains across {len(subset)} stations")
+
+    if not trains:
+        return JSONResponse({k: 0 for k in subset.keys()})
+
+    VP_INCOMING = rt.VehiclePosition.INCOMING_AT
+    VP_STOPPED = rt.VehiclePosition.STOPPED_AT
+    out: dict[str, int] = {}
+    matches = dist_fb = 0
+
+    for name, meta in subset.items():
+        pid = meta["stop_id"]
+        slat, slon = meta["lat"], meta["lon"]
+        station_route = (meta.get("route_short") or "").upper()
+        best = 0
+        best_d = None
+
+        for (tlat, tlon, train_route, child_sid, st) in trains:
+            if train_route is not None and train_route != station_route:
+                continue
+
+            # VP parent-station match
+            if not MB_FORCE_DISTANCE and child_sid:
+                parent = CHILD_TO_PARENT.get(child_sid) or child_sid
+                if parent == pid:
+                    if st == VP_STOPPED:
+                        best = 3
+                        matches += 1
+                        break
+                    elif st == VP_INCOMING:
+                        best = max(best, 2)
+                        matches += 1
+
+            # Distance fallback (same route or unknown route)
+            if best < 3 and tlat is not None and tlon is not None:
+                d = hav_m(slat, slon, tlat, tlon)
+                if best_d is None or d < best_d:
+                    best_d = d
+
+        if best == 0 and best_d is not None:
+            best = status_from_dist(best_d)
+            if best > 0:
+                dist_fb += 1
+
+        out[name] = best
+
+    if MB_VERBOSE:
+        act = sum(1 for v in out.values() if v > 0)
+        vlog(f"result active={act}/{len(subset)} matches={matches} distance_fb={dist_fb}")
+
+    return JSONResponse(out)
 
 if __name__=="__main__":
     import uvicorn
