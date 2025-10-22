@@ -148,29 +148,46 @@ def fetch_vp_cached():
 
 # ---------------- Train collector ----------------
 def collect_trains(feed: rt.FeedMessage, trip_to_short: dict[str, str]):
-    trains=[]; by_route={}; dropped=0
+    trains = []
+    by_route = {}
+    dropped = 0
+    missing_trip = 0
+    missing_route = 0
+
     for e in feed.entity:
-        if not e.HasField("vehicle"): continue
-        v=e.vehicle
-        tripid=v.trip.trip_id if v.HasField("trip") else ""
-        rid=v.trip.route_id if v.HasField("trip") else ""
+        if not e.HasField("vehicle"):
+            continue
+        v = e.vehicle
+        tripid = v.trip.trip_id if v.HasField("trip") else ""
+        rid = v.trip.route_id if v.HasField("trip") else ""
 
-        # Skip non-scheduled
-        if tripid.startswith(("NonTimetabled","Test")) or rid.startswith(("NonTimetabled","Test")):
-            dropped+=1; continue
+        # 🚫 Skip non-scheduled trains
+        if tripid.startswith(("NonTimetabled", "Test")) or rid.startswith(("NonTimetabled", "Test")):
+            dropped += 1
+            continue
 
-        rs=trip_to_short.get(tripid)
-        if not rs: continue
+        # ✅ Try mapping by trip_id first, then route_id fallback
+        rs = trip_to_short.get(tripid)
+        if not rs and rid:
+            rs = ROUTE_ID_TO_SHORT.get(rid)
+        if not rs:
+            missing_trip += 1
+            continue
 
-        sid=getattr(v,"stop_id","")
-        st=int(getattr(v,"current_status",rt.VehiclePosition.IN_TRANSIT_TO))
-        lat=getattr(v.position,"latitude",None) if v.HasField("position") else None
-        lon=getattr(v.position,"longitude",None) if v.HasField("position") else None
+        sid = getattr(v, "stop_id", "")
+        st = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
+        lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
+        lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
 
-        trains.append((lat,lon,rs,sid,st))
-        by_route[rs]=by_route.get(rs,0)+1
-    vlog(f"collect_trains kept={len(trains)} dropped={dropped} by_route={len(by_route)}")
-    return trains,by_route
+        trains.append((lat, lon, rs, sid, st))
+        by_route[rs] = by_route.get(rs, 0) + 1
+
+    vlog(
+        f"collect_trains kept={len(trains)} dropped={dropped} "
+        f"missing_trip={missing_trip} by_route={len(by_route)}"
+    )
+    return trains, by_route
+
 
 # ---------------- FastAPI ----------------
 app=FastAPI()
