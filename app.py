@@ -559,41 +559,46 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         if not e.HasField("vehicle"):
             continue
         v = e.vehicle
+        ROUTE_PREFIX_MAP = {
+            "APS": "T1",
+            "BMT": "T1",
+            "CMB": "T2",
+            "IWL": "T4",
+            "NTH": "T9",
+            "OLY": "T7",
+            "RTTA": "T6",
+            "SCO": "SCO",
+            "WST": "T1",
+            "M": "M1",
+        }
+        
         rid = v.trip.route_id if v.HasField("trip") else ""
         tripid = v.trip.trip_id if v.HasField("trip") else ""
         
         # Try route_id → short mapping
         rs = (route_id_to_short.get(rid, "") or "").upper()
         
-        # Fallbacks
+        # Fallback: extract T/M number if present
         if not rs:
-            # Common TfNSW pattern: "T3_1a" or "M1_2c"
             for src in (rid, tripid):
                 if not src:
                     continue
-                # Look for T/M followed by digits (e.g., T1, T2, M1)
                 match = re.search(r"\b([TM]\d{1,2})\b", src, re.I)
                 if match:
                     rs = match.group(1).upper()
                     vlog(f"[fallback] extracted route_short={rs} from {src}")
                     break
         
-        # Still nothing? try prefix map for known patterns
+        # Prefix-based inference for control codes
         if not rs and rid:
-            for prefix, code in {
-                "APS": "T1", "BMT": "T1", "CMB": "T2", "IWL": "T8",
-                "NTH": "T9", "OLY": "T7", "SCO": "SCO", "RTTA": "T6",
-                "WST": "T1", "M": "M1"
-            }.items():
-                if rid.upper().startswith(prefix):
-                    rs = code
-                    vlog(f"[map] inferred {rs} from prefix {prefix}")
-                    break
+            prefix = rid.split("_", 1)[0].upper()
+            rs = ROUTE_PREFIX_MAP.get(prefix)
+            if rs:
+                vlog(f"[prefix-map] inferred route_short={rs} from prefix={prefix}")
         
         if not rs:
             rs = None
 
-        
         # Track missing routes for debugging
         if not rs and rid:
             missing_routes[rid] = missing_routes.get(rid, 0) + 1
