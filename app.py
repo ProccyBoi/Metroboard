@@ -714,7 +714,7 @@ def debug():
 def trains():
     """Debug endpoint to see raw train data"""
     feed, age = fetch_vp_cached()
-    trains, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
+    trains, _, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
 
     # rt.VehiclePosition.VehicleStopStatus:
     # INCOMING_AT=0, STOPPED_AT=1, IN_TRANSIT_TO=2
