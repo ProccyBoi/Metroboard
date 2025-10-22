@@ -560,6 +560,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
             continue
         v = e.vehicle
         ROUTE_PREFIX_MAP = {
+            # Suburban
             "APS": "T1",
             "BMT": "T1",
             "CMB": "T2",
@@ -570,6 +571,13 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
             "SCO": "SCO",
             "WST": "T1",
             "M": "M1",
+        
+            # Intercity / New prefixes
+            "ESI": "T4",     # or "SCO" if you prefer South Coast behaviour
+            "CCN": "CCN",
+            "NSN": "T9",
+            "SMNW": "M1",    # Metro Northwest/C&SW
+            "T3": "T3",      # some trip_ids already start with T3_
         }
         
         rid = v.trip.route_id if v.HasField("trip") else ""
