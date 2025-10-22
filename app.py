@@ -772,7 +772,7 @@ def states(only: T.Optional[str] = Query(None, description="Comma-separated stat
             return JSONResponse({})
 
     feed, _ = fetch_vp_cached()
-    trains, _by_route = collect_trains(feed, ROUTE_ID_TO_SHORT)
+    trains, _by_route, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
 
     if MB_VERBOSE:
         vlog(f"processing trains={len(trains)} stations={len(subset)}")
