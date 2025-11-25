@@ -16,8 +16,8 @@ import random
 import typing as T
 
 import requests
-from fastapi import FastAPI, Query
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, Query, Request, Form
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google.transit import gtfs_realtime_pb2 as rt
 from requests.adapters import HTTPAdapter
@@ -48,6 +48,10 @@ ROUTE_SHORT_ALLOW: set[str] = {s.strip().upper() for s in os.getenv("MB_ROUTE_SH
 # Route short-name overrides
 ROUTE_SHORT_OVERRIDES_PATH = os.getenv("ROUTE_SHORT_OVERRIDES_PATH", "route_overrides.csv")
 ROUTE_SHORT_OVERRIDES_JSON = os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "")
+BOARD_SETTINGS_PATH = os.getenv("BOARD_SETTINGS_PATH", "boards.json")
+
+# board_id -> settings dict
+BOARD_SETTINGS: dict[str, dict] = {}
 
 # Caching/CORS/logging
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
@@ -74,6 +78,53 @@ SYD_BBOX = _bbox_env()
 def vlog(*a):
     if MB_VERBOSE:
         print("[metroboard]", *a)
+
+def _load_board_settings() -> dict[str, dict]:
+    if not os.path.exists(BOARD_SETTINGS_PATH):
+        return {}
+    try:
+        with open(BOARD_SETTINGS_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except Exception as e:
+        vlog("WARN: failed to load boards.json:", e)
+    return {}
+
+def _save_board_settings() -> None:
+    try:
+        with open(BOARD_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(BOARD_SETTINGS, f, indent=2, sort_keys=True)
+    except Exception as e:
+        vlog("WARN: failed to save boards.json:", e)
+
+def _default_board_settings(board_id: str) -> dict:
+    return {
+        "board_id": board_id,
+        "brightness": 160,
+        "mode": "live",  # "live" or "animation"
+        "night_mode": {
+            "enabled": False,
+            "start": "23:00",
+            "end": "06:00",
+            "action": "off",  # "off" or "dim"
+            "dim_level": 20
+        },
+        "animation": {
+            "name": "pulse",
+            "speed": 120,
+            "color": [255, 80, 0]
+        },
+    }
+
+def _get_or_create_board(board_id: str) -> dict:
+    board_id = (board_id or "").strip()
+    if not board_id:
+        raise ValueError("empty board_id")
+    if board_id not in BOARD_SETTINGS:
+        BOARD_SETTINGS[board_id] = _default_board_settings(board_id)
+        _save_board_settings()
+    return BOARD_SETTINGS[board_id]
 
 EXCLUDE_SUB = ("wharf", "light rail", "b-line", "interchange", "motorway", " m2")
 SHORT_RE = re.compile(r"\b([TM]\d{1,2})\b", re.I)
@@ -655,7 +706,9 @@ CHILD_TO_PARENT: dict[str, str] = {}
 
 @app.on_event("startup")
 def _startup():
-    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT
+    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS
+
+    BOARD_SETTINGS = _load_board_settings()
 
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
 
@@ -709,6 +762,152 @@ def healthz():
     age = None if _FEED_TS == 0 else (time.time() - _FEED_TS)
     return {"status": "ok", "stations": len(STATION_INDEX), "trains_last_fetch_s": age}
 
+@app.get("/login", response_class=HTMLResponse)
+def login_get():
+    return """
+    <html>
+      <head><title>Metroboard Login</title></head>
+      <body>
+        <h2>Metroboard Login</h2>
+        <form method="post" action="/login">
+          <label>Board ID (5-char code):</label>
+          <input type="text" name="board_id" minlength="5" maxlength="16" required />
+          <button type="submit">Open</button>
+        </form>
+      </body>
+    </html>
+    """
+
+@app.post("/login")
+async def login_post(board_id: str = Form(...)):
+    board_id = board_id.strip()
+    if not board_id:
+        return RedirectResponse("/login", status_code=303)
+    return RedirectResponse(f"/board/{board_id}", status_code=303)
+
+
+@app.get("/board/{board_id}", response_class=HTMLResponse)
+def board_settings_page(board_id: str):
+    try:
+        cfg = _get_or_create_board(board_id)
+    except ValueError:
+        return HTMLResponse("Invalid board_id", status_code=400)
+
+    b = cfg.get("brightness", 160)
+    mode = cfg.get("mode", "live")
+    nm = cfg.get("night_mode", {}) or {}
+    an = cfg.get("animation", {}) or {}
+
+    nm_enabled = "checked" if nm.get("enabled") else ""
+    nm_start = nm.get("start", "23:00")
+    nm_end = nm.get("end", "06:00")
+    nm_action = nm.get("action", "off")
+    nm_dim = nm.get("dim_level", 20)
+
+    an_name = an.get("name", "pulse")
+    an_speed = an.get("speed", 120)
+    an_color = an.get("color", [255, 80, 0])
+    an_color_hex = "#%02X%02X%02X" % (an_color[0], an_color[1], an_color[2])
+
+    return f"""
+    <html>
+      <head>
+        <title>Metroboard {board_id} Settings</title>
+      </head>
+      <body>
+        <h2>Metroboard {board_id}</h2>
+        <form method="post" action="/board/{board_id}">
+          <h3>Display Mode</h3>
+          <label><input type="radio" name="mode" value="live" {'checked' if mode=='live' else ''}> Live trains</label><br>
+          <label><input type="radio" name="mode" value="animation" {'checked' if mode=='animation' else ''}> Animation</label>
+
+          <h3>Brightness</h3>
+          <input type="range" min="0" max="255" name="brightness" value="{b}" />
+
+          <h3>Night Mode</h3>
+          <label>
+            <input type="checkbox" name="nm_enabled" {nm_enabled}> Enable night mode
+          </label><br>
+          <label>Start: <input type="time" name="nm_start" value="{nm_start}"></label><br>
+          <label>End: <input type="time" name="nm_end" value="{nm_end}"></label><br>
+          <label>Action:
+            <select name="nm_action">
+              <option value="off" {"selected" if nm_action=="off" else ""}>Turn off</option>
+              <option value="dim" {"selected" if nm_action=="dim" else ""}>Dim</option>
+            </select>
+          </label><br>
+          <label>Night brightness:
+            <input type="number" name="nm_dim" min="0" max="255" value="{nm_dim}">
+          </label>
+
+          <h3>Animation</h3>
+          <label>Name:
+            <select name="an_name">
+              <option value="pulse" {"selected" if an_name=="pulse" else ""}>Pulse</option>
+              <option value="rainbow" {"selected" if an_name=="rainbow" else ""}>Rainbow</option>
+            </select>
+          </label><br>
+          <label>Speed:
+            <input type="number" name="an_speed" value="{an_speed}">
+          </label><br>
+          <label>Colour:
+            <input type="color" name="an_color" value="{an_color_hex}">
+          </label><br><br>
+
+          <button type="submit">Save</button>
+        </form>
+
+        <p><a href="/login">Back</a></p>
+      </body>
+    </html>
+    """
+
+
+@app.post("/board/{board_id}")
+async def board_settings_save(
+    board_id: str,
+    mode: str = Form("live"),
+    brightness: int = Form(160),
+    nm_enabled: T.Optional[str] = Form(None),
+    nm_start: str = Form("23:00"),
+    nm_end: str = Form("06:00"),
+    nm_action: str = Form("off"),
+    nm_dim: int = Form(20),
+    an_name: str = Form("pulse"),
+    an_speed: int = Form(120),
+    an_color: str = Form("#FF5000"),
+):
+    cfg = _get_or_create_board(board_id)
+
+    mode = mode if mode in ("live", "animation") else "live"
+    brightness = max(0, min(255, brightness))
+    nm_dim = max(0, min(255, nm_dim))
+
+    def _parse_hex_color(s: str) -> list[int]:
+        s = s.lstrip("#")
+        if len(s) == 3: s = "".join(c*2 for c in s)
+        if len(s) != 6: return [255, 80, 0]
+        return [int(s[i:i+2], 16) for i in (0, 2, 4)]
+
+    cfg["mode"] = mode
+    cfg["brightness"] = brightness
+    cfg["night_mode"] = {
+        "enabled": bool(nm_enabled),
+        "start": nm_start,
+        "end": nm_end,
+        "action": nm_action,
+        "dim_level": nm_dim,
+    }
+    cfg["animation"] = {
+        "name": an_name,
+        "speed": an_speed,
+        "color": _parse_hex_color(an_color),
+    }
+
+    BOARD_SETTINGS[board_id] = cfg
+    _save_board_settings()
+
+    return RedirectResponse(f"/board/{board_id}", status_code=303)
 
 @app.get("/debug")
 def debug():
@@ -766,19 +965,39 @@ def trains():
         "sample_trains": out
     }
 
+@app.get("/board_settings")
+def board_settings_api(board_id: str = Query(...)):
+    board_id = board_id.strip()
+    if not board_id:
+        return JSONResponse({"error": "missing board_id"}, status_code=400)
+    try:
+        cfg = _get_or_create_board(board_id)
+    except ValueError:
+        return JSONResponse({"error": "invalid board_id"}, status_code=400)
+    return JSONResponse(cfg)
+
 @app.get("/stations")
 def stations():
     # Sorted by name for stable UI
     return JSONResponse([STATION_INDEX[k] for k in sorted(STATION_INDEX.keys())])
 
 @app.get("/states")
-def states(only: T.Optional[str] = Query(None, description="Comma-separated station names")):
+def states(
+    only: T.Optional[str] = Query(None, description="Comma-separated station names"),
+    board_id: T.Optional[str] = Query(None, description="Board ID (5-char code)")
+):
     """
-    *** FIXED VERSION ***
-    Returns status for each station, but ONLY considers trains on the SAME route_short.
-    This prevents T1 trains from lighting up T2/T3/etc stations.
+    Returns status for each station.
+    If board_id is provided, we require that board to exist in boards.json.
     """
+    if board_id is not None:
+        board_id = board_id.strip()
+        if not board_id or board_id not in BOARD_SETTINGS:
+            return JSONResponse({"error": "unknown board_id"}, status_code=403)
+        # You *could* read mode here and e.g. short-circuit if mode=="animation".
+
     subset = STATION_INDEX
+
     if only:
         wanted = [x.strip() for x in only.split(",") if x.strip()]
         subset = {n: STATION_INDEX[n] for n in wanted if n in STATION_INDEX}
