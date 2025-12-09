@@ -49,6 +49,10 @@ ROUTE_SHORT_ALLOW: set[str] = {s.strip().upper() for s in os.getenv("MB_ROUTE_SH
 ROUTE_SHORT_OVERRIDES_PATH = os.getenv("ROUTE_SHORT_OVERRIDES_PATH", "route_overrides.csv")
 ROUTE_SHORT_OVERRIDES_JSON = os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "")
 BOARD_SETTINGS_PATH = os.getenv("BOARD_SETTINGS_PATH", "boards.json")
+DEFAULT_BOARD_IDS = [
+    bid.strip() for bid in (os.getenv("DEFAULT_BOARD_IDS") or "AB12C").split(",")
+    if bid.strip()
+]
 
 # board_id -> settings dict
 BOARD_SETTINGS: dict[str, dict] = {}
@@ -90,7 +94,14 @@ def vlog(*a):
 
 def _load_board_settings() -> dict[str, dict]:
     if not os.path.exists(BOARD_SETTINGS_PATH):
-        return {}
+        seeded = {_id: _default_board_settings(_id) for _id in DEFAULT_BOARD_IDS}
+        if seeded:
+            try:
+                with open(BOARD_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                    json.dump(seeded, f, indent=2, sort_keys=True)
+            except Exception as e:
+                vlog("WARN: failed to create boards.json:", e)
+        return seeded
     try:
         with open(BOARD_SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)

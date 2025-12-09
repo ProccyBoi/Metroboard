@@ -1,0 +1,26 @@
+{
+  "AB12C": {
+    "animation": {
+      "color": [
+        255,
+        80,
+        0
+      ],
+      "name": "pulse",
+      "speed": 120
+    },
+    "board_id": "AB12C",
+    "brightness": {
+      "animation": 160,
+      "live": 160
+    },
+    "mode": "live",
+    "night_mode": {
+      "action": "off",
+      "dim_level": 20,
+      "enabled": false,
+      "end": "06:00",
+      "start": "23:00"
+    }
+  }
+}
