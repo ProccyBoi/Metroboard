@@ -234,6 +234,7 @@ def _effective_brightness(cfg: dict, *, now_minutes: T.Optional[int] = None) -> 
 
 EXCLUDE_SUB = ("wharf", "light rail", "b-line", "interchange", "motorway", " m2")
 SHORT_RE = re.compile(r"\b([TM]\d{1,2})\b", re.I)
+LINE_CODE_RE = re.compile(r"^(T\d{1,2}|M\d|CCN|SCO|BMT|HUN)$", re.I)
 
 # ---------------- Small helpers ----------------
 def _session() -> requests.Session:
@@ -328,6 +329,12 @@ def derive_route_short(route_short_name: str | None, route_long_name: str | None
         if m:
             return m.group(1).upper()
     return ""
+
+
+def is_core_line(rs: str) -> bool:
+    """Return True for supported passenger rail/metro line short codes."""
+
+    return bool(LINE_CODE_RE.match((rs or "").strip()))
 
 def load_route_overrides(path: str, env_json: str) -> dict[str, str]:
     out: dict[str, str] = {}
@@ -442,6 +449,8 @@ def require_allowed_parents(
                 continue
             if route_short_allow and rshort and rshort.upper() not in route_short_allow:
                 continue
+            if not is_core_line(rshort):
+                continue
             p = parent_of((r.get("stop_id") or "").strip())
             if p and is_num_parent(p):
                 allowed.add(p)
@@ -547,6 +556,8 @@ def require_allowed_pairs(
                 if len(missing_short_seen) < 20:
                     missing_short_seen[rid] = missing_short_seen.get(rid, 0) + 1
                 continue
+            if not is_core_line(rshort):
+                continue
             if route_short_allow and rshort not in route_short_allow:
                 continue
             p = parent_of((r.get("stop_id") or "").strip())
@@ -557,9 +568,29 @@ def require_allowed_pairs(
         vlog(f"pairs strict: {len(pairs)}")
         return pairs
 
+    # deterministic fallback from curated station_line_pairs.csv (avoids line fan-out)
+    pairs_csv = os.getenv("STATION_LINE_PAIRS_PATH", "station_line_pairs.csv")
+    if os.path.exists(pairs_csv):
+        with open(pairs_csv, encoding="utf-8-sig") as f:
+            for row in csv.DictReader(f):
+                pid = (row.get("parent_stop_id") or "").strip()
+                rs = (row.get("route_short") or "").strip().upper()
+                if not (pid and rs):
+                    continue
+                if route_short_allow and rs not in route_short_allow:
+                    continue
+                if allowed_parents_for_fallback and pid not in allowed_parents_for_fallback:
+                    continue
+                if not is_core_line(rs):
+                    continue
+                pairs.add((pid, rs))
+        if pairs:
+            vlog(f"pairs from CSV: {len(pairs)}")
+            return pairs
+
     # permissive fallback
-    if os.getenv("MB_PERMISSIVE_PAIRS", "1") != "0":
-        known = _known_tm(route_id_to_short)
+    if os.getenv("MB_PERMISSIVE_PAIRS", "0") != "0":
+        known = {rs for rs in _known_tm(route_id_to_short) if is_core_line(rs)}
         if route_short_allow:
             known &= {x.upper() for x in route_short_allow}
         if not known:
