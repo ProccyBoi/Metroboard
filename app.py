@@ -544,6 +544,16 @@ def load_station_index(
 
     return idx
 
+
+def station_routes_lookup(station_index: dict[str, dict]) -> dict[str, set[str]]:
+    out: dict[str, set[str]] = {}
+    for meta in station_index.values():
+        base = (meta.get("base_name") or "").lower()
+        rs = (meta.get("route_short") or "").upper()
+        if base and rs:
+            out.setdefault(base, set()).add(rs)
+    return out
+
 # ---------------- Child→Parent map for VP.stop_id resolution ----------------
 def build_child_to_parent(stops="stops.txt") -> dict[str, str]:
     out: dict[str, str] = {}
@@ -600,16 +610,59 @@ def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
     vlog("feed merged vehicles", total)
     return merged, 0.0
 
-def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> tuple[
+def collect_trains(
+    feed: rt.FeedMessage,
+    route_id_to_short: dict[str, str],
+    station_routes_by_name: dict[str, set[str]],
+) -> tuple[
     list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]],
     dict[str, int],
     dict[str, str],
 ]:
-    """Return (trains, counts, route_debug)."""
+    """Return (trains, counts, route_debug).
+
+    The primary source of truth for a vehicle's line is the label-based inference, as
+    described in the TfNSW GTFS-RT spec (see VehicleDescriptor.label examples in the
+    Real Time Train Technical Document v3.6). This avoids bucketing trains purely by
+    inferred route_id prefixes, which can be inaccurate when multiple lines share
+    similar identifiers.
+    """
     trains = []
     by_route = {}
     missing_routes = {}
     route_debug = {}
+
+    def _route_from_label(label: str) -> T.Optional[str]:
+        label = (label or "").strip()
+        if not label:
+            return None
+
+        # Drop leading departure time (e.g., "15:30 ")
+        label = re.sub(r"^\d{1,2}:\d{2}\s+", "", label)
+
+        # Expect "<Origin> to <Destination>" per TfNSW examples
+        parts = re.split(r"\s+to\s+", label, maxsplit=1, flags=re.IGNORECASE)
+        if len(parts) != 2:
+            return None
+
+        origin_raw, dest_raw = (clean_name(p) for p in parts)
+        origin = origin_raw.lower()
+        dest = dest_raw.lower()
+
+        routes_o = station_routes_by_name.get(origin, set())
+        routes_d = station_routes_by_name.get(dest, set())
+
+        if routes_o and routes_d:
+            common = routes_o & routes_d
+            if common:
+                return sorted(common)[0]
+
+        # If only one side is known and unique, prefer it as a best-effort guess
+        for routes in (routes_o, routes_d):
+            if len(routes) == 1:
+                return next(iter(routes))
+
+        return None
 
     ROUTE_PREFIX_MAP = {
         # Core prefixes
@@ -642,6 +695,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         v = e.vehicle
         rid = v.trip.route_id if v.HasField("trip") else ""
         tripid = v.trip.trip_id if v.HasField("trip") else ""
+        label = getattr(v.vehicle, "label", "") if v.HasField("vehicle") else ""
 
         rs = (route_id_to_short.get(rid, "") or "").upper()
 
@@ -654,6 +708,10 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                 if m:
                     rs = m.group(1).upper()
                     break
+
+        # Prefer route from VehicleDescriptor label when available
+        if not rs:
+            rs = _route_from_label(label)
 
         # Fallback: prefix mapping
         if not rs and rid:
@@ -669,7 +727,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                         break
 
         rs = rs or None
-        route_debug[rid] = rs
+        route_debug[rid] = rs or _route_from_label(label)
         if not rs and rid:
             missing_routes[rid] = missing_routes.get(rid, 0) + 1
 
@@ -703,10 +761,11 @@ if CORS_ALLOW_ORIGIN:
 ROUTE_ID_TO_SHORT: dict[str, str] = {}
 STATION_INDEX: dict[str, dict] = {}
 CHILD_TO_PARENT: dict[str, str] = {}
+STATION_ROUTES_BY_NAME: dict[str, set[str]] = {}
 
 @app.on_event("startup")
 def _startup():
-    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS
+    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS, STATION_ROUTES_BY_NAME
 
     BOARD_SETTINGS = _load_board_settings()
 
@@ -746,6 +805,8 @@ def _startup():
         allowed_parents=allowed_parents,
         allowed_pairs=allowed_pairs,
     )
+
+    STATION_ROUTES_BY_NAME = station_routes_lookup(STATION_INDEX)
 
     CHILD_TO_PARENT = build_child_to_parent("stops.txt")
 
@@ -912,7 +973,7 @@ async def board_settings_save(
 @app.get("/debug")
 def debug():
     feed, _ = fetch_vp_cached()
-    trains, by_route, route_debug = collect_trains(feed, ROUTE_ID_TO_SHORT)
+    trains, by_route, route_debug = collect_trains(feed, ROUTE_ID_TO_SHORT, STATION_ROUTES_BY_NAME)
     return {
         "stations_count": len(STATION_INDEX),
         "bbox": list(SYD_BBOX) if SYD_BBOX else None,
@@ -927,7 +988,7 @@ def debug():
 def trains():
     """Debug endpoint to see raw train data"""
     feed, age = fetch_vp_cached()
-    trains, _, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
+    trains, _, _ = collect_trains(feed, ROUTE_ID_TO_SHORT, STATION_ROUTES_BY_NAME)
 
     # rt.VehiclePosition.VehicleStopStatus:
     # INCOMING_AT=0, STOPPED_AT=1, IN_TRANSIT_TO=2
@@ -1005,7 +1066,7 @@ def states(
             return JSONResponse({})
 
     feed, _ = fetch_vp_cached()
-    trains, _by_route, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
+    trains, _by_route, _ = collect_trains(feed, ROUTE_ID_TO_SHORT, STATION_ROUTES_BY_NAME)
 
     if MB_VERBOSE:
         vlog(f"processing trains={len(trains)} stations={len(subset)}")
