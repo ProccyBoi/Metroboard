@@ -847,9 +847,6 @@ def collect_trains(
         "MOUNTAINS": ["T1"], "CUMBERLAND": ["T5"], "WOLLONGONG": ["SCO"],
         "LIVERPOOL": ["T3"], "SEFTON": ["T3", "T6"],
         "BLACKTOWN": ["T1"], "LIDCOMBE": ["T1", "T7"],
-    
-        # Defensive catch for stray codes
-        "": ["T1"],  # blank/unknown — default to T1 to avoid None
     }
 
 
@@ -879,18 +876,19 @@ def collect_trains(
         if not rs:
             rs = _route_from_label(label)
 
-        # Fallback: prefix mapping
+        # Fallback: prefix mapping (only when a usable prefix exists)
         if not rs and rid:
             prefix = rid.split("_", 1)[0].split(".")[0].upper()
-            if prefix in ROUTE_PREFIX_MAP:
-                opts = ROUTE_PREFIX_MAP[prefix]
-                rs = opts[abs(hash(tripid or rid)) % len(opts)]
-            else:
-                # check substrings for looser match
-                for key, opts in ROUTE_PREFIX_MAP.items():
-                    if key in prefix:
-                        rs = opts[abs(hash(tripid or rid)) % len(opts)]
-                        break
+            if prefix:
+                if prefix in ROUTE_PREFIX_MAP:
+                    opts = ROUTE_PREFIX_MAP[prefix]
+                    rs = opts[abs(hash(tripid or rid)) % len(opts)]
+                else:
+                    # check substrings for looser match
+                    for key, opts in ROUTE_PREFIX_MAP.items():
+                        if key and key in prefix:
+                            rs = opts[abs(hash(tripid or rid)) % len(opts)]
+                            break
 
         rs = rs or None
         route_debug[rid or tripid] = rs or _route_from_label(label)
