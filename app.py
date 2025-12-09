@@ -390,6 +390,21 @@ def load_route_shortnames(routes_path: str = "routes.txt") -> dict[str, str]:
     vlog(f"route_short: {len(out)} (ov={len(ov)})")
     return out
 
+
+def load_trip_to_route(trips_path: str = "trips.txt") -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    try:
+        with open(trips_path, encoding="utf-8-sig") as f:
+            for r in csv.DictReader(f):
+                tid = (r.get("trip_id") or "").strip()
+                rid = (r.get("route_id") or "").strip()
+                if tid and rid:
+                    mapping[tid] = rid
+    except Exception as e:
+        vlog(f"WARN: failed to load trips map: {e}")
+    vlog(f"trip→route map: {len(mapping)}")
+    return mapping
+
 # ---------------- Static GTFS filters: allowed parents & pairs ----------------
 def require_allowed_parents(
     stops="stops.txt",
@@ -762,6 +777,7 @@ def collect_trains(
     feed: rt.FeedMessage,
     route_id_to_short: dict[str, str],
     station_routes_by_name: dict[str, set[str]],
+    trip_to_route: dict[str, str],
 ) -> tuple[
     list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]],
     dict[str, int],
@@ -831,9 +847,6 @@ def collect_trains(
         "MOUNTAINS": ["T1"], "CUMBERLAND": ["T5"], "WOLLONGONG": ["SCO"],
         "LIVERPOOL": ["T3"], "SEFTON": ["T3", "T6"],
         "BLACKTOWN": ["T1"], "LIDCOMBE": ["T1", "T7"],
-    
-        # Defensive catch for stray codes
-        "": ["T1"],  # blank/unknown — default to T1 to avoid None
     }
 
 
@@ -843,6 +856,7 @@ def collect_trains(
         v = e.vehicle
         rid = v.trip.route_id if v.HasField("trip") else ""
         tripid = v.trip.trip_id if v.HasField("trip") else ""
+        rid = rid or trip_to_route.get(tripid, "")
         label = getattr(v.vehicle, "label", "") if v.HasField("vehicle") else ""
 
         label_route = _route_from_label(label)
@@ -862,21 +876,22 @@ def collect_trains(
         if not rs:
             rs = _route_from_label(label)
 
-        # Fallback: prefix mapping
+        # Fallback: prefix mapping (only when a usable prefix exists)
         if not rs and rid:
             prefix = rid.split("_", 1)[0].split(".")[0].upper()
-            if prefix in ROUTE_PREFIX_MAP:
-                opts = ROUTE_PREFIX_MAP[prefix]
-                rs = opts[abs(hash(tripid or rid)) % len(opts)]
-            else:
-                # check substrings for looser match
-                for key, opts in ROUTE_PREFIX_MAP.items():
-                    if key in prefix:
-                        rs = opts[abs(hash(tripid or rid)) % len(opts)]
-                        break
+            if prefix:
+                if prefix in ROUTE_PREFIX_MAP:
+                    opts = ROUTE_PREFIX_MAP[prefix]
+                    rs = opts[abs(hash(tripid or rid)) % len(opts)]
+                else:
+                    # check substrings for looser match
+                    for key, opts in ROUTE_PREFIX_MAP.items():
+                        if key and key in prefix:
+                            rs = opts[abs(hash(tripid or rid)) % len(opts)]
+                            break
 
         rs = rs or None
-        route_debug[rid] = rs or _route_from_label(label)
+        route_debug[rid or tripid] = rs or _route_from_label(label)
         if not rs and rid:
             missing_routes[rid] = missing_routes.get(rid, 0) + 1
 
@@ -911,16 +926,18 @@ ROUTE_ID_TO_SHORT: dict[str, str] = {}
 STATION_INDEX: dict[str, dict] = {}
 CHILD_TO_PARENT: dict[str, str] = {}
 STATION_ROUTES_BY_NAME: dict[str, set[str]] = {}
+TRIP_TO_ROUTE: dict[str, str] = {}
 
 @app.on_event("startup")
 def _startup():
-    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS, STATION_ROUTES_BY_NAME
+    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS, STATION_ROUTES_BY_NAME, TRIP_TO_ROUTE
 
     BOARD_SETTINGS = _load_board_settings()
     for cfg in BOARD_SETTINGS.values():
         _normalize_board_settings(cfg)
 
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
+    TRIP_TO_ROUTE = load_trip_to_route("trips.txt")
 
     allowed_parents = require_allowed_parents(
         stops="stops.txt",
@@ -1137,7 +1154,7 @@ async def board_settings_save(
 @app.get("/debug")
 def debug():
     feed, _ = fetch_vp_cached()
-    trains, by_route, route_debug = collect_trains(feed, ROUTE_ID_TO_SHORT, STATION_ROUTES_BY_NAME)
+    trains, by_route, route_debug = collect_trains(feed, ROUTE_ID_TO_SHORT, STATION_ROUTES_BY_NAME, TRIP_TO_ROUTE)
     return {
         "stations_count": len(STATION_INDEX),
         "bbox": list(SYD_BBOX) if SYD_BBOX else None,
@@ -1152,7 +1169,7 @@ def debug():
 def trains():
     """Debug endpoint to see raw train data"""
     feed, age = fetch_vp_cached()
-    trains, _, _ = collect_trains(feed, ROUTE_ID_TO_SHORT, STATION_ROUTES_BY_NAME)
+    trains, _, _ = collect_trains(feed, ROUTE_ID_TO_SHORT, STATION_ROUTES_BY_NAME, TRIP_TO_ROUTE)
 
     # rt.VehiclePosition.VehicleStopStatus:
     # INCOMING_AT=0, STOPPED_AT=1, IN_TRANSIT_TO=2
@@ -1236,7 +1253,7 @@ def states(
             return JSONResponse({})
 
     feed, _ = fetch_vp_cached()
-    trains, _by_route, _ = collect_trains(feed, ROUTE_ID_TO_SHORT, STATION_ROUTES_BY_NAME)
+    trains, _by_route, _ = collect_trains(feed, ROUTE_ID_TO_SHORT, STATION_ROUTES_BY_NAME, TRIP_TO_ROUTE)
 
     if MB_VERBOSE:
         vlog(f"processing trains={len(trains)} stations={len(subset)}")
