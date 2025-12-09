@@ -1252,7 +1252,7 @@ def states(
         # CRITICAL: Only look at trains that match THIS station's route
         for (tlat, tlon, train_route, child_sid, st) in trains:
             # SKIP trains that don't match this station's route
-            # Allow None train_route to fall through to distance-only matching
+            # Allow None train_route only for **exact** stop_id matches (no distance fallback)
             if train_route is not None and train_route != station_route:
                 continue
 
@@ -1268,8 +1268,8 @@ def states(
                         best = max(best, 2)
                         matches += 1
 
-            # Distance fallback (only for trains on the correct route or unknown route)
-            if best < 3 and tlat is not None and tlon is not None:
+            # Distance fallback only for trains with a route that matches this station
+            if best < 3 and tlat is not None and tlon is not None and train_route == station_route:
                 d = hav_m(slat, slon, tlat, tlon)
                 if best_d is None or d < best_d:
                     best_d = d
