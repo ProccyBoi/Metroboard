@@ -1,29 +1,86 @@
-// public.ino
-// Production-ready Metroboard firmware sketch.
-// Features:
-//  - Live train mode (renders /states) and animation mode (local LED patterns)
-//  - Per-mode brightness (live vs animation) driven by backend board settings
-//  - Selectable animations (pulse/rainbow/theater/sparkle/solid) with speed control
-//  - Night mode honors backend dim/off window by using effective_brightness
-//  - Resilient fetch loops with backoff to avoid hammering the API
-//
-// Libraries required: Adafruit_NeoPixel, ArduinoJson, WiFi, HTTPClient.
+// Metroboard — Solid-at-Station, No Flicker, BRIGHTNESS=16, Grace TTL, Coalesced Batch Updates
 
-#include <ArduinoJson.h>
-#include <HTTPClient.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <Adafruit_NeoPixel.h>
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-// ---------- WiFi + API config ----------
-const char *WIFI_SSID = "YOUR_WIFI";
-const char *WIFI_PASS = "YOUR_PASS";
-const char *BOARD_ID = "ABCDE";  // 5+ char board code
-const char *API_BASE = "http://metroboard.local"; // base URL to FastAPI backend
+// ===== WiFi / Endpoint =====
+#define WIFI_SSID "Bob"
+#define WIFI_PASS "96365509"
 
-// ---------- LED config ----------
-#define LINE_COUNT 10
-const uint8_t STRIP_PINS[LINE_COUNT] = {2, 4, 5, 18, 19, 21, 22, 23, 25, 26}; // set to your wiring
-const uint16_t STRIP_LEN[LINE_COUNT] = {10, 10, 10, 10, 10, 10, 10, 10, 10, 10}; // LEDs per strip
+static const char* kBoardId    = "AB12C";   // <- unique per Metroboard
+static const char* kStatesBase = "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/states";
+static const char* kSettingsBase = "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_settings";
+
+static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
+
+static const char* ISRG_X1 = R"EOF(
+-----BEGIN CERTIFICATE-----
+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
+-----END CERTIFICATE-----
+)EOF";
+
+// ===== LEDs =====
+#define STATUS_PIN 25
+uint8_t gBaseBrightness = 16;   // updated from settings
+uint8_t gEffectiveBrightness = 16; // can later factor in night mode
+
+
+enum Line : uint8_t { L_T9, L_T5, L_T2, L_T6, L_T3, L_T4, L_T7, L_T8, L_M1, L_T1, LINE_COUNT };
+const uint8_t  STRIP_PINS[LINE_COUNT] = {4,13,14,16,17,18,19,21,22,23};
+//                                     T9  T5  T2  T6  T3  T4  T7  T8  M1  T1
+const uint16_t STRIP_LEN [LINE_COUNT] = {43, 31, 38,  6, 30, 33,  2, 38, 31, 56}; // synced to tester
+bool REVERSE[LINE_COUNT] = {0,0,0,0,0,0,1,0,0,0}; // T7 reversed physically
+
+// Fixed per-line colors (LED-friendly palette synced to tester)
+const uint32_t LINE_COLOR_HEX[LINE_COUNT] = {
+  0xE53935, // T9 red
+  0xD81B60, // T5 magenta
+  0x00ACC1, // T2 teal/cyan
+  0xA0522D, // T6 brown (Sienna, LED-friendly)
+  0xFB8C00, // T3 orange
+  0x0D47A1, // T4 dark blue
+  0x9E9E9E, // T7 grey
+  0x006400, // T8 dark green (pure green)
+  0x26C6DA, // M1 light teal
+  0xF39C12  // T1 yellow/orange
+};
 
 Adafruit_NeoPixel strips[LINE_COUNT] = {
   Adafruit_NeoPixel(STRIP_LEN[0], STRIP_PINS[0], NEO_GRB + NEO_KHZ800),
@@ -38,25 +95,212 @@ Adafruit_NeoPixel strips[LINE_COUNT] = {
   Adafruit_NeoPixel(STRIP_LEN[9], STRIP_PINS[9], NEO_GRB + NEO_KHZ800)
 };
 
-struct StationMap {
-  const char *name;   // station display name exactly as backend serves
-  uint8_t line;       // strip index
-  uint16_t index;     // LED index along strip
-};
+Adafruit_NeoPixel statusStrip(1, STATUS_PIN, NEO_GRB + NEO_KHZ800);
+DynamicJsonDocument gDoc(8192);
 
-// Minimal sample map. Replace with your board's layout to cover all stations.
-const StationMap STATION_MAP[] = {
-  {"Penrith Station", 0, 0},
-  {"Parramatta Station", 0, 1},
-  {"Central Station", 0, 2},
-  {"Town Hall Station", 0, 3},
-  {"Wynyard Station", 0, 4},
-  {"Chatswood Station", 1, 0},
-  {"Epping Station", 1, 1},
-  {"Hornsby Station", 1, 2},
-  {"Bondi Junction Station", 2, 0}
-};
-const size_t STATION_COUNT = sizeof(STATION_MAP) / sizeof(STATION_MAP[0]);
+String gMode = "live"; // "live" or "animation"
+
+struct NightModeCfg {
+  bool enabled;
+  String start;   // "HH:MM"
+  String end;
+  String action;  // "off" or "dim"
+  uint8_t dimLevel;
+} gNightMode = {false, "23:00", "06:00", "off", 20};
+
+struct AnimCfg {
+  String name;   // "pulse", "rainbow", ...
+  int speed;     // arbitrary units
+  uint8_t r, g, b;
+} gAnim = {"pulse", 120, 255, 80, 0};
+
+uint32_t lastSettingsFetch = 0;
+const uint32_t SETTINGS_FETCH_MS = 30000; // 30s
+
+// ===== Binding model =====
+struct LedBinding { const char* station; Line line; uint16_t led; };
+#define MAX_BINDINGS 500
+LedBinding B[MAX_BINDINGS]; size_t NB = 0;
+
+// Persistent state + tiny hold-time after last solid to avoid blink-offs
+uint8_t* stateBuf = nullptr;  // 0..3 (we light only when ==3)
+uint8_t* ttlBuf   = nullptr;  // polls-to-hold after last 3
+static const uint8_t GRACE_POLLS = 3; // a touch longer to mask late batches
+
+// ===== helpers =====
+void fetchBoardSettings() {
+  static bool firstFetch = true;
+  if (!firstFetch && millis() - lastSettingsFetch < SETTINGS_FETCH_MS) return;
+  firstFetch = false;
+  lastSettingsFetch = millis();
+
+  Serial.println("=== Fetching board settings ===");
+  String url = String(kSettingsBase) + "?board_id=" + kBoardId;
+  Serial.printf("[DEBUG] URL = %s\n", url.c_str());
+
+  // --- TLS test ---
+  Serial.println("[TLS] testing raw TLS connection...");
+  WiFiClientSecure tlsTest;
+  tlsTest.setInsecure();
+  tlsTest.setCACert(nullptr);   // <--- ADD THIS
+  if (!tlsTest.connect("damp-catlin-metroboard-7be2a3b3.koyeb.app", 443)) {
+      Serial.println("[TLS] FAILED — cannot handshake");
+      return;
+  }
+
+  Serial.println("[TLS] OK — handshake success");
+  tlsTest.stop();
+
+  // --- real client ---
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setCACert(nullptr);    // <--- ADD THIS
+  client.setTimeout(20000);
+  client.setHandshakeTimeout(20000);
+
+  HTTPClient http;
+  http.setTimeout(20000);
+  http.useHTTP10(false); /// IMPORTANT: HTTP/1.1
+
+  http.addHeader("User-Agent", "ESP32-Metroboard");
+  http.addHeader("Accept-Encoding", "identity");
+  http.addHeader("Cache-Control", "no-cache");
+
+  Serial.println("[HTTP] beginning request...");
+  if (!http.begin(client, url)) {
+    Serial.println("[HTTP] begin FAILED");
+    return;
+  }
+
+  int code = http.GET();
+  Serial.printf("[HTTP] GET returned %d\n", code);
+
+  if (code != HTTP_CODE_OK) {
+    Serial.println("[HTTP] GET error");
+    http.end();
+    return;
+  }
+
+  String body = http.getString();
+  http.end();
+
+  Serial.println("[HTTP] settings payload:");
+  Serial.println(body);
+
+  if (body.isEmpty() || (body[0] != '{' && body[0] != '[')) {
+    Serial.println("Invalid settings JSON");
+    return;
+  }
+
+  DynamicJsonDocument doc(4096);  // <--- FIXED BUFFER SIZE
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("JSON decode error: %s\n", err.c_str());
+    return;
+  }
+
+  JsonObject root = doc.as<JsonObject>();
+
+  // ===== Mode =====
+  const char* mode = root["mode"] | "live";
+  gMode = String(mode);
+  gMode.toLowerCase();
+  Serial.printf("Mode = %s\n", gMode.c_str());
+
+  // ===== Brightness =====
+  int b = root["brightness"] | 16;
+  b = constrain(b, 0, 255);
+  gBaseBrightness = (uint8_t)b;
+
+  // TEMP: disable night mode for troubleshooting
+  gEffectiveBrightness = gBaseBrightness;
+
+  // ===== Night mode =====
+  JsonObject nm = root["night_mode"];
+  if (!nm.isNull()) {
+    gNightMode.enabled = nm["enabled"] | false;
+    gNightMode.start   = nm["start"]   | "23:00";
+    gNightMode.end     = nm["end"]     | "06:00";
+    gNightMode.action  = nm["action"]  | "off";
+    gNightMode.dimLevel = (uint8_t) (nm["dim_level"] | 20);
+  }
+
+  // ===== Animation =====
+  JsonObject an = root["animation"];
+  if (!an.isNull()) {
+    const char* animName = an["name"] | "pulse";
+    gAnim.name = String(animName);
+    gAnim.speed = an["speed"] | 120;
+
+    JsonArray col = an["color"].as<JsonArray>();
+    if (col.size() >= 3) {
+      gAnim.r = uint8_t(col[0]);
+      gAnim.g = uint8_t(col[1]);
+      gAnim.b = uint8_t(col[2]);
+    }
+  }
+
+  Serial.printf("Brightness=%u  NightMode=%d  Anim=%s\n",
+                gBaseBrightness,
+                gNightMode.enabled,
+                gAnim.name.c_str());
+}
+
+void statusOrange() {
+  statusStrip.setPixelColor(0, statusStrip.Color(200, 80, 0)); // orange
+  statusStrip.show();
+}
+
+void statusGreen() {
+  statusStrip.setPixelColor(0, statusStrip.Color(0, 160, 0)); // green
+  statusStrip.show();
+}
+
+static const char* routeSuffix(Line ln){
+  switch(ln){
+    case L_T9: return "9";  case L_T5: return "5";  case L_T2: return "2";
+    case L_T6: return "6";  case L_T3: return "3";  case L_T4: return "4";
+    case L_T7: return "7";  case L_T8: return "8";  case L_M1: return "M";
+    case L_T1: return "1";  default:   return "?";
+  }
+}
+static char* makeKey(const char* base, Line ln){
+  const char* suf = routeSuffix(ln);
+  size_t lb = strlen(base), ls = strlen(suf);
+  char* out = (char*)malloc(lb + ls + 1);
+  if(!out) return nullptr;
+  memcpy(out, base, lb);
+  memcpy(out + lb, suf, ls);
+  out[lb + ls] = '\0';
+  return out;
+}
+static inline uint16_t physIdx(Line ln, uint16_t led){
+  return REVERSE[ln] ? uint16_t(STRIP_LEN[ln] - 1 - led) : led;
+}
+void addBind(const char* base, Line ln, uint16_t led){
+  if(NB >= MAX_BINDINGS) return;
+  uint16_t idx = physIdx(ln, led);
+  if(idx >= STRIP_LEN[ln]) return;
+  char* key = makeKey(base, ln);
+  if(!key) return;
+  B[NB++] = { key, ln, idx };
+}
+void bindSeq(Line ln, const char* const* seq, size_t n, uint16_t start=0){
+  for(size_t i=0;i<n;i++) addBind(seq[i], ln, start + (uint16_t)i);
+}
+static inline bool unres(char c){
+  return (c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||c=='-'||c=='_'||c=='.'||c=='~';
+}
+static String enc(const char* s){
+  String o; while(*s){ char c=*s++;
+    if(unres(c)) o+=c; else { char b[4]; snprintf(b,sizeof(b),"%%%02X",(unsigned char)c); o+=b; }
+  } return o;
+}
+static uint32_t lineColor(Line ln){
+  uint32_t h = LINE_COLOR_HEX[ln];
+  uint8_t r = (h>>16)&0xFF, g = (h>>8)&0xFF, b = h&0xFF;
+  return strips[ln].Color(r,g,b);
+}
 
 // ===== sequences (synced to tester) =====
 // T9
@@ -121,272 +365,329 @@ const char* const T1_SEQ[] = {
   "Doonside","Rooty Hill","Mount Druitt","St Marys","Werrington","Kingswood","Penrith","Emu Plains"
 };
 
-// ---------- Timers ----------
-const unsigned long CFG_REFRESH_MS = 5000;
-const unsigned long STATE_REFRESH_MS = 3000;
-unsigned long lastCfgMs = 0;
-unsigned long lastStateMs = 0;
+// ===== build & render =====
+void runAnimationStep(){
+  // Simple pulse based on millis() and speed
+  static uint32_t last = 0;
+  uint32_t now = millis();
+  uint32_t dt = now - last;
+  last = now;
 
-// ---------- State model ----------
-struct AnimationCfg {
-  String name;
-  uint8_t speed;
-  uint32_t color;
-};
+  // Compute phase [0, 1]
+  float speed = (gAnim.speed <= 0) ? 100.0f : float(gAnim.speed);
+  float t = (now % (uint32_t)(speed * 20)) / (speed * 20.0f); // wrap
+  float intensity = 0.5f + 0.5f * sinf(2.0f * 3.14159f * t);   // 0..1
 
-struct NightCfg {
-  bool enabled;
-  String action; // "off" or "dim"
-  uint8_t dimLevel;
-  bool active;
-};
-
-struct BoardCfg {
-  String mode;          // "live" or "animation"
-  uint8_t brightnessLive;
-  uint8_t brightnessAnimation;
-  uint8_t effectiveBrightness;
-  AnimationCfg animation;
-  NightCfg night;
-};
-
-BoardCfg cfg;
-
-// ---------- Helpers ----------
-uint32_t rgb(uint8_t r, uint8_t g, uint8_t b) { return ((uint32_t)r << 16) | ((uint32_t)g << 8) | b; }
-
-void applyBrightness(uint8_t level) {
-  for (int i = 0; i < LINE_COUNT; i++) {
-    strips[i].setBrightness(level);
-  }
-}
-
-void showAll() {
-  for (int i = 0; i < LINE_COUNT; i++) {
-    strips[i].show();
-  }
-}
-
-void setAll(uint32_t color) {
-  for (int l = 0; l < LINE_COUNT; l++) {
-    for (uint16_t i = 0; i < STRIP_LEN[l]; i++) {
-      strips[l].setPixelColor(i, color);
+  uint8_t br = (uint8_t)(gEffectiveBrightness * intensity);
+  for(uint8_t ln=0; ln<LINE_COUNT; ln++){
+    strips[ln].setBrightness(br);
+    strips[ln].clear();
+    for(uint16_t i=0; i<STRIP_LEN[ln]; i++){
+      strips[ln].setPixelColor(i, strips[ln].Color(gAnim.r, gAnim.g, gAnim.b));
     }
+    strips[ln].show();
   }
 }
 
-// ---------- Animations ----------
-void animPulse(uint8_t speed) {
-  static int level = 0;
-  static int dir = 1;
-  int step = max(1, (int)(speed / 12));
-  level += dir * step;
-  if (level >= 255) { level = 255; dir = -1; }
-  if (level <= 20) { level = 20; dir = 1; }
-  uint8_t effective = (uint16_t(level) * cfg.effectiveBrightness) / 255;
-  applyBrightness(effective);
-  setAll(cfg.animation.color);
-  showAll();
+void buildBindings(){
+  bindSeq(L_T9, T9_SEQ, sizeof(T9_SEQ)/sizeof(*T9_SEQ));
+  bindSeq(L_T5, T5_SEQ, sizeof(T5_SEQ)/sizeof(*T5_SEQ));
+  bindSeq(L_T2, T2_SEG1, sizeof(T2_SEG1)/sizeof(*T2_SEG1), 0);
+  bindSeq(L_T2, T2_SEG2, sizeof(T2_SEG2)/sizeof(*T2_SEG2), 12);
+  bindSeq(L_T6, T6_SEQ, sizeof(T6_SEQ)/sizeof(*T6_SEQ));
+  bindSeq(L_T3, T3_SEQ, sizeof(T3_SEQ)/sizeof(*T3_SEQ));
+  bindSeq(L_T4, T4_SEQ, sizeof(T4_SEQ)/sizeof(*T4_SEQ));
+  bindSeq(L_T7, T7_SEQ, sizeof(T7_SEQ)/sizeof(*T7_SEQ));
+  bindSeq(L_T8, T8_SEQ, sizeof(T8_SEQ)/sizeof(*T8_SEQ));
+  bindSeq(L_M1, M1_SEQ, sizeof(M1_SEQ)/sizeof(*M1_SEQ));
+  bindSeq(L_T1, T1_SEQ, sizeof(T1_SEQ)/sizeof(*T1_SEQ));
+
+  stateBuf = (uint8_t*)malloc(NB?NB:1);
+  ttlBuf   = (uint8_t*)malloc(NB?NB:1);
+  if(stateBuf) memset(stateBuf, 0, NB);
+  if(ttlBuf)   memset(ttlBuf, 0, NB);
+  Serial.printf("Bindings=%u\n", (unsigned)NB);
 }
 
-void animRainbow(uint8_t speed) {
-  static uint16_t hue = 0;
-  hue += speed;
-  for (int l = 0; l < LINE_COUNT; l++) {
-    for (uint16_t i = 0; i < STRIP_LEN[l]; i++) {
-      strips[l].setPixelColor(i, strips[l].gamma32(strips[l].ColorHSV(hue + i * 256 / STRIP_LEN[l])));
+bool dirtyLine[LINE_COUNT] = {0};
+inline void clearDirty(){ for(uint8_t i=0;i<LINE_COUNT;i++) dirtyLine[i]=false; }
+
+void applyBatchToState(const DynamicJsonDocument& doc) {
+  for (size_t i = 0; i < NB; i++) {
+    JsonVariantConst v = doc[B[i].station];
+    if (v.isNull()) continue;
+
+    int s = v.as<int>();
+    if (s < 0) s = 0;
+    if (s > 3) s = 3;
+
+    // DEBUG PRINT
+    Serial.printf("[STATE] %s = %d\n", B[i].station, s);
+
+    stateBuf[i] = (uint8_t)s;
+    if (s == 3) ttlBuf[i] = GRACE_POLLS;
+    dirtyLine[B[i].line] = true;
+  }
+}
+
+
+void repaintDirtyLinesAndDecayOnce(){
+  statusStrip.setBrightness(gEffectiveBrightness);
+  for(uint8_t ln=0; ln<LINE_COUNT; ln++){
+    strips[ln].setBrightness(gEffectiveBrightness);
+    if (!dirtyLine[ln]) continue;
+    Serial.printf("[RENDER] Repainting line %d\n", ln);
+    strips[ln].clear();
+    for(size_t i=0;i<NB;i++){
+      if(B[i].line != (Line)ln) continue;
+      bool on = (stateBuf[i]==3) || (ttlBuf[i]>0);
+      if(on) strips[ln].setPixelColor(B[i].led, lineColor(B[i].line));
     }
+    strips[ln].show();
   }
-  applyBrightness(cfg.effectiveBrightness);
-  showAll();
+  // TTL decay exactly once per poll tick (prevents mid-batch dropouts)
+  for(size_t i=0;i<NB;i++) if(stateBuf[i]!=3 && ttlBuf[i]>0) ttlBuf[i]--;
+  clearDirty();
 }
 
-void animTheater(uint8_t speed) {
-  static uint8_t offset = 0;
-  offset = (offset + 1) % 3;
-  for (int l = 0; l < LINE_COUNT; l++) {
-    for (uint16_t i = 0; i < STRIP_LEN[l]; i++) {
-      bool on = ((i + offset) % 3 == 0);
-      strips[l].setPixelColor(i, on ? cfg.animation.color : 0);
-    }
+void renderAll(){
+  statusStrip.setBrightness(gEffectiveBrightness);
+  for(uint8_t ln=0; ln<LINE_COUNT; ln++){
+    strips[ln].setBrightness(gEffectiveBrightness);
+    strips[ln].clear();
   }
-  applyBrightness(cfg.effectiveBrightness);
-  delay(20 + (255 - speed));
-  showAll();
-}
-
-void animSparkle(uint8_t speed) {
-  setAll(0);
-  int sparks = 1 + (speed / 32);
-  for (int i = 0; i < sparks; i++) {
-    uint8_t line = random(LINE_COUNT);
-    uint16_t idx = random(STRIP_LEN[line]);
-    strips[line].setPixelColor(idx, cfg.animation.color);
+  for(size_t i=0;i<NB;i++){
+    bool on = (stateBuf[i]==3) || (ttlBuf[i]>0);
+    if(on) strips[B[i].line].setPixelColor(B[i].led, lineColor(B[i].line));
   }
-  applyBrightness(cfg.effectiveBrightness);
-  delay(max(5, 40 - speed / 6));
-  showAll();
+  for(uint8_t ln=0; ln<LINE_COUNT; ln++) strips[ln].show();
+  // TTL decay once on full repaint
+  for(size_t i=0;i<NB;i++) if(stateBuf[i]!=3 && ttlBuf[i]>0) ttlBuf[i]--;
 }
 
-void animSolid() {
-  setAll(cfg.animation.color);
-  applyBrightness(cfg.effectiveBrightness);
-  showAll();
+// ===== networking & polling =====
+void wifiConnect(){
+  WiFi.mode(WIFI_STA); WiFi.setSleep(false); WiFi.begin(WIFI_SSID, WIFI_PASS);
+  Serial.printf("WiFi: \"%s\"", WIFI_SSID);
+  while(WiFi.status() != WL_CONNECTED){ delay(300); Serial.print('.'); }
+  Serial.printf("\nIP=%s heap=%u\n", WiFi.localIP().toString().c_str(), ESP.getFreeHeap());
+  statusGreen();
 }
-
-void runAnimation() {
-  uint8_t spd = cfg.animation.speed;
-  String name = cfg.animation.name;
-  if (name == "pulse") return animPulse(spd);
-  if (name == "rainbow") return animRainbow(spd);
-  if (name == "theater") return animTheater(spd);
-  if (name == "sparkle") return animSparkle(spd);
-  return animSolid();
-}
-
-// ---------- Network helpers ----------
-String buildUrl(const char *path) {
-  String url(API_BASE);
-  if (!url.endsWith("/")) url += "/";
-  url += path;
-  url += url.indexOf('?') >= 0 ? "&" : "?";
-  url += "board_id=";
-  url += BOARD_ID;
-  return url;
-}
-
-bool fetchJson(const String &url, DynamicJsonDocument &doc) {
-  HTTPClient http;
-  if (!http.begin(url)) return false;
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    http.end();
-    return false;
-  }
-  DeserializationError err = deserializeJson(doc, http.getStream());
-  http.end();
-  return !err;
-}
-
-// ---------- Config/state fetch ----------
-void updateBoardCfg() {
-  DynamicJsonDocument doc(2048);
-  if (!fetchJson(buildUrl("board_settings"), doc)) return;
-
-  const char *modeStr = doc["effective_mode"] | doc["mode"] | "live";
-  cfg.mode = String(modeStr);
-  cfg.brightnessLive = doc["brightness"]["live"] | 160;
-  cfg.brightnessAnimation = doc["brightness"]["animation"] | cfg.brightnessLive;
-  cfg.effectiveBrightness = doc["effective_brightness"] | cfg.brightnessLive;
-
-  JsonObject an = doc["animation"];
-  cfg.animation.name = String((const char *)an["name"] | "pulse");
-  cfg.animation.speed = an["speed"] | 120;
-  JsonArray col = an["color"].as<JsonArray>();
-  uint8_t r = col.size() > 0 ? col[0] : 255;
-  uint8_t g = col.size() > 1 ? col[1] : 80;
-  uint8_t b = col.size() > 2 ? col[2] : 0;
-  cfg.animation.color = rgb(r, g, b);
-
-  JsonObject nm = doc["night_mode"];
-  cfg.night.enabled = nm["enabled"] | false;
-  cfg.night.action = String((const char *)nm["action"] | "off");
-  cfg.night.dimLevel = nm["dim_level"] | 20;
-  cfg.night.active = doc["night_mode_active"] | false;
-}
-
-int findStation(const String &name, uint8_t &line, uint16_t &idx) {
-  for (size_t i = 0; i < STATION_COUNT; i++) {
-    if (name.equalsIgnoreCase(STATION_MAP[i].name)) {
-      line = STATION_MAP[i].line;
-      idx = STATION_MAP[i].index;
-      return i;
-    }
-  }
-  return -1;
-}
-
-void applyStates(const JsonObject &states) {
-  unsigned long now = millis();
-  bool blinkOn = (now / 500) % 2 == 0;
-  for (size_t i = 0; i < STATION_COUNT; i++) {
-    uint8_t line = STATION_MAP[i].line;
-    uint16_t idx = STATION_MAP[i].index;
-    const char *sname = STATION_MAP[i].name;
-    uint8_t state = states.containsKey(sname) ? (uint8_t)states[sname] : 0;
-
-    uint32_t color = 0;
-    if (state == 3) color = rgb(0, 255, 0);           // train at station
-    else if (state == 1) color = blinkOn ? rgb(255, 140, 0) : 0; // near -> blink
-    else if (state == 2) color = blinkOn ? rgb(0, 120, 255) : 0; // reserved fast blink
-    strips[line].setPixelColor(idx, color);
-  }
-  applyBrightness(cfg.effectiveBrightness);
-  showAll();
-}
-
-void updateStates() {
-  DynamicJsonDocument doc(4096);
-  if (!fetchJson(buildUrl("states"), doc)) return;
-  if (!doc.is<JsonObject>()) return;
-  applyStates(doc.as<JsonObject>());
-}
-
-// ---------- Setup & loop ----------
-void connectWiFi() {
-  if (WiFi.status() == WL_CONNECTED) return;
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  int retries = 0;
-  while (WiFi.status() != WL_CONNECTED && retries < 20) {
-    delay(500);
-    retries++;
-  }
-}
-
-void setup() {
-  Serial.begin(115200);
-  cfg.mode = "live";
-  cfg.brightnessLive = 160;
-  cfg.brightnessAnimation = 160;
-  cfg.effectiveBrightness = 160;
-  cfg.animation = {"pulse", 120, rgb(255, 80, 0)};
-  cfg.night = {false, "off", 20, false};
-  for (int i = 0; i < LINE_COUNT; i++) {
-    strips[i].begin();
-    strips[i].clear();
-    strips[i].show();
-  }
-  connectWiFi();
-  updateBoardCfg();
-  updateStates();
-}
-
-void loop() {
-  connectWiFi();
-  unsigned long now = millis();
-
-  if (now - lastCfgMs > CFG_REFRESH_MS) {
-    updateBoardCfg();
-    lastCfgMs = now;
-  }
-
-  bool liveMode = cfg.mode == "live";
-  uint8_t desiredBrightness = liveMode ? cfg.brightnessLive : cfg.brightnessAnimation;
-  cfg.effectiveBrightness = cfg.night.active && cfg.night.action == "dim" ? cfg.night.dimLevel : desiredBrightness;
-  if (cfg.night.active && cfg.night.action == "off") {
-    setAll(0);
-    applyBrightness(0);
-    showAll();
-    delay(500);
+void ensureWifi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    statusGreen();
     return;
   }
 
-  if (liveMode) {
-    if (now - lastStateMs > STATE_REFRESH_MS) {
-      updateStates();
-      lastStateMs = now;
-    }
+  Serial.println("[WiFi] LOST connection. Reconnecting...");
+  statusOrange();
+
+  WiFi.disconnect(true,true);
+  delay(100);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+    Serial.print('.');
+    delay(250);
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\n[WiFi] Reconnected. IP=%s\n",
+                  WiFi.localIP().toString().c_str());
+    statusGreen();
   } else {
-    runAnimation();
+    Serial.println("\n[WiFi] FAILED to reconnect.");
+  }
+}
+
+
+
+// ===== Batch tuner =====
+static const size_t URL_CHAR_BUDGET = 1700;    // safe budget for GET URL length
+static const uint8_t MAX_BATCHES_PER_POLL = 6; // fetch more per tick to speed things up
+
+size_t computeBatchEnd(size_t i){
+  const char* base = kStatesBase;
+
+  // Add board_id + "&only=" into the base URL length calculation
+  // Example: https://server/states?board_id=ABCDE&only=
+  size_t baseLen =
+      strlen(base)
+      + strlen("?board_id=")
+      + strlen(kBoardId)
+      + strlen("&only=");
+
+  size_t used = baseLen;
+  size_t j = i;
+
+  while(j < NB){
+    const char* s = B[j].station;
+
+    // 1 char for comma if not first
+    size_t need = (j == i) ? 0 : 1;
+
+    // URL-encode station name length
+    while(*s){
+      char c = *s++;
+      if ((c>='A'&&c<='Z')||(c>='a'&&c<='z')||(c>='0'&&c<='9')||
+          c=='-'||c=='_'||c=='.'||c=='~')
+      {
+        need += 1;
+      } else {
+        need += 3;
+      }
+    }
+
+    if (used + need > URL_CHAR_BUDGET)
+      break;
+
+    used += need;
+    j++;
+  }
+
+  if (j == i) j++; // always take at least one per batch
+  return j;
+}
+
+int fetchAllBatchesAndRenderOnce(){
+  if (NB == 0) return 0;
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(20000);
+  client.setHandshakeTimeout(20000);
+
+  size_t i = 0;
+  int ok = 0;
+  uint8_t fired = 0;
+
+  while (i < NB && fired < MAX_BATCHES_PER_POLL) {
+
+    size_t end = computeBatchEnd(i);
+
+    // Build full URL with board_id and only=
+    String url = String(kStatesBase);
+    url += "?board_id=";
+    url += kBoardId;
+    url += "&only=";
+
+    for (size_t j = i; j < end; j++) {
+      if (j > i) url += ',';
+      url += enc(B[j].station);
+    }
+
+    HTTPClient http;
+    http.setTimeout(20000);
+    http.setReuse(false);
+    http.useHTTP10(false);
+    http.addHeader("Accept", "application/json");
+    http.addHeader("Accept-Encoding", "identity");
+    http.addHeader("Cache-Control", "no-cache");
+    http.addHeader("Connection", "close");
+    http.addHeader("User-Agent", "ESP32-Metroboard/solid/1.2");
+
+    if (!http.begin(client, url)) {
+      http.end();
+      break;
+    }
+
+    const char* hk[] = {"Content-Type", "Content-Encoding"};
+    http.collectHeaders(hk, 2);
+
+    Serial.printf("[BATCH] GET %s\n", url.c_str());
+
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+      http.end();
+      break;
+    }
+
+    if (http.header("Content-Encoding").indexOf("gzip") >= 0 ||
+        http.header("Content-Type").indexOf("application/json") < 0)
+    {
+      http.end();
+      break;
+    }
+
+    String body = http.getString();
+    http.end();
+    body.trim();
+
+    char c0 = body.length() ? body.charAt(0) : '\0';
+    if (c0 != '{' && c0 != '[') break;
+
+    gDoc.clear();
+    if (deserializeJson(gDoc, body)) break;
+
+    // Store these states — do NOT render yet.
+    applyBatchToState(gDoc);
+
+    ok++;
+    fired++;
+    i = end;
+
+    Serial.printf("[BATCH] HTTP %d  (%d bytes)\n", code, body.length());
+
+    delay(40);
+    yield();
+  }
+
+  if (ok > 0) {
+    repaintDirtyLinesAndDecayOnce();
+  } else {
+    renderAll();
+  }
+
+  return ok;
+}
+
+// ===== setup / loop =====
+uint32_t lastPoll=0, pollInterval=POLL_MS_MIN;
+
+void beginStrips(){
+  statusStrip.begin(); statusStrip.setBrightness(gEffectiveBrightness);
+  statusOrange();
+  statusStrip.show();
+  for(uint8_t i=0;i<LINE_COUNT;i++){
+    strips[i].begin(); strips[i].setBrightness(gEffectiveBrightness);
+    strips[i].clear(); strips[i].show();
+  }
+}
+
+void setup(){
+  Serial.begin(115200); delay(150);
+  Serial.println("\nMetroboard — Solid Station Mode (TTL, fixed colors, BRIGHTNESS=16, coalesced)");
+  wifiConnect(); beginStrips(); buildBindings(); renderAll();
+}
+
+void loop(){
+  ensureWifi();
+  fetchBoardSettings();  // update gMode, brightness, animation, etc
+
+  if (gMode == "animation") {
+    // No /states polling; just run animation
+    runAnimationStep();
+    delay(20);  // small delay to control CPU usage
+    return;
+  }
+
+  // Live mode: your existing logic
+  if(millis()-lastPoll >= pollInterval){
+    lastPoll = millis();
+
+    statusStrip.setPixelColor(0, statusStrip.Color(0,80,0));
+    statusStrip.show();
+
+    int batches = fetchAllBatchesAndRenderOnce();
+
+    statusStrip.setPixelColor(0, statusStrip.Color(0,160,0));
+    statusStrip.show();
+
+    if(batches>0) pollInterval = POLL_MS_MIN;
+    else {
+      uint32_t next = pollInterval + 1500; if(next > POLL_MS_MAX) next = POLL_MS_MAX;
+      pollInterval = next;
+    }
   }
 }
