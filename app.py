@@ -816,6 +816,10 @@ def collect_trains(
                     rs = m.group(1).upper()
                     break
 
+        # Prefer route from VehicleDescriptor label when available
+        if not rs:
+            rs = _route_from_label(label)
+
         # Fallback: prefix mapping
         if not rs and rid:
             prefix = rid.split("_", 1)[0].split(".")[0].upper()
@@ -830,7 +834,7 @@ def collect_trains(
                         break
 
         rs = rs or None
-        route_debug[rid or label or tripid] = rs or label_route
+        route_debug[rid] = rs or _route_from_label(label)
         if not rs and rid:
             missing_routes[rid] = missing_routes.get(rid, 0) + 1
 
