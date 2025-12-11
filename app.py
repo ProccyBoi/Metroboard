@@ -807,20 +807,6 @@ def _route_from_label(label: str, station_routes_by_name: dict[str, set[str]]) -
     return None
 
 
-PREFIX_ROUTE_FALLBACK = {
-    "APS": "T8",   # Airport & South
-    "IWL": "T2",   # Inner West & Leppington
-    "CMB": "T5",   # Cumberland
-    "WST": "T1",   # Western
-    "NSN": "T9",   # Northern (T9)
-    "NTH": "T1",   # North Shore
-    "ESI": "T4",   # Eastern Suburbs & Illawarra
-    "BMT": "BMT",  # Blue Mountains
-    "CCN": "CCN",  # Central Coast & Newcastle
-    "SCO": "SCO",  # South Coast
-}
-
-
 def infer_vehicle_route(
     v: rt.VehiclePosition,
     route_id_to_short: dict[str, str],
@@ -836,10 +822,6 @@ def infer_vehicle_route(
     if not rs:
         rs = (route_id_to_short.get(rid, "") or "").upper()
 
-    if not rs and rid:
-        prefix = rid.split("_", 1)[0].upper()
-        rs = PREFIX_ROUTE_FALLBACK.get(prefix, "")
-
     if not rs:
         for src in (rid, tripid):
             if not src:
@@ -851,6 +833,14 @@ def infer_vehicle_route(
 
     return rs or None
 
+
+def collect_trains(
+    feed: rt.FeedMessage,
+    route_id_to_short: dict[str, str],
+    station_routes_by_name: dict[str, set[str]],
+    trip_to_route: dict[str, str],
+) -> list[dict[str, T.Any]]:
+    trains: list[dict[str, T.Any]] = []
 
 def collect_trains(
     feed: rt.FeedMessage,
@@ -1267,34 +1257,25 @@ def states(
     for train in trains:
         route = train.get("route")
         parent = train.get("parent_stop")
-        if not parent:
+        if not route or not parent:
+            continue
+        key = (parent, route)
+        if key not in stop_route_subset:
             continue
 
-        # If the route is missing, try every station under this parent.
-        target_keys: list[tuple[str, str]]
-        if route:
-            key = (parent, route)
-            target_keys = [key] if key in stop_route_subset else []
-        else:
-            target_keys = [key for key in stop_route_subset if key[0] == parent]
+        for station_name in stop_route_subset[key]:
+            if out.get(station_name) == 3:
+                continue
 
-        if not target_keys:
-            continue
+            meta = subset[station_name]
+            slat, slon = meta["lat"], meta["lon"]
+            tlat, tlon = train.get("lat"), train.get("lon")
+            near = False
+            if tlat is not None and tlon is not None:
+                near = hav_m(slat, slon, tlat, tlon) <= 100
 
-        for key in target_keys:
-            for station_name in stop_route_subset.get(key, []):
-                if out.get(station_name) == 3:
-                    continue
-
-                meta = subset[station_name]
-                slat, slon = meta["lat"], meta["lon"]
-                tlat, tlon = train.get("lat"), train.get("lon")
-                near = False
-                if tlat is not None and tlon is not None:
-                    near = hav_m(slat, slon, tlat, tlon) <= 100
-
-                if near or train.get("status") == rt.VehiclePosition.STOPPED_AT or train.get("stop_id"):
-                    out[station_name] = 3
+            if near or train.get("status") == rt.VehiclePosition.STOPPED_AT or train.get("stop_id"):
+                out[station_name] = 3
 
     return JSONResponse(out)
 
