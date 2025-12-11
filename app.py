@@ -803,20 +803,6 @@ def _route_from_label(label: str, station_routes_by_name: dict[str, set[str]]) -
     return None
 
 
-PREFIX_ROUTE_FALLBACK = {
-    "APS": "T8",   # Airport & South
-    "IWL": "T2",   # Inner West & Leppington
-    "CMB": "T5",   # Cumberland
-    "WST": "T1",   # Western
-    "NSN": "T9",   # Northern (T9)
-    "NTH": "T1",   # North Shore
-    "ESI": "T4",   # Eastern Suburbs & Illawarra
-    "BMT": "BMT",  # Blue Mountains
-    "CCN": "CCN",  # Central Coast & Newcastle
-    "SCO": "SCO",  # South Coast
-}
-
-
 def infer_vehicle_route(
     v: rt.VehiclePosition,
     route_id_to_short: dict[str, str],
@@ -832,10 +818,6 @@ def infer_vehicle_route(
     if not rs:
         rs = (route_id_to_short.get(rid, "") or "").upper()
 
-    if not rs and rid:
-        prefix = rid.split("_", 1)[0].upper()
-        rs = PREFIX_ROUTE_FALLBACK.get(prefix, "")
-
     if not rs:
         for src in (rid, tripid):
             if not src:
@@ -847,6 +829,14 @@ def infer_vehicle_route(
 
     return rs or None
 
+
+def collect_trains(
+    feed: rt.FeedMessage,
+    route_id_to_short: dict[str, str],
+    station_routes_by_name: dict[str, set[str]],
+    trip_to_route: dict[str, str],
+) -> list[dict[str, T.Any]]:
+    trains: list[dict[str, T.Any]] = []
 
 def collect_trains(
     feed: rt.FeedMessage,
