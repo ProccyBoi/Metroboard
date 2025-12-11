@@ -838,6 +838,14 @@ def collect_trains(
 ) -> list[dict[str, T.Any]]:
     trains: list[dict[str, T.Any]] = []
 
+def collect_trains(
+    feed: rt.FeedMessage,
+    route_id_to_short: dict[str, str],
+    station_routes_by_name: dict[str, set[str]],
+    trip_to_route: dict[str, str],
+) -> list[dict[str, T.Any]]:
+    trains: list[dict[str, T.Any]] = []
+
     for e in feed.entity:
         if not e.HasField("vehicle"):
             continue
