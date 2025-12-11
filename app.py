@@ -137,8 +137,12 @@ def _default_board_settings(board_id: str) -> dict:
         },
     }
 
+def normalize_board_id(board_id: str) -> str:
+    return (board_id or "").strip().upper()
+
+
 def _get_or_create_board(board_id: str) -> dict:
-    board_id = (board_id or "").strip()
+    board_id = normalize_board_id(board_id)
     if not board_id:
         raise ValueError("empty board_id")
     if board_id not in BOARD_SETTINGS:
@@ -1184,7 +1188,7 @@ def trains():
 
 @app.get("/board_settings")
 def board_settings_api(board_id: str = Query(...)):
-    board_id = board_id.strip()
+    board_id = normalize_board_id(board_id)
     if not board_id:
         return JSONResponse({"error": "missing board_id"}, status_code=400)
     try:
@@ -1214,8 +1218,13 @@ def states(
     If board_id is provided, we require that board to exist in boards.json.
     """
     if board_id is not None:
-        board_id = board_id.strip()
-        if not board_id or board_id not in BOARD_SETTINGS:
+        board_id = normalize_board_id(board_id)
+        if not board_id:
+            return JSONResponse({"error": "unknown board_id"}, status_code=403)
+        # Ensure the board exists (creates with defaults if missing)
+        try:
+            _get_or_create_board(board_id)
+        except ValueError:
             return JSONResponse({"error": "unknown board_id"}, status_code=403)
         # You *could* read mode here and e.g. short-circuit if mode=="animation".
 
