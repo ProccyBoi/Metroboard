@@ -1,26 +1,23 @@
 {
   "AB12C": {
+    "board_id": "AB12C",
+    "brightness": 160,
+    "mode": "live",
+    "night_mode": {
+      "enabled": false,
+      "start": "23:00",
+      "end": "06:00",
+      "action": "off",
+      "dim_level": 20
+    },
     "animation": {
+      "name": "pulse",
+      "speed": 120,
       "color": [
         255,
         80,
         0
-      ],
-      "name": "pulse",
-      "speed": 120
-    },
-    "board_id": "AB12C",
-    "brightness": {
-      "animation": 160,
-      "live": 160
-    },
-    "mode": "live",
-    "night_mode": {
-      "action": "off",
-      "dim_level": 20,
-      "enabled": false,
-      "end": "06:00",
-      "start": "23:00"
+      ]
     }
   }
 }
