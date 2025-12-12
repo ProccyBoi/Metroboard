@@ -1122,6 +1122,7 @@ def board_settings_page(board_id: str):
 
 @app.post("/board/{board_id}")
 async def board_settings_save(
+    request: Request,
     board_id: str,
     mode: str = Form("live"),
     brightness_live: int = Form(160),
@@ -1171,6 +1172,20 @@ async def board_settings_save(
 
     BOARD_SETTINGS[board_id_norm] = cfg
     _save_board_settings()
+
+    eff_b, night_active, eff_mode = _effective_brightness(cfg)
+    resp = dict(cfg)
+    resp["effective_brightness"] = eff_b
+    resp["effective_mode"] = eff_mode
+    resp["night_mode_active"] = night_active
+    resp["animations_available"] = ANIMATION_CHOICES
+    resp["brightness_live"] = cfg["brightness"].get("live", brightness_live)
+    resp["brightness_animation"] = cfg["brightness"].get("animation", brightness_animation)
+    resp["brightness_default"] = _get_brightness_for_mode(cfg, cfg.get("mode", "live"))
+
+    accept = request.headers.get("accept", "").lower()
+    if "application/json" in accept:
+        return JSONResponse(resp)
 
     return RedirectResponse(f"/board/{board_id_norm}", status_code=303)
 

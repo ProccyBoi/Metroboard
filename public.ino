@@ -208,12 +208,27 @@ void fetchBoardSettings() {
   Serial.printf("Mode = %s\n", gMode.c_str());
 
   // ===== Brightness =====
-  int b = root["brightness"] | 16;
-  b = constrain(b, 0, 255);
-  gBaseBrightness = (uint8_t)b;
+  int liveB = 16, animB = 16;
+  JsonVariant br = root["brightness"];
+  if (br.is<int>()) {
+    liveB = animB = br.as<int>();
+  } else if (br.is<JsonObject>()) {
+    JsonObject o = br.as<JsonObject>();
+    liveB = o["live"] | o["default"] | liveB;
+    animB = o["animation"] | liveB;
+  }
 
-  // TEMP: disable night mode for troubleshooting
-  gEffectiveBrightness = gBaseBrightness;
+  liveB = constrain(liveB, 0, 255);
+  animB = constrain(animB, 0, 255);
+
+  gBaseBrightness = (gMode == "animation") ? (uint8_t)animB : (uint8_t)liveB;
+
+  int effB = root["effective_brightness"] | -1;
+  if (effB >= 0) {
+    gEffectiveBrightness = (uint8_t)constrain(effB, 0, 255);
+  } else {
+    gEffectiveBrightness = gBaseBrightness;
+  }
 
   // ===== Night mode =====
   JsonObject nm = root["night_mode"];
