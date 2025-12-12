@@ -49,22 +49,9 @@ ROUTE_SHORT_ALLOW: set[str] = {s.strip().upper() for s in os.getenv("MB_ROUTE_SH
 ROUTE_SHORT_OVERRIDES_PATH = os.getenv("ROUTE_SHORT_OVERRIDES_PATH", "route_overrides.csv")
 ROUTE_SHORT_OVERRIDES_JSON = os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "")
 BOARD_SETTINGS_PATH = os.getenv("BOARD_SETTINGS_PATH", "boards.json")
-DEFAULT_BOARD_IDS = [
-    bid.strip() for bid in (os.getenv("DEFAULT_BOARD_IDS") or "AB12C").split(",")
-    if bid.strip()
-]
 
 # board_id -> settings dict
 BOARD_SETTINGS: dict[str, dict] = {}
-
-# Supported LED animation names (mirrors ESP demo options)
-ANIMATION_CHOICES: list[str] = [
-    "pulse",
-    "rainbow",
-    "theater",
-    "sparkle",
-    "solid",
-]
 
 # Caching/CORS/logging
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
@@ -93,59 +80,31 @@ def vlog(*a):
         print("[metroboard]", *a)
 
 def _load_board_settings() -> dict[str, dict]:
-    """Load persisted board settings, normalising keys/IDs to uppercase."""
-
-    def _seed_defaults() -> dict[str, dict]:
-        seeded = {}
-        for _id in DEFAULT_BOARD_IDS:
-            norm = normalize_board_id(_id)
-            if not norm:
-                continue
-            seeded[norm] = _default_board_settings(norm)
-        if seeded:
-            try:
-                with open(BOARD_SETTINGS_PATH, "w", encoding="utf-8") as f:
-                    json.dump(seeded, f, indent=2, sort_keys=True)
-            except Exception as e:
-                vlog("WARN: failed to create boards.json:", e)
-        return seeded
-
     if not os.path.exists(BOARD_SETTINGS_PATH):
-        return _seed_defaults()
-
-    dirty = False
-    out: dict[str, dict] = {}
+        return {}
     try:
         with open(BOARD_SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if not isinstance(data, dict):
-            return _seed_defaults()
-
-        for raw_key, cfg in data.items():
-            if not isinstance(cfg, dict):
-                continue
-            cid = normalize_board_id(raw_key or cfg.get("board_id", ""))
-            if not cid:
-                continue
-            original = dict(cfg)
-            cfg = dict(cfg)
-            cfg["board_id"] = cid
-            _normalize_board_settings(cfg)
-            out[cid] = cfg
-            if cid != raw_key or cfg != original:
-                dirty = True
+        if isinstance(data, dict):
+            # Backward-compat: older boards.json stored brightness as a dict.
+            for bid, cfg in data.items():
+                if not isinstance(cfg, dict):
+                    continue
+                b = cfg.get("brightness")
+                if isinstance(b, dict):
+                    # Prefer live brightness, fall back to animation.
+                    live = b.get("live")
+                    anim = b.get("animation")
+                    if isinstance(live, (int, float)):
+                        cfg["brightness"] = int(live)
+                    elif isinstance(anim, (int, float)):
+                        cfg["brightness"] = int(anim)
+                elif isinstance(b, (int, float)):
+                    cfg["brightness"] = int(b)
+            return data
     except Exception as e:
         vlog("WARN: failed to load boards.json:", e)
-        return _seed_defaults()
-
-    if dirty:
-        try:
-            with open(BOARD_SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump(out, f, indent=2, sort_keys=True)
-        except Exception as e:
-            vlog("WARN: failed to rewrite boards.json:", e)
-
-    return out
+    return {}
 
 def _save_board_settings() -> None:
     try:
@@ -157,7 +116,7 @@ def _save_board_settings() -> None:
 def _default_board_settings(board_id: str) -> dict:
     return {
         "board_id": board_id,
-        "brightness": {"live": 160, "animation": 160},
+        "brightness": 160,
         "mode": "live",  # "live" or "animation"
         "night_mode": {
             "enabled": False,
@@ -173,120 +132,17 @@ def _default_board_settings(board_id: str) -> dict:
         },
     }
 
-def normalize_board_id(board_id: str) -> str:
-    return (board_id or "").strip().upper()
-
-
 def _get_or_create_board(board_id: str) -> dict:
-    board_id = normalize_board_id(board_id)
+    board_id = (board_id or "").strip()
     if not board_id:
         raise ValueError("empty board_id")
     if board_id not in BOARD_SETTINGS:
         BOARD_SETTINGS[board_id] = _default_board_settings(board_id)
         _save_board_settings()
-    cfg = BOARD_SETTINGS[board_id]
-    _normalize_board_settings(cfg)
-    cfg["board_id"] = board_id
-    return cfg
-
-
-def _normalize_board_settings(cfg: dict) -> None:
-    """Ensure persisted boards always have expected keys and shapes."""
-
-    def _norm_brightness(v: T.Any, fallback: int = 160) -> dict[str, int]:
-        if isinstance(v, dict):
-            live = int(v.get("live", v.get("default", fallback)))
-            anim = int(v.get("animation", live))
-        else:
-            try:
-                live = anim = int(v)
-            except Exception:
-                live = anim = fallback
-        return {
-            "live": max(0, min(255, live)),
-            "animation": max(0, min(255, anim)),
-        }
-
-    cfg.setdefault("board_id", "")
-    cfg["brightness"] = _norm_brightness(cfg.get("brightness", 160))
-    cfg.setdefault("mode", "live")
-    nm = cfg.get("night_mode") or {}
-    cfg["night_mode"] = {
-        "enabled": bool(nm.get("enabled")),
-        "start": nm.get("start", "23:00"),
-        "end": nm.get("end", "06:00"),
-        "action": nm.get("action", "off"),
-        "dim_level": max(0, min(255, int(nm.get("dim_level", 20))))
-    }
-
-    an = cfg.get("animation") or {}
-    name = (an.get("name") or "pulse").lower()
-    if name not in ANIMATION_CHOICES:
-        name = ANIMATION_CHOICES[0]
-    color = [int(c) for c in (an.get("color") or [255, 80, 0])][:3]
-    while len(color) < 3:
-        color.append(0)
-    cfg["animation"] = {
-        "name": name,
-        "speed": max(1, int(an.get("speed", 120))),
-        "color": color,
-    }
-
-
-def _get_brightness_for_mode(cfg: dict, mode: str) -> int:
-    b = cfg.get("brightness", {})
-    if isinstance(b, dict):
-        val = b.get(mode, b.get("live", 160))
-    else:
-        try:
-            val = int(b)
-        except Exception:
-            val = 160
-    return max(0, min(255, int(val)))
-
-
-def _parse_minutes(hhmm: str) -> T.Optional[int]:
-    try:
-        hh, mm = hhmm.split(":", 1)
-        return (int(hh) % 24) * 60 + (int(mm) % 60)
-    except Exception:
-        return None
-
-
-def _night_mode_active(cfg: dict, *, now_minutes: T.Optional[int] = None) -> bool:
-    nm = cfg.get("night_mode") or {}
-    if not nm.get("enabled"):
-        return False
-    start = _parse_minutes(nm.get("start", ""))
-    end = _parse_minutes(nm.get("end", ""))
-    if start is None or end is None:
-        return False
-    if now_minutes is None:
-        t = time.localtime()
-        now_minutes = t.tm_hour * 60 + t.tm_min
-    if start <= end:
-        return start <= now_minutes < end
-    return now_minutes >= start or now_minutes < end
-
-
-def _effective_brightness(cfg: dict, *, now_minutes: T.Optional[int] = None) -> tuple[int, bool, str]:
-    mode = (cfg.get("mode") or "live").lower()
-    base_b = _get_brightness_for_mode(cfg, mode)
-    nm = cfg.get("night_mode") or {}
-    nm_active = _night_mode_active(cfg, now_minutes=now_minutes)
-
-    if nm_active:
-        action = (nm.get("action") or "off").lower()
-        if action == "off":
-            return 0, True, "off"
-        dim_level = max(0, min(255, int(nm.get("dim_level", base_b))))
-        return min(base_b, dim_level), True, mode
-
-    return base_b, False, mode
+    return BOARD_SETTINGS[board_id]
 
 EXCLUDE_SUB = ("wharf", "light rail", "b-line", "interchange", "motorway", " m2")
 SHORT_RE = re.compile(r"\b([TM]\d{1,2})\b", re.I)
-LINE_CODE_RE = re.compile(r"^(T\d{1,2}|M\d|CCN|SCO|BMT|HUN)$", re.I)
 
 # ---------------- Small helpers ----------------
 def _session() -> requests.Session:
@@ -382,12 +238,6 @@ def derive_route_short(route_short_name: str | None, route_long_name: str | None
             return m.group(1).upper()
     return ""
 
-
-def is_core_line(rs: str) -> bool:
-    """Return True for supported passenger rail/metro line short codes."""
-
-    return bool(LINE_CODE_RE.match((rs or "").strip()))
-
 def load_route_overrides(path: str, env_json: str) -> dict[str, str]:
     out: dict[str, str] = {}
     # CSV file
@@ -430,21 +280,6 @@ def load_route_shortnames(routes_path: str = "routes.txt") -> dict[str, str]:
                 out[rid] = rs
     vlog(f"route_short: {len(out)} (ov={len(ov)})")
     return out
-
-
-def load_trip_to_route(trips_path: str = "trips.txt") -> dict[str, str]:
-    mapping: dict[str, str] = {}
-    try:
-        with open(trips_path, encoding="utf-8-sig") as f:
-            for r in csv.DictReader(f):
-                tid = (r.get("trip_id") or "").strip()
-                rid = (r.get("route_id") or "").strip()
-                if tid and rid:
-                    mapping[tid] = rid
-    except Exception as e:
-        vlog(f"WARN: failed to load trips map: {e}")
-    vlog(f"trip→route map: {len(mapping)}")
-    return mapping
 
 # ---------------- Static GTFS filters: allowed parents & pairs ----------------
 def require_allowed_parents(
@@ -515,8 +350,6 @@ def require_allowed_parents(
             if agencies_allowed and ag not in agencies_allowed:
                 continue
             if route_short_allow and rshort and rshort.upper() not in route_short_allow:
-                continue
-            if not is_core_line(rshort):
                 continue
             p = parent_of((r.get("stop_id") or "").strip())
             if p and is_num_parent(p):
@@ -623,8 +456,6 @@ def require_allowed_pairs(
                 if len(missing_short_seen) < 20:
                     missing_short_seen[rid] = missing_short_seen.get(rid, 0) + 1
                 continue
-            if not is_core_line(rshort):
-                continue
             if route_short_allow and rshort not in route_short_allow:
                 continue
             p = parent_of((r.get("stop_id") or "").strip())
@@ -635,29 +466,9 @@ def require_allowed_pairs(
         vlog(f"pairs strict: {len(pairs)}")
         return pairs
 
-    # deterministic fallback from curated station_line_pairs.csv (avoids line fan-out)
-    pairs_csv = os.getenv("STATION_LINE_PAIRS_PATH", "station_line_pairs.csv")
-    if os.path.exists(pairs_csv):
-        with open(pairs_csv, encoding="utf-8-sig") as f:
-            for row in csv.DictReader(f):
-                pid = (row.get("parent_stop_id") or "").strip()
-                rs = (row.get("route_short") or "").strip().upper()
-                if not (pid and rs):
-                    continue
-                if route_short_allow and rs not in route_short_allow:
-                    continue
-                if allowed_parents_for_fallback and pid not in allowed_parents_for_fallback:
-                    continue
-                if not is_core_line(rs):
-                    continue
-                pairs.add((pid, rs))
-        if pairs:
-            vlog(f"pairs from CSV: {len(pairs)}")
-            return pairs
-
     # permissive fallback
-    if os.getenv("MB_PERMISSIVE_PAIRS", "0") != "0":
-        known = {rs for rs in _known_tm(route_id_to_short) if is_core_line(rs)}
+    if os.getenv("MB_PERMISSIVE_PAIRS", "1") != "0":
+        known = _known_tm(route_id_to_short)
         if route_short_allow:
             known &= {x.upper() for x in route_short_allow}
         if not known:
@@ -748,16 +559,6 @@ def load_station_index(
 
     return idx
 
-
-def station_routes_lookup(station_index: dict[str, dict]) -> dict[str, set[str]]:
-    out: dict[str, set[str]] = {}
-    for meta in station_index.values():
-        base = (meta.get("base_name") or "").lower()
-        rs = (meta.get("route_short") or "").upper()
-        if base and rs:
-            out.setdefault(base, set()).add(rs)
-    return out
-
 # ---------------- Child→Parent map for VP.stop_id resolution ----------------
 def build_child_to_parent(stops="stops.txt") -> dict[str, str]:
     out: dict[str, str] = {}
@@ -814,107 +615,92 @@ def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
     vlog("feed merged vehicles", total)
     return merged, 0.0
 
+def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> tuple[
+    list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]],
+    dict[str, int],
+    dict[str, str],
+]:
+    """Return (trains, counts, route_debug)."""
+    trains = []
+    by_route = {}
+    missing_routes = {}
+    route_debug = {}
 
-def _route_from_label(label: str, station_routes_by_name: dict[str, set[str]]) -> T.Optional[str]:
-    label = (label or "").strip()
-    if not label:
-        return None
+    ROUTE_PREFIX_MAP = {
+        # Core prefixes
+        "BMT": ["T1"], "NTH": ["T1", "T9"], "WST": ["T1"], "APS": ["T1", "T9"],
+        "CTY": ["T2"], "T3": ["T3"], "IWL": ["T4"], "ESI": ["T4"],
+        "CMB": ["T5"], "RTTA": ["T6"], "T6": ["T6"],  # include T6_1a / T6_2a variants
+        "OLY": ["T7"], "T7": ["T7"],
+        "NSN": ["T9"], "SHL": ["T9", "T1"],
+    
+        # Regional lines
+        "SCO": ["SCO"], "CCN": ["CCN"],
+    
+        # Metro
+        "SMNW": ["M1"], "M1": ["M1"],
+    
+        # Extended/new identifiers from static GTFS
+        "SOUTHCOAST": ["SCO"], "CENTRALCOAST": ["CCN"],
+        "MOUNTAINS": ["T1"], "CUMBERLAND": ["T5"], "WOLLONGONG": ["SCO"],
+        "LIVERPOOL": ["T3"], "SEFTON": ["T3", "T6"],
+        "BLACKTOWN": ["T1"], "LIDCOMBE": ["T1", "T7"],
+    
+        # Defensive catch for stray codes
+        "": ["T1"],  # blank/unknown — default to T1 to avoid None
+    }
 
-    label = re.sub(r"^\d{1,2}:\d{2}\s+", "", label)
-    parts = re.split(r"\s+to\s+", label, maxsplit=1, flags=re.IGNORECASE)
-    if len(parts) != 2:
-        return None
-
-    origin_raw, dest_raw = (clean_name(p) for p in parts)
-    origin = origin_raw.lower()
-    dest = dest_raw.lower()
-
-    routes_o = station_routes_by_name.get(origin, set())
-    routes_d = station_routes_by_name.get(dest, set())
-
-    if routes_o and routes_d:
-        common = routes_o & routes_d
-        if common:
-            return sorted(common)[0]
-
-    for routes in (routes_o, routes_d):
-        if len(routes) == 1:
-            return next(iter(routes))
-
-    return None
-
-
-def infer_vehicle_route(
-    v: rt.VehiclePosition,
-    route_id_to_short: dict[str, str],
-    station_routes_by_name: dict[str, set[str]],
-    trip_to_route: dict[str, str],
-) -> T.Optional[str]:
-    rid = v.trip.route_id if v.HasField("trip") else ""
-    tripid = v.trip.trip_id if v.HasField("trip") else ""
-    rid = rid or trip_to_route.get(tripid, "")
-    label = getattr(v.vehicle, "label", "") if v.HasField("vehicle") else ""
-
-    rs = _route_from_label(label, station_routes_by_name)
-    if not rs:
-        rs = (route_id_to_short.get(rid, "") or "").upper()
-
-    if not rs:
-        for src in (rid, tripid):
-            if not src:
-                continue
-            m = re.search(r"\b([TM]\d{1,2})\b", src, re.I)
-            if m:
-                rs = m.group(1).upper()
-                break
-
-    return rs or None
-
-
-def collect_trains(
-    feed: rt.FeedMessage,
-    route_id_to_short: dict[str, str],
-    station_routes_by_name: dict[str, set[str]],
-    trip_to_route: dict[str, str],
-) -> list[dict[str, T.Any]]:
-    trains: list[dict[str, T.Any]] = []
-
-def collect_trains(
-    feed: rt.FeedMessage,
-    route_id_to_short: dict[str, str],
-    station_routes_by_name: dict[str, set[str]],
-    trip_to_route: dict[str, str],
-) -> list[dict[str, T.Any]]:
-    trains: list[dict[str, T.Any]] = []
 
     for e in feed.entity:
         if not e.HasField("vehicle"):
             continue
         v = e.vehicle
-        route = infer_vehicle_route(v, route_id_to_short, station_routes_by_name, trip_to_route)
+        rid = v.trip.route_id if v.HasField("trip") else ""
+        tripid = v.trip.trip_id if v.HasField("trip") else ""
 
-        if route and ROUTE_SHORT_ALLOW and route not in ROUTE_SHORT_ALLOW:
+        rs = (route_id_to_short.get(rid, "") or "").upper()
+
+        # Fallback: extract T/M code
+        if not rs:
+            for src in (rid, tripid):
+                if not src:
+                    continue
+                m = re.search(r"\b([TM]\d{1,2})\b", src, re.I)
+                if m:
+                    rs = m.group(1).upper()
+                    break
+
+        # Fallback: prefix mapping
+        if not rs and rid:
+            prefix = rid.split("_", 1)[0].split(".")[0].upper()
+            if prefix in ROUTE_PREFIX_MAP:
+                opts = ROUTE_PREFIX_MAP[prefix]
+                rs = opts[abs(hash(tripid or rid)) % len(opts)]
+            else:
+                # check substrings for looser match
+                for key, opts in ROUTE_PREFIX_MAP.items():
+                    if key in prefix:
+                        rs = opts[abs(hash(tripid or rid)) % len(opts)]
+                        break
+
+        rs = rs or None
+        route_debug[rid] = rs
+        if not rs and rid:
+            missing_routes[rid] = missing_routes.get(rid, 0) + 1
+
+        if rs and ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW:
             continue
 
         sid = getattr(v, "stop_id", "")
-        parent_stop = None
-        if sid:
-            parent_stop = CHILD_TO_PARENT.get(sid) or (sid if is_num_parent(sid) else None)
+        status = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
+        lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
+        lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
+        trains.append((lat, lon, rs, sid, status))
+        if rs:
+            by_route[rs] = by_route.get(rs, 0) + 1
 
-        trains.append(
-            {
-                "lat": getattr(v.position, "latitude", None) if v.HasField("position") else None,
-                "lon": getattr(v.position, "longitude", None) if v.HasField("position") else None,
-                "route": route,
-                "stop_id": sid,
-                "parent_stop": parent_stop,
-                "status": int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO)),
-                "label": getattr(v.vehicle, "label", "") if v.HasField("vehicle") else "",
-            }
-        )
-
-    vlog(f"collect_trains kept={len(trains)}")
-    return trains
+    vlog(f"collect_trains kept={len(trains)}, routes={len(by_route)}, null_routes={len([t for t in trains if t[2] is None])}")
+    return trains, by_route, route_debug
 
 
 # ---------------- FastAPI app ----------------
@@ -932,20 +718,14 @@ if CORS_ALLOW_ORIGIN:
 ROUTE_ID_TO_SHORT: dict[str, str] = {}
 STATION_INDEX: dict[str, dict] = {}
 CHILD_TO_PARENT: dict[str, str] = {}
-STATION_ROUTES_BY_NAME: dict[str, set[str]] = {}
-TRIP_TO_ROUTE: dict[str, str] = {}
-STATIONS_BY_STOP_ROUTE: dict[tuple[str, str], list[str]] = {}
 
 @app.on_event("startup")
 def _startup():
-    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS, STATION_ROUTES_BY_NAME, TRIP_TO_ROUTE, STATIONS_BY_STOP_ROUTE
+    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS
 
     BOARD_SETTINGS = _load_board_settings()
-    for cfg in BOARD_SETTINGS.values():
-        _normalize_board_settings(cfg)
 
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
-    TRIP_TO_ROUTE = load_trip_to_route("trips.txt")
 
     allowed_parents = require_allowed_parents(
         stops="stops.txt",
@@ -982,13 +762,6 @@ def _startup():
         allowed_pairs=allowed_pairs,
     )
 
-    STATION_ROUTES_BY_NAME = station_routes_lookup(STATION_INDEX)
-
-    STATIONS_BY_STOP_ROUTE = {}
-    for name, meta in STATION_INDEX.items():
-        key = (meta["stop_id"], (meta.get("route_short") or "").upper())
-        STATIONS_BY_STOP_ROUTE.setdefault(key, []).append(name)
-
     CHILD_TO_PARENT = build_child_to_parent("stops.txt")
 
     if not STATION_INDEX:
@@ -1022,7 +795,7 @@ def login_get():
 
 @app.post("/login")
 async def login_post(board_id: str = Form(...)):
-    board_id = normalize_board_id(board_id)
+    board_id = board_id.strip()
     if not board_id:
         return RedirectResponse("/login", status_code=303)
     return RedirectResponse(f"/board/{board_id}", status_code=303)
@@ -1030,19 +803,12 @@ async def login_post(board_id: str = Form(...)):
 
 @app.get("/board/{board_id}", response_class=HTMLResponse)
 def board_settings_page(board_id: str):
-    board_id_norm = normalize_board_id(board_id)
-    if not board_id_norm:
-        return HTMLResponse("Invalid board_id", status_code=400)
-    if board_id_norm != board_id:
-        return RedirectResponse(f"/board/{board_id_norm}", status_code=303)
-
     try:
-        cfg = _get_or_create_board(board_id_norm)
+        cfg = _get_or_create_board(board_id)
     except ValueError:
         return HTMLResponse("Invalid board_id", status_code=400)
 
-    b_live = _get_brightness_for_mode(cfg, "live")
-    b_anim = _get_brightness_for_mode(cfg, "animation")
+    b = cfg.get("brightness", 160)
     mode = cfg.get("mode", "live")
     nm = cfg.get("night_mode", {}) or {}
     an = cfg.get("animation", {}) or {}
@@ -1058,31 +824,20 @@ def board_settings_page(board_id: str):
     an_color = an.get("color", [255, 80, 0])
     an_color_hex = "#%02X%02X%02X" % (an_color[0], an_color[1], an_color[2])
 
-    anim_options = "".join(
-        f"<option value=\"{opt}\" {'selected' if an_name==opt else ''}>{opt.title()}</option>"
-        for opt in ANIMATION_CHOICES
-    )
-
     return f"""
-      <html>
-        <head>
-          <title>Metroboard {board_id_norm} Settings</title>
+    <html>
+      <head>
+        <title>Metroboard {board_id} Settings</title>
       </head>
       <body>
-        <h2>Metroboard {board_id_norm}</h2>
-        <form method="post" action="/board/{board_id_norm}">
+        <h2>Metroboard {board_id}</h2>
+        <form method="post" action="/board/{board_id}">
           <h3>Display Mode</h3>
           <label><input type="radio" name="mode" value="live" {'checked' if mode=='live' else ''}> Live trains</label><br>
           <label><input type="radio" name="mode" value="animation" {'checked' if mode=='animation' else ''}> Animation</label>
 
           <h3>Brightness</h3>
-          <label>Live mode brightness:<br>
-            <input type="range" min="0" max="255" name="brightness_live" value="{b_live}" />
-          </label><br>
-          <label>Animation brightness:<br>
-            <input type="range" min="0" max="255" name="brightness_animation" value="{b_anim}" />
-          </label><br>
-          <small>Both modes respect the night mode settings below.</small>
+          <input type="range" min="0" max="255" name="brightness" value="{b}" />
 
           <h3>Night Mode</h3>
           <label>
@@ -1102,10 +857,13 @@ def board_settings_page(board_id: str):
 
           <h3>Animation</h3>
           <label>Name:
-            <select name="an_name">{anim_options}</select>
+            <select name="an_name">
+              <option value="pulse" {"selected" if an_name=="pulse" else ""}>Pulse</option>
+              <option value="rainbow" {"selected" if an_name=="rainbow" else ""}>Rainbow</option>
+            </select>
           </label><br>
           <label>Speed:
-            <input type="number" name="an_speed" min="1" max="255" value="{an_speed}">
+            <input type="number" name="an_speed" value="{an_speed}">
           </label><br>
           <label>Colour:
             <input type="color" name="an_color" value="{an_color_hex}">
@@ -1122,11 +880,9 @@ def board_settings_page(board_id: str):
 
 @app.post("/board/{board_id}")
 async def board_settings_save(
-    request: Request,
     board_id: str,
     mode: str = Form("live"),
-    brightness_live: int = Form(160),
-    brightness_animation: int = Form(160),
+    brightness: int = Form(160),
     nm_enabled: T.Optional[str] = Form(None),
     nm_start: str = Form("23:00"),
     nm_end: str = Form("06:00"),
@@ -1136,15 +892,10 @@ async def board_settings_save(
     an_speed: int = Form(120),
     an_color: str = Form("#FF5000"),
 ):
-    board_id_norm = normalize_board_id(board_id)
-    if not board_id_norm:
-        return JSONResponse({"error": "invalid board_id"}, status_code=400)
-
-    cfg = _get_or_create_board(board_id_norm)
+    cfg = _get_or_create_board(board_id)
 
     mode = mode if mode in ("live", "animation") else "live"
-    brightness_live = max(0, min(255, brightness_live))
-    brightness_animation = max(0, min(255, brightness_animation))
+    brightness = max(0, min(255, brightness))
     nm_dim = max(0, min(255, nm_dim))
 
     def _parse_hex_color(s: str) -> list[int]:
@@ -1154,7 +905,7 @@ async def board_settings_save(
         return [int(s[i:i+2], 16) for i in (0, 2, 4)]
 
     cfg["mode"] = mode
-    cfg["brightness"] = {"live": brightness_live, "animation": brightness_animation}
+    cfg["brightness"] = brightness
     cfg["night_mode"] = {
         "enabled": bool(nm_enabled),
         "start": nm_start,
@@ -1163,53 +914,35 @@ async def board_settings_save(
         "dim_level": nm_dim,
     }
     cfg["animation"] = {
-        "name": an_name if an_name in ANIMATION_CHOICES else ANIMATION_CHOICES[0],
-        "speed": max(1, an_speed),
+        "name": an_name,
+        "speed": an_speed,
         "color": _parse_hex_color(an_color),
     }
 
-    _normalize_board_settings(cfg)
-
-    BOARD_SETTINGS[board_id_norm] = cfg
+    BOARD_SETTINGS[board_id] = cfg
     _save_board_settings()
 
-    eff_b, night_active, eff_mode = _effective_brightness(cfg)
-    resp = dict(cfg)
-    resp["effective_brightness"] = eff_b
-    resp["effective_mode"] = eff_mode
-    resp["night_mode_active"] = night_active
-    resp["animations_available"] = ANIMATION_CHOICES
-    resp["brightness_live"] = cfg["brightness"].get("live", brightness_live)
-    resp["brightness_animation"] = cfg["brightness"].get("animation", brightness_animation)
-    resp["brightness_default"] = _get_brightness_for_mode(cfg, cfg.get("mode", "live"))
-
-    accept = request.headers.get("accept", "").lower()
-    if "application/json" in accept:
-        return JSONResponse(resp)
-
-    return RedirectResponse(f"/board/{board_id_norm}", status_code=303)
+    return RedirectResponse(f"/board/{board_id}", status_code=303)
 
 @app.get("/debug")
 def debug():
     feed, _ = fetch_vp_cached()
-    trains = collect_trains(feed, ROUTE_ID_TO_SHORT, STATION_ROUTES_BY_NAME, TRIP_TO_ROUTE)
-    by_route: dict[str, int] = {}
-    for t in trains:
-        if t["route"]:
-            by_route[t["route"]] = by_route.get(t["route"], 0) + 1
+    trains, by_route, route_debug = collect_trains(feed, ROUTE_ID_TO_SHORT)
     return {
         "stations_count": len(STATION_INDEX),
         "bbox": list(SYD_BBOX) if SYD_BBOX else None,
         "feeds": URLS_VP,
         "total_trains": len(trains),
         "routes_found": sorted(by_route.keys()),
+        "routes_missing": [r for r, v in route_debug.items() if v is None],
+        "routes_resolved": route_debug,
     }
 
 @app.get("/trains")
 def trains():
     """Debug endpoint to see raw train data"""
     feed, age = fetch_vp_cached()
-    trains = collect_trains(feed, ROUTE_ID_TO_SHORT, STATION_ROUTES_BY_NAME, TRIP_TO_ROUTE)
+    trains, _, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
 
     # rt.VehiclePosition.VehicleStopStatus:
     # INCOMING_AT=0, STOPPED_AT=1, IN_TRANSIT_TO=2
@@ -1219,7 +952,7 @@ def trains():
     out = []
     # Also collect raw route_ids from feed for debugging
     raw_routes = set()
-
+    
     for e in feed.entity[:50]:  # Sample first 50
         if not e.HasField("vehicle"):
             continue
@@ -1227,43 +960,36 @@ def trains():
         rid = v.trip.route_id if v.HasField("trip") else ""
         if rid:
             raw_routes.add(rid)
-
-    for train in trains[:50]:
-        sid = train.get("stop_id")
+    
+    for lat, lon, rs, sid, st in trains[:50]:
         out.append({
-            "route": train.get("route"),
-            "lat": train.get("lat"),
-            "lon": train.get("lon"),
+            "route": rs,
+            "lat": lat,
+            "lon": lon,
             "stop_id": sid,
-            "status": status_name(train.get("status", 2)),
+            "status": status_name(st),
             "parent_station": CHILD_TO_PARENT.get(sid, sid) if sid else None,
         })
 
     return {
-        "feed_age_seconds": age,
+        "feed_age_seconds": age, 
         "total_trains": len(trains),
-        "trains_with_routes": len([t for t in trains if t.get("route") is not None]),
-        "trains_without_routes": len([t for t in trains if t.get("route") is None]),
+        "trains_with_routes": len([t for t in trains if t[2] is not None]),
+        "trains_without_routes": len([t for t in trains if t[2] is None]),
         "sample_raw_route_ids": sorted(list(raw_routes)[:20]),
         "sample_trains": out
     }
 
 @app.get("/board_settings")
 def board_settings_api(board_id: str = Query(...)):
-    board_id = normalize_board_id(board_id)
+    board_id = board_id.strip()
     if not board_id:
         return JSONResponse({"error": "missing board_id"}, status_code=400)
     try:
         cfg = _get_or_create_board(board_id)
     except ValueError:
         return JSONResponse({"error": "invalid board_id"}, status_code=400)
-    eff_b, night_active, eff_mode = _effective_brightness(cfg)
-    resp = dict(cfg)
-    resp["effective_brightness"] = eff_b
-    resp["effective_mode"] = eff_mode
-    resp["night_mode_active"] = night_active
-    resp["animations_available"] = ANIMATION_CHOICES
-    return JSONResponse(resp)
+    return JSONResponse(cfg)
 
 @app.get("/stations")
 def stations():
@@ -1280,13 +1006,8 @@ def states(
     If board_id is provided, we require that board to exist in boards.json.
     """
     if board_id is not None:
-        board_id = normalize_board_id(board_id)
-        if not board_id:
-            return JSONResponse({"error": "unknown board_id"}, status_code=403)
-        # Ensure the board exists (creates with defaults if missing)
-        try:
-            _get_or_create_board(board_id)
-        except ValueError:
+        board_id = board_id.strip()
+        if not board_id or board_id not in BOARD_SETTINGS:
             return JSONResponse({"error": "unknown board_id"}, status_code=403)
         # You *could* read mode here and e.g. short-circuit if mode=="animation".
 
@@ -1299,45 +1020,65 @@ def states(
             return JSONResponse({})
 
     feed, _ = fetch_vp_cached()
-    trains = collect_trains(feed, ROUTE_ID_TO_SHORT, STATION_ROUTES_BY_NAME, TRIP_TO_ROUTE)
+    trains, _by_route, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
 
     if MB_VERBOSE:
         vlog(f"processing trains={len(trains)} stations={len(subset)}")
 
-    out: dict[str, int] = {k: 0 for k in subset.keys()}
+    if not trains:
+        return JSONResponse({k: 0 for k in subset.keys()})
 
-    stop_route_subset: dict[tuple[str, str], list[str]] = {}
-    if subset is STATION_INDEX:
-        for key, names in STATIONS_BY_STOP_ROUTE.items():
-            stop_route_subset[key] = list(names)
-    else:
-        for key, names in STATIONS_BY_STOP_ROUTE.items():
-            filtered = [n for n in names if n in subset]
-            if filtered:
-                stop_route_subset[key] = filtered
+    VP_INCOMING = rt.VehiclePosition.INCOMING_AT
+    VP_STOPPED  = rt.VehiclePosition.STOPPED_AT
 
-    for train in trains:
-        route = train.get("route")
-        parent = train.get("parent_stop")
-        if not route or not parent:
-            continue
-        key = (parent, route)
-        if key not in stop_route_subset:
-            continue
+    out: dict[str, int] = {}
+    matches = 0
+    dist_fb = 0
 
-        for station_name in stop_route_subset[key]:
-            if out.get(station_name) == 3:
+    for name, meta in subset.items():
+        pid = meta["stop_id"]
+        slat, slon = meta["lat"], meta["lon"]
+        # THIS IS THE KEY FIX: Each station has its specific route_short
+        station_route = (meta.get("route_short") or "").upper()
+
+        best = 0
+        best_d = None
+
+        # CRITICAL: Only look at trains that match THIS station's route
+        for (tlat, tlon, train_route, child_sid, st) in trains:
+            # SKIP trains that don't match this station's route
+            # Allow None train_route to fall through to distance-only matching
+            if train_route is not None and train_route != station_route:
                 continue
 
-            meta = subset[station_name]
-            slat, slon = meta["lat"], meta["lon"]
-            tlat, tlon = train.get("lat"), train.get("lon")
-            near = False
-            if tlat is not None and tlon is not None:
-                near = hav_m(slat, slon, tlat, tlon) <= 100
+            # VP match first (unless forced distance)
+            if not MB_FORCE_DISTANCE and child_sid:
+                parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
+                if parent == pid:
+                    if st == VP_STOPPED:
+                        best = 3
+                        matches += 1
+                        break
+                    elif st == VP_INCOMING:
+                        best = max(best, 2)
+                        matches += 1
 
-            if near or train.get("status") == rt.VehiclePosition.STOPPED_AT or train.get("stop_id"):
-                out[station_name] = 3
+            # Distance fallback (only for trains on the correct route or unknown route)
+            if best < 3 and tlat is not None and tlon is not None:
+                d = hav_m(slat, slon, tlat, tlon)
+                if best_d is None or d < best_d:
+                    best_d = d
+
+        if best == 0 and best_d is not None:
+            best = status_from_dist(best_d)
+            if best > 0:
+                dist_fb += 1
+
+        out[name] = best
+
+    if MB_VERBOSE:
+        act = sum(1 for v in out.values() if v > 0)
+        vlog(f"result active={act}/{len(subset)} matches={matches} distance_fb={dist_fb}")
 
     return JSONResponse(out)
 
