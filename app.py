@@ -929,10 +929,7 @@ async def board_settings_save(
 
 @app.get("/debug")
 def debug():
-    try:
-        feed, _ = fetch_vp_cached()
-    except RuntimeError as e:
-        return JSONResponse({"error": str(e)}, status_code=503)
+    feed, _ = fetch_vp_cached()
     trains, by_route, route_debug = collect_trains(feed, ROUTE_ID_TO_SHORT)
     return {
         "stations_count": len(STATION_INDEX),
@@ -947,10 +944,7 @@ def debug():
 @app.get("/trains")
 def trains():
     """Debug endpoint to see raw train data"""
-    try:
-        feed, age = fetch_vp_cached()
-    except RuntimeError as e:
-        return JSONResponse({"error": str(e)}, status_code=503)
+    feed, age = fetch_vp_cached()
     trains, _, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
 
     # rt.VehiclePosition.VehicleStopStatus:
@@ -1028,10 +1022,7 @@ def states(
         if not subset:
             return JSONResponse({})
 
-    try:
-        feed, _ = fetch_vp_cached()
-    except RuntimeError as e:
-        return JSONResponse({"error": str(e)}, status_code=503)
+    feed, _ = fetch_vp_cached()
     trains, _by_route, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
 
     if MB_VERBOSE:
