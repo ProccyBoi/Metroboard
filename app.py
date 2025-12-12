@@ -93,8 +93,15 @@ def vlog(*a):
         print("[metroboard]", *a)
 
 def _load_board_settings() -> dict[str, dict]:
-    if not os.path.exists(BOARD_SETTINGS_PATH):
-        seeded = {_id: _default_board_settings(_id) for _id in DEFAULT_BOARD_IDS}
+    """Load persisted board settings, normalising keys/IDs to uppercase."""
+
+    def _seed_defaults() -> dict[str, dict]:
+        seeded = {}
+        for _id in DEFAULT_BOARD_IDS:
+            norm = normalize_board_id(_id)
+            if not norm:
+                continue
+            seeded[norm] = _default_board_settings(norm)
         if seeded:
             try:
                 with open(BOARD_SETTINGS_PATH, "w", encoding="utf-8") as f:
@@ -102,14 +109,43 @@ def _load_board_settings() -> dict[str, dict]:
             except Exception as e:
                 vlog("WARN: failed to create boards.json:", e)
         return seeded
+
+    if not os.path.exists(BOARD_SETTINGS_PATH):
+        return _seed_defaults()
+
+    dirty = False
+    out: dict[str, dict] = {}
     try:
         with open(BOARD_SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
-        if isinstance(data, dict):
-            return data
+        if not isinstance(data, dict):
+            return _seed_defaults()
+
+        for raw_key, cfg in data.items():
+            if not isinstance(cfg, dict):
+                continue
+            cid = normalize_board_id(raw_key or cfg.get("board_id", ""))
+            if not cid:
+                continue
+            original = dict(cfg)
+            cfg = dict(cfg)
+            cfg["board_id"] = cid
+            _normalize_board_settings(cfg)
+            out[cid] = cfg
+            if cid != raw_key or cfg != original:
+                dirty = True
     except Exception as e:
         vlog("WARN: failed to load boards.json:", e)
-    return {}
+        return _seed_defaults()
+
+    if dirty:
+        try:
+            with open(BOARD_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2, sort_keys=True)
+        except Exception as e:
+            vlog("WARN: failed to rewrite boards.json:", e)
+
+    return out
 
 def _save_board_settings() -> None:
     try:
@@ -150,6 +186,7 @@ def _get_or_create_board(board_id: str) -> dict:
         _save_board_settings()
     cfg = BOARD_SETTINGS[board_id]
     _normalize_board_settings(cfg)
+    cfg["board_id"] = board_id
     return cfg
 
 
@@ -985,7 +1022,7 @@ def login_get():
 
 @app.post("/login")
 async def login_post(board_id: str = Form(...)):
-    board_id = board_id.strip()
+    board_id = normalize_board_id(board_id)
     if not board_id:
         return RedirectResponse("/login", status_code=303)
     return RedirectResponse(f"/board/{board_id}", status_code=303)
@@ -993,8 +1030,14 @@ async def login_post(board_id: str = Form(...)):
 
 @app.get("/board/{board_id}", response_class=HTMLResponse)
 def board_settings_page(board_id: str):
+    board_id_norm = normalize_board_id(board_id)
+    if not board_id_norm:
+        return HTMLResponse("Invalid board_id", status_code=400)
+    if board_id_norm != board_id:
+        return RedirectResponse(f"/board/{board_id_norm}", status_code=303)
+
     try:
-        cfg = _get_or_create_board(board_id)
+        cfg = _get_or_create_board(board_id_norm)
     except ValueError:
         return HTMLResponse("Invalid board_id", status_code=400)
 
@@ -1021,13 +1064,13 @@ def board_settings_page(board_id: str):
     )
 
     return f"""
-    <html>
-      <head>
-        <title>Metroboard {board_id} Settings</title>
+      <html>
+        <head>
+          <title>Metroboard {board_id_norm} Settings</title>
       </head>
       <body>
-        <h2>Metroboard {board_id}</h2>
-        <form method="post" action="/board/{board_id}">
+        <h2>Metroboard {board_id_norm}</h2>
+        <form method="post" action="/board/{board_id_norm}">
           <h3>Display Mode</h3>
           <label><input type="radio" name="mode" value="live" {'checked' if mode=='live' else ''}> Live trains</label><br>
           <label><input type="radio" name="mode" value="animation" {'checked' if mode=='animation' else ''}> Animation</label>
@@ -1092,7 +1135,11 @@ async def board_settings_save(
     an_speed: int = Form(120),
     an_color: str = Form("#FF5000"),
 ):
-    cfg = _get_or_create_board(board_id)
+    board_id_norm = normalize_board_id(board_id)
+    if not board_id_norm:
+        return JSONResponse({"error": "invalid board_id"}, status_code=400)
+
+    cfg = _get_or_create_board(board_id_norm)
 
     mode = mode if mode in ("live", "animation") else "live"
     brightness_live = max(0, min(255, brightness_live))
@@ -1122,10 +1169,10 @@ async def board_settings_save(
 
     _normalize_board_settings(cfg)
 
-    BOARD_SETTINGS[board_id] = cfg
+    BOARD_SETTINGS[board_id_norm] = cfg
     _save_board_settings()
 
-    return RedirectResponse(f"/board/{board_id}", status_code=303)
+    return RedirectResponse(f"/board/{board_id_norm}", status_code=303)
 
 @app.get("/debug")
 def debug():
