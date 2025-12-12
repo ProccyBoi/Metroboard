@@ -49,7 +49,7 @@ Install dependencies:
 pip install fastapi uvicorn requests protobuf
 ```
 
-Run the backend:
+Run the backend (set `TFNSW_API_TOKEN` if you want live train data):
 
 ```bash
 # macOS/Linux
@@ -64,6 +64,9 @@ uvicorn app:app --reload --port 8000
 ```
 
 Backend will start at **[http://localhost:8000](http://localhost:8000)**.
+If you skip `TFNSW_API_TOKEN`, board settings pages will still work but live
+train endpoints like `/states` and `/trains` will return an error until you
+provide the key.
 
 ---
 
@@ -105,7 +108,7 @@ Eastwood
 
 | Variable                 | Required | Default                   | Description                                        |
 | ------------------------ | :------: | ------------------------- | -------------------------------------------------- |
-| `TFNSW_API_TOKEN`        |     ✅    | —                         | TfNSW API key for GTFS‑RT.                         |
+| `TFNSW_API_TOKEN`        |   Live    | —                         | TfNSW API key for GTFS‑RT (required for train data). |
 | `STATION_WHITELIST_PATH` |          | `stations_whitelist.txt`  | Path to whitelist file.                            |
 | `FEED_CACHE_SEC`         |          | `3`                       | Cache lifetime for VehiclePositions (seconds).     |
 | `CORS_ALLOW_ORIGIN`      |          | —                         | Comma‑sep. list (e.g. `*` or `https://your.site`). |

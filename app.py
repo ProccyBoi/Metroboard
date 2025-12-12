@@ -24,7 +24,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # ---------------- Config ----------------
-API_TOKEN = os.environ["TFNSW_API_TOKEN"]
+API_TOKEN = os.getenv("TFNSW_API_TOKEN")
 
 # Allow override via FEEDS env (comma-separated); default to both feeds
 _FEEDS_ENV = os.getenv("FEEDS", "").strip()
@@ -583,6 +583,9 @@ def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
     now = time.time()
     if _FEED_CACHE is not None and (now - _FEED_TS) < FEED_CACHE_SEC:
         return _FEED_CACHE, (now - _FEED_TS)
+
+    if not API_TOKEN:
+        raise RuntimeError("TFNSW_API_TOKEN is not configured; live feeds unavailable")
 
     hdr = {
         "Authorization": f"apikey {API_TOKEN}",
