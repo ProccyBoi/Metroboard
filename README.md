@@ -1,180 +1,52 @@
-# Metroboard
+# Metroboard (current behaviour)
 
-Live LED board for the **Sydney Trains** network 🚇💡
-
-Metroboard pulls real‑time vehicle positions from Transport for NSW (TfNSW) and reduces them to simple per‑station states (off / near / at station). Those states drive LEDs on a physical display or a web preview.
-
----
-
-## How it works
-
-* **Backend (FastAPI)**
-
-  * Connects to the TfNSW **GTFS‑Realtime VehiclePositions** feed.
-  * Restricts stations to *exactly* the Sydney Trains map via a **whitelist file** (`stations_whitelist.txt`).
-  * Computes per‑station state from nearest train distance:
-
-    * `0` = off (no train nearby)
-    * `1` = near (≤ 500 m; slow blink)
-    * `3` = at station (≤ 120 m; solid)
-    * `2` = reserved for future “fast blink”.
-  * Exposes REST endpoints for the web UI / hardware.
-
-* **Frontend (optional)**
-
-  * Simple React/HTML client that polls `/states` and renders LED‑style indicators.
-
-* **Hardware**
-
-  * ESP32 (or similar) driving addressable LEDs. One LED per station, mapped by name.
-
----
+Metroboard is a FastAPI service that turns the TfNSW GTFS Realtime vehicle positions into simple per-station status lights for Sydney Trains and Metro. It filters the static GTFS feed to rail/metro routes only, builds station+line keys (e.g., `Epping9`, `EppingM`), and exposes JSON endpoints plus a minimal HTML board-settings page. ​:codex-file-citation[codex-file-citation]{line_range_start=1 line_range_end=143 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L1-L143"}​​:codex-file-citation[codex-file-citation]{line_range_start=709 line_range_end=1086 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L709-L1086"}​
 
 ## Requirements
-
-* Python **3.10+**
-* A **TfNSW API key** (GTFS‑Realtime access)
-* Static GTFS files alongside the app:
-
-  * `routes.txt`, `stops.txt` (always required)
-  * `trips.txt`, `stop_times.txt` (only needed if you want to *generate* the whitelist automatically)
-
----
-
-## Setup
-
-Install dependencies:
-
-```bash
-pip install fastapi uvicorn requests protobuf
-```
-
-Run the backend (set `TFNSW_API_TOKEN` if you want live train data):
-
-```bash
-# macOS/Linux
-export TFNSW_API_TOKEN=your_api_key_here
-uvicorn app:app --reload --port 8000
-```
-
-```powershell
-# Windows (PowerShell)
-$env:TFNSW_API_TOKEN="your_api_key_here"
-uvicorn app:app --reload --port 8000
-```
-
-Backend will start at **[http://localhost:8000](http://localhost:8000)**.
-If you skip `TFNSW_API_TOKEN`, board settings pages will still work but live
-train endpoints like `/states` and `/trains` will return an error until you
-provide the key.
-
----
-
-## Station whitelist
-
-To match the **official Sydney Trains network map**, the backend reads a whitelist file and *only* exposes those stations.
-
-You have two options:
-
-### A) Generate from GTFS (recommended)
-
-If you have the full static GTFS (contains `trips.txt` and `stop_times.txt`):
-
-```bash
-python build_station_whitelist.py stops.txt routes.txt trips.txt stop_times.txt stations_whitelist.txt
-```
-
-This writes one **parent station `stop_id` per line** to `stations_whitelist.txt` for all lines in `{T1..T9, CCN, SCO, BMT, SHL}`.
-
-### B) Create by hand (quick)
-
-Create a text file `stations_whitelist.txt` next to `app.py` with one entry per line. You can use station **names** (case‑insensitive; “ Station” suffix ignored) or parent **stop\_ids**:
-
-```
-Central
-Town Hall
-Wynyard
-North Sydney
-Epping
-Eastwood
-# …and so on
-```
-
-> **Note:** The backend accepts either names or numeric parent `stop_id`s.
-
----
+* Python 3.10+
+* Dependencies: `fastapi`, `uvicorn`, `requests`, `urllib3`, `gtfs-realtime-bindings`, `protobuf`, `python-dotenv`, `python-multipart`. Install with `pip install -r requirements.txt`. ​:codex-file-citation[codex-file-citation]{line_range_start=1 line_range_end=8 path=requirements.txt git_url="https://github.com/ProccyBoi/Metroboard/blob/main/requirements.txt#L1-L8"}​
+* Static GTFS files alongside `app.py`: `stops.txt`, `routes.txt`, `trips.txt`, `stop_times.txt`, `agency.txt`. A station whitelist (`stations_whitelist.txt`) and optional overrides (`route_overrides.csv`) can sit next to the app. ​:codex-file-citation[codex-file-citation]{line_range_start=1 line_range_end=143 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L1-L143"}​​:codex-file-citation[codex-file-citation]{line_range_start=725 line_range_end=772 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L725-L772"}​
 
 ## Configuration (env vars)
+* `TFNSW_API_TOKEN` (required for live data)
+* `FEEDS` (comma-separated custom GTFS-RT URLs; defaults to Sydney Trains + Metro) ​:codex-file-citation[codex-file-citation]{line_range_start=29 line_range_end=38 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L29-L38"}​
+* `FEED_CACHE_SEC` (cache duration in seconds; default 3) ​:codex-file-citation[codex-file-citation]{line_range_start=56 line_range_end=60 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L56-L60"}​
+* `MB_D_SOLID`, `MB_D_NEAR`, `MB_D_FAR` (distance thresholds in meters; defaults 200/800/1500) ​:codex-file-citation[codex-file-citation]{line_range_start=39 line_range_end=43 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L39-L43"}​
+* `MB_AGENCIES` (agency allowlist), `MB_ROUTE_SHORT_ALLOW` (route-short allowlist) ​:codex-file-citation[codex-file-citation]{line_range_start=44 line_range_end=47 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L44-L47"}​
+* `ROUTE_SHORT_OVERRIDES_PATH`, `ROUTE_SHORT_OVERRIDES_JSON` (override static route short names) ​:codex-file-citation[codex-file-citation]{line_range_start=48 line_range_end=50 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L48-L50"}​
+* `BOARD_SETTINGS_PATH` (where board configs are stored; default `boards.json`) ​:codex-file-citation[codex-file-citation]{line_range_start=51 line_range_end=55 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L51-L55"}​
+* `CORS_ALLOW_ORIGIN` (comma-separated origins) ​:codex-file-citation[codex-file-citation]{line_range_start=56 line_range_end=60 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L56-L60"}​
+* `SYD_BBOX` or `SYD_BBOX_DISABLE` to tune/disable map bounding box guardrail ​:codex-file-citation[codex-file-citation]{line_range_start=62 line_range_end=77 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L62-L77"}​
+* `MB_VERBOSE` (default on) and `MB_FORCE_DISTANCE` (force distance-only matching) ​:codex-file-citation[codex-file-citation]{line_range_start=56 line_range_end=61 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L56-L61"}​
 
-| Variable                 | Required | Default                   | Description                                        |
-| ------------------------ | :------: | ------------------------- | -------------------------------------------------- |
-| `TFNSW_API_TOKEN`        |   Live    | —                         | TfNSW API key for GTFS‑RT (required for train data). |
-| `STATION_WHITELIST_PATH` |          | `stations_whitelist.txt`  | Path to whitelist file.                            |
-| `FEED_CACHE_SEC`         |          | `3`                       | Cache lifetime for VehiclePositions (seconds).     |
-| `CORS_ALLOW_ORIGIN`      |          | —                         | Comma‑sep. list (e.g. `*` or `https://your.site`). |
-| `SYD_BBOX`               |          | `-34.2,150.5,-33.4,151.4` | Optional guardrail bbox `S,W,N,E`.                 |
-| `SYD_BBOX_DISABLE`       |          | `0`                       | Set to `1` to disable bbox filtering entirely.     |
+## Data loading at startup
+1. Load board settings from `boards.json`, creating defaults per board when needed. ​:codex-file-citation[codex-file-citation]{line_range_start=82 line_range_end=143 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L82-L143"}​​:codex-file-citation[codex-file-citation]{line_range_start=725 line_range_end=772 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L725-L772"}​
+2. Derive route short names from `routes.txt`, applying CSV/JSON overrides when present. ​:codex-file-citation[codex-file-citation]{line_range_start=48 line_range_end=119 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L48-L119"}​​:codex-file-citation[codex-file-citation]{line_range_start=621 line_range_end=707 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L621-L707"}​
+3. Filter static GTFS to rail/metro route types (1 and 2), optional agency/route allowlists, and keep numeric parent stations. ​:codex-file-citation[codex-file-citation]{line_range_start=260 line_range_end=419 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L260-L419"}​​:codex-file-citation[codex-file-citation]{line_range_start=725 line_range_end=766 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L725-L766"}​
+4. Build allowed station×route pairs; if the static feed lacks short codes, a T*/M* fallback fan-out can be enabled. ​:codex-file-citation[codex-file-citation]{line_range_start=420 line_range_end=519 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L420-L519"}​​:codex-file-citation[codex-file-citation]{line_range_start=725 line_range_end=766 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L725-L766"}​
+5. Construct the station index keyed by cleaned station name + route suffix (e.g., `Central1`), using whitelists and bounding box filters where provided. ​:codex-file-citation[codex-file-citation]{line_range_start=480 line_range_end=560 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L480-L560"}​​:codex-file-citation[codex-file-citation]{line_range_start=725 line_range_end=772 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L725-L772"}​
+6. Build a child-stop → parent-station map for matching realtime stop IDs to parent stations. ​:codex-file-citation[codex-file-citation]{line_range_start=562 line_range_end=576 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L562-L576"}​​:codex-file-citation[codex-file-citation]{line_range_start=725 line_range_end=772 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L725-L772"}​
 
----
+## Runtime behaviour
+* GTFS-RT fetch: merges Sydney Trains and Metro feeds (or `FEEDS` override), with retry/backoff and a configurable cache. Raises an error if `TFNSW_API_TOKEN` is missing when live data is requested. ​:codex-file-citation[codex-file-citation]{line_range_start=577 line_range_end=619 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L577-L619"}​
+* Train collection: resolves route short names from static mapping, falls back to trip/route IDs, then prefix heuristics, and skips trains outside the allowed route list. ​:codex-file-citation[codex-file-citation]{line_range_start=621 line_range_end=707 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L621-L707"}​
+* State computation (`/states`): for each station key, prefer exact parent-station match on the same route using GTFS-RT `stop_id`; otherwise fall back to distance thresholds (solid/near/far). Only trains on the correct route (or unknown route) are considered. Supports `?only=` filter and optional `board_id` existence check. ​:codex-file-citation[codex-file-citation]{line_range_start=1002 line_range_end=1086 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L1002-L1086"}​
+* Station list (`/stations`): sorted list of station metadata (lat/lon/route_short). ​:codex-file-citation[codex-file-citation]{line_range_start=997 line_range_end=1001 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L997-L1001"}​
+* Health/debug: `/healthz` returns station count and feed age; `/debug` summarizes feed routes and bbox; `/trains` samples raw train entries. ​:codex-file-citation[codex-file-citation]{line_range_start=774 line_range_end=996 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L774-L996"}​
+* Root endpoint (`/`) lists available routes. ​:codex-file-citation[codex-file-citation]{line_range_start=774 line_range_end=777 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L774-L777"}​
 
-## API
+## Board settings (optional web UI)
+* Minimal HTML at `/login` and `/board/{board_id}` to edit per-board brightness, mode (`live` vs `animation`), night-mode scheduling, and animation colour/speed; settings persist to `boards.json`. ​:codex-file-citation[codex-file-citation]{line_range_start=783 line_range_end=929 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L783-L929"}​
+* API access via `/board_settings?board_id=...` returns the JSON config for the given board. ​:codex-file-citation[codex-file-citation]{line_range_start=986 line_range_end=996 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L986-L996"}​
 
-* `GET /healthz` → `{"status":"ok","stations":N,"trains_last_fetch_s":age}`
-* `GET /stations` → `[{"name":"Epping","stop_id":"212110","lat":...,"lon":...}, ...]`
-* `GET /states` → `{ "Station": 0|1|3, ... }`
+## Status codes for LEDs
+* `0` = off
+* `1` = far/in area (distance > `D_NEAR` but ≤ `D_FAR`)
+* `2` = approaching (distance > `D_SOLID` but ≤ `D_NEAR`, or incoming status)
+* `3` = at station/solid (stopped or within `D_SOLID`) ​:codex-file-citation[codex-file-citation]{line_range_start=39 line_range_end=43 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L39-L43"}​​:codex-file-citation[codex-file-citation]{line_range_start=188 line_range_end=198 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L188-L198"}​​:codex-file-citation[codex-file-citation]{line_range_start=1041 line_range_end=1086 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L1041-L1086"}​
 
-  * Optional: `?only=Epping,Eastwood` to limit output to a subset
-* `GET /debug` → configuration + counters (bbox, cache, routes)
+## Running locally
+1. Export `TFNSW_API_TOKEN` and any desired filters.
+2. Start the server: `uvicorn app:app --reload --port 8000`.
+3. Hit `http://localhost:8000/states` for live statuses, `http://localhost:8000/stations` for station metadata, and `http://localhost:8000/board/{your_id}` to tweak board settings.
 
-### Examples
-
-```bash
-curl http://localhost:8000/healthz
-curl http://localhost:8000/stations | jq .
-curl "http://localhost:8000/states?only=Epping,Eastwood" | jq .
-```
-
----
-
-## Frontend (optional)
-
-Use the provided React component (`MetroboardPanel`) or a plain HTML+JS page to preview `/states` while testing.
-
-* Same‑origin by default; if hosting separately, enable CORS and pass `?api=https://api.example.com` to the page.
-
----
-
-## Hardware integration (outline)
-
-* Map station names from `/stations` to LED indices in firmware.
-* Poll `/states` every \~5 s.
-* LED behaviour:
-
-  * `0` off
-  * `1` slow blink (near)
-  * `3` solid (at station)
-  * `2` reserved for later
-
----
-
-## Troubleshooting
-
-* **`/stations` is empty**
-
-  * Whitelist file missing or not found (check `STATION_WHITELIST_PATH`).
-  * Whitelist names don’t match GTFS `stop_name`s (try using parent `stop_id`s).
-
-* **`/states` always zeros**
-
-  * GTFS‑RT fetch failing (bad token/network) → check `/healthz` and server logs.
-  * `ROUTE_SHORT_ALLOW` doesn’t include the line you expect.
-
-* **CORS errors in browser**
-
-  * Set `CORS_ALLOW_ORIGIN="*"` (or your site origin) before starting the app.
-
----
-
-## License
-
-MIT
