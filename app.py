@@ -712,6 +712,11 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         tripid = v.trip.trip_id if v.HasField("trip") else ""
         sid = getattr(v, "stop_id", "")
 
+        # Resolve stop_id to parent station ID early for use in disambiguation
+        parent = None
+        if sid and STATION_ROUTE_PAIRS:
+            parent = CHILD_TO_PARENT.get(sid) or (sid if is_num_parent(sid) else None)
+
         # METHOD 1: Use static GTFS route mapping (most reliable)
         rs = (route_id_to_short.get(rid, "") or "").upper()
 
@@ -725,42 +730,58 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                     rs = m.group(1).upper()
                     break
 
-        # METHOD 3: Use prefix mapping (now includes T8!)
+        # METHOD 3: Use prefix mapping with station-based disambiguation
         if not rs and rid:
             prefix = rid.split("_", 1)[0].split(".")[0].upper()
+            candidates = []
             
             # Try exact match first
             if prefix in ROUTE_PREFIX_MAP:
-                opts = ROUTE_PREFIX_MAP[prefix]
-                rs = opts[abs(hash(tripid or rid)) % len(opts)]
+                candidates = ROUTE_PREFIX_MAP[prefix]
             else:
                 # Try substring match
                 for key, opts in ROUTE_PREFIX_MAP.items():
                     if key and key in prefix:
-                        rs = opts[abs(hash(tripid or rid)) % len(opts)]
+                        candidates = opts
                         break
+            
+            # If we have candidates, use station info to pick the right one
+            if candidates and len(candidates) > 1 and parent and parent in STATION_ROUTE_PAIRS:
+                # Filter candidates to only those that serve this station
+                possible = set(candidates) & STATION_ROUTE_PAIRS[parent]
+                if len(possible) == 1:
+                    rs = list(possible)[0]
+                    if MB_VERBOSE:
+                        vlog(f"Disambiguated {rid} at {parent}: {candidates} -> {rs}")
+                elif possible:
+                    # Multiple matches, use heuristics
+                    if any(x in rid.upper() for x in ["AIR", "SHL", "APT", "ESS"]) and "T8" in possible:
+                        rs = "T8"
+                    else:
+                        rs = sorted(possible)[0]
+                else:
+                    # None of the candidates serve this station - station data might be wrong
+                    # Fall back to hash-based selection
+                    rs = candidates[abs(hash(tripid or rid)) % len(candidates)]
+            elif candidates:
+                rs = candidates[0] if len(candidates) == 1 else candidates[abs(hash(tripid or rid)) % len(candidates)]
 
         # METHOD 4: Infer from stop_id using station_line_pairs.csv
-        # This is especially useful when the route encoding is ambiguous
-        if not rs and sid and STATION_ROUTE_PAIRS:
-            # Resolve child stop to parent
-            parent = CHILD_TO_PARENT.get(sid) or (sid if is_num_parent(sid) else None)
-            if parent and parent in STATION_ROUTE_PAIRS:
-                possible_routes = STATION_ROUTE_PAIRS[parent]
-                if len(possible_routes) == 1:
-                    # Unambiguous - only one route serves this station
-                    rs = list(possible_routes)[0]
-                    vlog(f"Inferred route {rs} from stop {parent}")
-                elif len(possible_routes) > 1:
-                    # Multiple routes possible - pick based on route_id pattern
-                    # Prefer T8 if "AIR" or "SHL" in route_id
-                    if any(x in rid.upper() for x in ["AIR", "SHL", "APT", "ESS"]):
-                        if "T8" in possible_routes:
-                            rs = "T8"
-                    # Otherwise pick the first alphabetically for consistency
-                    if not rs:
-                        rs = sorted(possible_routes)[0]
-                    vlog(f"Ambiguous stop {parent}, chose {rs} from {possible_routes}")
+        # Only used as absolute last resort
+        if not rs and parent and parent in STATION_ROUTE_PAIRS:
+            possible_routes = STATION_ROUTE_PAIRS[parent]
+            if len(possible_routes) == 1:
+                rs = list(possible_routes)[0]
+                if MB_VERBOSE:
+                    vlog(f"Inferred route {rs} from stop {parent} (only option)")
+            elif len(possible_routes) > 1:
+                # Prefer T8 if AIR/SHL keywords present
+                if any(x in rid.upper() for x in ["AIR", "SHL", "APT", "ESS"]) and "T8" in possible_routes:
+                    rs = "T8"
+                else:
+                    rs = sorted(possible_routes)[0]
+                if MB_VERBOSE:
+                    vlog(f"Inferred route {rs} from stop {parent} (chose from {possible_routes})")
 
         rs = rs or None
         route_debug[rid] = rs
@@ -799,6 +820,7 @@ if CORS_ALLOW_ORIGIN:
 ROUTE_ID_TO_SHORT: dict[str, str] = {}
 STATION_INDEX: dict[str, dict] = {}
 CHILD_TO_PARENT: dict[str, str] = {}
+STATION_ROUTE_PAIRS: dict[str, set[str]] = {}
 
 @app.on_event("startup")
 def _startup():
