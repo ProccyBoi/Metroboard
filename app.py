@@ -618,6 +618,30 @@ def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
     vlog("feed merged vehicles", total)
     return merged, 0.0
 
+def load_station_route_pairs(path: str = "station_line_pairs.csv") -> dict[str, set[str]]:
+    """Load parent_stop_id -> set of route_short from station_line_pairs.csv"""
+    pairs: dict[str, set[str]] = {}
+    if not os.path.exists(path):
+        vlog(f"WARN: {path} not found, route inference will be limited")
+        return pairs
+    
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                pid = (row.get("parent_stop_id") or "").strip()
+                rs = (row.get("route_short") or "").strip().upper()
+                if pid and rs:
+                    pairs.setdefault(pid, set()).add(rs)
+        vlog(f"Loaded {len(pairs)} station->route mappings from {path}")
+    except Exception as e:
+        vlog(f"WARN: Failed to load {path}: {e}")
+    
+    return pairs
+
+# Call this at startup
+STATION_ROUTE_PAIRS: dict[str, set[str]] = {}
+
 def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> tuple[
     list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]],
     dict[str, int],
@@ -629,30 +653,56 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
     missing_routes = {}
     route_debug = {}
 
+    # COMPREHENSIVE route prefix mapping - INCLUDING T8!
     ROUTE_PREFIX_MAP = {
-        # Core prefixes
-        "BMT": ["T1"], "NTH": ["T1", "T9"], "WST": ["T1"], "APS": ["T1", "T9"],
-        "CTY": ["T2"], "T3": ["T3"], "IWL": ["T4"], "ESI": ["T4"],
-        "CMB": ["T5"], "RTTA": ["T6"], "T6": ["T6"],  # include T6_1a / T6_2a variants
-        "OLY": ["T7"], "T7": ["T7"],
-        "NSN": ["T9"], "SHL": ["T9", "T1"],
-    
+        # Core Sydney Trains lines
+        "BMT": ["T1"],           # Blue Mountains Line
+        "NTH": ["T1", "T9"],     # North Shore Line
+        "WST": ["T1"],           # Western Line  
+        "APS": ["T1", "T9"],     # Airport/North Shore
+        "CTY": ["T2"],           # Inner West & Leppington
+        "T3": ["T3"],            # Bankstown Line
+        "IWL": ["T4"],           # Illawarra Line (via Illawarra)
+        "ESI": ["T4"],           # Eastern Suburbs & Illawarra
+        "CMB": ["T5"],           # Cumberland Line
+        "RTTA": ["T6"],          # Carlingford/Lidcombe
+        "T6": ["T6"],            # Lidcombe & Bankstown (new)
+        "OLY": ["T7"],           # Olympic Park Line
+        "T7": ["T7"],            # Olympic Park
+        "APT": ["T8"],           # AIRPORT LINE - THIS WAS MISSING!
+        "SHL": ["T8"],           # South/Airport Line
+        "AIRS": ["T8"],          # Airport & South
+        "AIR": ["T8"],           # Airport
+        "ESS": ["T8"],           # Eastern Suburbs South
+        "T8": ["T8"],            # Direct T8
+        "NSN": ["T9"],           # Northern Line
+        
         # Regional lines
-        "SCO": ["SCO"], "CCN": ["CCN"],
-    
+        "SCO": ["SCO"],          # South Coast Line
+        "CCN": ["CCN"],          # Central Coast & Newcastle
+        "SOUTHCOAST": ["SCO"],
+        "CENTRALCOAST": ["CCN"],
+        "WOLLONGONG": ["SCO"],
+        
         # Metro
-        "SMNW": ["M1"], "M1": ["M1"],
-    
-        # Extended/new identifiers from static GTFS
-        "SOUTHCOAST": ["SCO"], "CENTRALCOAST": ["CCN"],
-        "MOUNTAINS": ["T1"], "CUMBERLAND": ["T5"], "WOLLONGONG": ["SCO"],
-        "LIVERPOOL": ["T3"], "SEFTON": ["T3", "T6"],
-        "BLACKTOWN": ["T1"], "LIDCOMBE": ["T1", "T7"],
-    
-        # Defensive catch for stray codes
-        "": ["T1"],  # blank/unknown — default to T1 to avoid None
+        "SMNW": ["M1"],          # Sydney Metro Northwest
+        "M1": ["M1"],            # Metro M1
+        "METRO": ["M1"],
+        
+        # Other patterns
+        "MOUNTAINS": ["T1"],
+        "CUMBERLAND": ["T5"],
+        "LIVERPOOL": ["T3"],
+        "SEFTON": ["T3", "T6"],
+        "BLACKTOWN": ["T1"],
+        "LIDCOMBE": ["T1", "T7"],
+        "BANKSTOWN": ["T3"],
+        "EASTERN": ["T4", "T8"],
+        "ILLAWARRA": ["T4"],
+        
+        # Defensive catch
+        "": ["T1"],
     }
-
 
     for e in feed.entity:
         if not e.HasField("vehicle"):
@@ -660,10 +710,12 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         v = e.vehicle
         rid = v.trip.route_id if v.HasField("trip") else ""
         tripid = v.trip.trip_id if v.HasField("trip") else ""
+        sid = getattr(v, "stop_id", "")
 
+        # METHOD 1: Use static GTFS route mapping (most reliable)
         rs = (route_id_to_short.get(rid, "") or "").upper()
 
-        # Fallback: extract T/M code
+        # METHOD 2: Extract T/M code from route_id or trip_id
         if not rs:
             for src in (rid, tripid):
                 if not src:
@@ -673,18 +725,42 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                     rs = m.group(1).upper()
                     break
 
-        # Fallback: prefix mapping
+        # METHOD 3: Use prefix mapping (now includes T8!)
         if not rs and rid:
             prefix = rid.split("_", 1)[0].split(".")[0].upper()
+            
+            # Try exact match first
             if prefix in ROUTE_PREFIX_MAP:
                 opts = ROUTE_PREFIX_MAP[prefix]
                 rs = opts[abs(hash(tripid or rid)) % len(opts)]
             else:
-                # check substrings for looser match
+                # Try substring match
                 for key, opts in ROUTE_PREFIX_MAP.items():
-                    if key in prefix:
+                    if key and key in prefix:
                         rs = opts[abs(hash(tripid or rid)) % len(opts)]
                         break
+
+        # METHOD 4: Infer from stop_id using station_line_pairs.csv
+        # This is especially useful when the route encoding is ambiguous
+        if not rs and sid and STATION_ROUTE_PAIRS:
+            # Resolve child stop to parent
+            parent = CHILD_TO_PARENT.get(sid) or (sid if is_num_parent(sid) else None)
+            if parent and parent in STATION_ROUTE_PAIRS:
+                possible_routes = STATION_ROUTE_PAIRS[parent]
+                if len(possible_routes) == 1:
+                    # Unambiguous - only one route serves this station
+                    rs = list(possible_routes)[0]
+                    vlog(f"Inferred route {rs} from stop {parent}")
+                elif len(possible_routes) > 1:
+                    # Multiple routes possible - pick based on route_id pattern
+                    # Prefer T8 if "AIR" or "SHL" in route_id
+                    if any(x in rid.upper() for x in ["AIR", "SHL", "APT", "ESS"]):
+                        if "T8" in possible_routes:
+                            rs = "T8"
+                    # Otherwise pick the first alphabetically for consistency
+                    if not rs:
+                        rs = sorted(possible_routes)[0]
+                    vlog(f"Ambiguous stop {parent}, chose {rs} from {possible_routes}")
 
         rs = rs or None
         route_debug[rid] = rs
@@ -694,7 +770,6 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         if rs and ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW:
             continue
 
-        sid = getattr(v, "stop_id", "")
         status = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
         lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
         lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
@@ -703,6 +778,9 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
             by_route[rs] = by_route.get(rs, 0) + 1
 
     vlog(f"collect_trains kept={len(trains)}, routes={len(by_route)}, null_routes={len([t for t in trains if t[2] is None])}")
+    if missing_routes:
+        vlog(f"Missing route mappings (top 10): {dict(sorted(missing_routes.items(), key=lambda x: -x[1])[:10])}")
+    
     return trains, by_route, route_debug
 
 
@@ -724,7 +802,7 @@ CHILD_TO_PARENT: dict[str, str] = {}
 
 @app.on_event("startup")
 def _startup():
-    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS
+    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS, STATION_ROUTE_PAIRS
 
     BOARD_SETTINGS = _load_board_settings()
 
@@ -766,6 +844,9 @@ def _startup():
     )
 
     CHILD_TO_PARENT = build_child_to_parent("stops.txt")
+    
+    # Load station->route mappings for route inference
+    STATION_ROUTE_PAIRS = load_station_route_pairs("station_line_pairs.csv")
 
     if not STATION_INDEX:
         raise RuntimeError("No stations after filtering")
