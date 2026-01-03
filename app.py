@@ -61,124 +61,54 @@ MB_FORCE_DISTANCE = os.getenv("MB_FORCE_DISTANCE", "0") == "1"
 
 # TfNSW Location Code → Parent Station Mapping
 # These location codes appear in GTFS-RT but not in stops.txt
+# TfNSW Location Code → Parent Station Mapping
 LOCATION_CODE_PATTERNS = {
-    # Pattern: (location_prefix, parent_station_id)
     "Sydney.": {
-        "SY": "200060",      # Central Station
-        "St James": "200050",
-        "Town Hall": "200070",
-        "Wynyard": "200080",
-        "Circular Quay": "200020",
-        "Martin Place": "200030",
-        "Museum": "200040",
-        "Redfern": "201510",
-        "Macdonaldtown": "201520",
+        "SY": "200060", "St James": "200050", "Town Hall": "200070",
+        "Wynyard": "200080", "Circular Quay": "200020", "Martin Place": "200030",
+        "Museum": "200040", "Redfern": "201510", "Macdonaldtown": "201520",
     },
     "Sydenham.": {
-        "SM": "204420",      # Sydenham (most SM codes)
-        "Redfern": "201510",
-        "Central": "200060",
-        "Erskineville": "204310",
-        "St Peters": "204410",
-        "Tempe": "204430",
-        "Wolli Creek": "220510",
-        "Arncliffe": "220520",
-        "Bondi": "202210",
-        "Edgecliff": "202710",
-        "Kings Cross": "201110",
-        "ES": "202710",      # Eastern Suburbs → Edgecliff
-        "IR": "201510",      # Illawarra/Redfern
+        "SM": "204420", "Redfern": "201510", "Central": "200060",
+        "Erskineville": "204310", "St Peters": "204410", "Tempe": "204430",
+        "Wolli Creek": "220510", "Arncliffe": "220520", "Bondi": "202210",
+        "Edgecliff": "202710", "Kings Cross": "201110", "ES": "202710", "IR": "201510",
     },
     "NorthShore.": {
-        "SH": "206010",      # North Shore → typically North Sydney
-        "NS": "206010",      # North Sydney
-        "Hornsby": "207720",
-        "St Leonards": "206520",
-        "Chatswood": "206710",
-        "Gordon": "207210",
-        "Waitara": "207710",
-        "Asquith": "207730",
-        "GN": "207210",      # Gordon
+        "SH": "206520", "NS": "206010", "Hornsby": "207720", "St Leonards": "206520",
+        "Chatswood": "206710", "Gordon": "207210", "Waitara": "207710",
+        "Asquith": "207730", "GN": "207210",
     },
     "Strathfield.": {
-        "ST": "213510",      # Strathfield
-        "Pennant Hills": "212020",
-        "Epping": "212110",
-        "EG": "212110",      # Epping
-        "Ashfield": "213110",
-        "Burwood": "213410",
+        "ST": "213510", "Pennant Hills": "212020", "Epping": "212110",
+        "EG": "212110", "Ashfield": "213110", "Burwood": "213410",
     },
-    "Lidcombe.": {
-        "ST": "214110",      # Lidcombe
-        "Parramatta": "215020",
-        "GE": "214240",      # Granville
-    },
-    "Blacktown.": {
-        "BN": "214810",      # Blacktown
-    },
-    "Mountains.": {
-        "M": "214810",       # Mountains → Blacktown area
-        "Penrith": "275010",
-        "Rooty Hill": "276610",
-    },
+    "Lidcombe.": {"ST": "214110", "Parramatta": "215020", "GE": "214240"},
+    "Blacktown.": {"BN": "214810"},
+    "Mountains.": {"M": "275010", "Penrith": "275010", "Rooty Hill": "276610"},
     "Glenfield.": {
-        "GL": "216710",      # Glenfield
-        "Campbelltown": "256020",
-        "Macarthur": "256030",
-        "Liverpool": "217020",
-        "Leppington": "217933",
-        "Minto": "256610",
-        "Leumeah": "256010",
-        "LE": "217933",      # Leppington
+        "GL": "216710", "Campbelltown": "256020", "Macarthur": "256030",
+        "Liverpool": "217020", "Leppington": "217933", "Minto": "256610",
+        "Leumeah": "256010", "LE": "217933",
     },
-    "Liverpool.": {
-        "S": "217020",       # Liverpool
-        "Guildford": "216110",
-    },
+    "Liverpool.": {"S": "217020", "Guildford": "216110"},
     "Sutherland.": {
-        "SC": "223210",      # Sutherland
-        "SW": "223330",      # Waterfall
-        "WL": "223330",      # Waterfall
-        "Cronulla": "223020",
-        "Waterfall": "223330",
-        "Heathcote": "223320",
-        "Woolooware": "223010",
-        "CA": "223020",      # Cronulla
+        "SC": "223210", "SW": "223330", "WL": "223330", "Cronulla": "223020",
+        "Waterfall": "223330", "Heathcote": "223320", "Woolooware": "223010", "CA": "223020",
     },
-    "Hurstville.": {
-        "SM": "222010",      # Hurstville
-    },
-    "Ashfield.": {
-        "S": "213110",       # Ashfield
-        "L": "213410",       # Could be multiple stations
-        "ST": "213510",      # Strathfield
-    },
-    "SouthCoast.": {
-        "PKLA": None,        # South Coast Line - regional
-        "THRL": None,        # Thirroul area
-    },
-    "Hornsby.": {
-        "Hornsby": "207720",
-    },
+    "Hurstville.": {"SM": "222010"},
+    "Ashfield.": {"S": "213110", "L": "213410", "ST": "213510"},
+    "Hornsby.": {"Hornsby": "207720"},
 }
 
 def resolve_location_code(stop_id: str) -> T.Optional[str]:
-    """
-    Resolve TfNSW location codes to parent station IDs.
-    Examples:
-      "Sutherland.CA8/11 Loc" → "223020" (Cronulla)
-      "Sydenham.SM885BER" → "204420" (Sydenham)
-      "Sydney.SY510 Loc" → "200060" (Central)
-    """
+    """Resolve TfNSW location codes to parent station IDs."""
     if not stop_id or not isinstance(stop_id, str):
         return None
     
-    # Try each prefix pattern
     for prefix, mappings in LOCATION_CODE_PATTERNS.items():
         if not stop_id.startswith(prefix):
             continue
-        
-        # Remove prefix to get the location part
         location_part = stop_id[len(prefix):].upper()
         
         # Try exact matches first
@@ -186,13 +116,13 @@ def resolve_location_code(stop_id: str) -> T.Optional[str]:
             if key.upper() in location_part:
                 return parent_id
         
-        # For code-based patterns (like "SM", "SY"), try prefix match
+        # For code-based patterns, try prefix match
         for key, parent_id in mappings.items():
             if len(key) <= 3 and location_part.startswith(key.upper()):
                 return parent_id
     
     return None
-
+    
 # BBox guardrail (None disables)
 DEFAULT_SYD_BBOX = (-34.2, 150.5, -33.4, 151.4)
 def _bbox_env() -> T.Optional[tuple[float, float, float, float]]:
@@ -805,40 +735,24 @@ def _candidate_pair_paths(path: str) -> list[str]:
     return uniq
 
 
-def load_station_route_pairs(path: str = "station_line_pairs.txt") -> dict[str, set[str]]:
-    """Load parent_stop_id -> set of route_short from station_line_pairs.* (tab or comma)."""
+def load_station_route_pairs(path: str = "station_line_pairs.csv") -> dict[str, set[str]]:
+    """Load parent_stop_id -> set of route_short from station_line_pairs.csv"""
     pairs: dict[str, set[str]] = {}
-    chosen_path = None
-
-    for cand in _candidate_pair_paths(path):
-        if os.path.exists(cand):
-            chosen_path = cand
-            break
-
-    if not chosen_path:
-        vlog(f"WARN: station_line_pairs not found (tried {_candidate_pair_paths(path)}); route inference will be limited")
+    if not os.path.exists(path):
+        vlog(f"WARN: {path} not found, route inference will be limited")
         return pairs
     
     try:
-        with open(chosen_path, encoding="utf-8-sig", newline="") as f:
-            sample = f.read(1024)
-            f.seek(0)
-            # Support either comma or tab delimiters.
-            try:
-                dialect = csv.Sniffer().sniff(sample, delimiters=",\t")
-                delimiter = dialect.delimiter
-            except Exception:
-                delimiter = "\t" if "\t" in sample else ","
-
-            reader = csv.DictReader(f, delimiter=delimiter)
+        with open(path, encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
             for row in reader:
                 pid = (row.get("parent_stop_id") or "").strip()
                 rs = (row.get("route_short") or "").strip().upper()
                 if pid and rs:
                     pairs.setdefault(pid, set()).add(rs)
-        vlog(f"Loaded {len(pairs)} station->route mappings from {chosen_path}")
+        vlog(f"Loaded {len(pairs)} station->route mappings from {path}")
     except Exception as e:
-        vlog(f"WARN: Failed to load {chosen_path}: {e}")
+        vlog(f"WARN: Failed to load {path}: {e}")
     
     return pairs
 
@@ -918,14 +832,14 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         # Resolve stop_id to parent station ID early for use in disambiguation
         parent = None
         if sid:
-            # First try: CHILD_TO_PARENT mapping from stops.txt
+            # Method 1: Try CHILD_TO_PARENT mapping from stops.txt
             parent = CHILD_TO_PARENT.get(sid)
             
-            # Second try: Location code pattern matching
+            # Method 2: Try location code pattern matching (for TfNSW location codes)
             if not parent or not is_num_parent(parent):
                 parent = resolve_location_code(sid)
             
-            # Third try: If it's already numeric, use as-is
+            # Method 3: If it's already numeric, use as-is
             if not parent and is_num_parent(sid):
                 parent = sid
 
@@ -987,11 +901,53 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                 if MB_VERBOSE:
                     vlog(f"Inferred route {rs} from stop {parent} (only option)")
             elif len(possible_routes) > 1:
-                # Prefer T8 if AIR/SHL keywords present
-                if any(x in rid.upper() for x in ["AIR", "SHL", "APT", "ESS"]) and "T8" in possible_routes:
-                    rs = "T8"
-                else:
+                # Use route_id to narrow down possibilities
+                rid_upper = rid.upper()
+                
+                # First: Try exact route_id prefix matching with all possible routes
+                filtered = possible_routes
+                for prefix, routes in ROUTE_PREFIX_MAP.items():
+                    if prefix and prefix in rid_upper:
+                        # Filter to only routes that match both the prefix AND the station
+                        prefix_routes = set(routes)
+                        filtered = possible_routes & prefix_routes
+                        if filtered:
+                            possible_routes = filtered
+                            break
+                
+                # Second: Use heuristics based on route_id keywords
+                if len(possible_routes) > 1:
+                    # T8/Airport keywords
+                    if any(x in rid_upper for x in ["AIR", "SHL", "APT", "ESS", "APS"]):
+                        if "T8" in possible_routes:
+                            rs = "T8"
+                    # T1 keywords
+                    elif any(x in rid_upper for x in ["WST", "BMT", "NTH"]):
+                        if "T1" in possible_routes:
+                            rs = "T1"
+                    # T9 keywords  
+                    elif "NSN" in rid_upper:
+                        if "T9" in possible_routes:
+                            rs = "T9"
+                    # T4 keywords
+                    elif any(x in rid_upper for x in ["ESI", "IWL"]):
+                        if "T4" in possible_routes:
+                            rs = "T4"
+                    # T2 keywords
+                    elif "CTY" in rid_upper:
+                        if "T2" in possible_routes:
+                            rs = "T2"
+                
+                # Third: If still ambiguous, prefer non-regional routes
+                if not rs:
+                    # Remove regional routes if there are suburban options
+                    suburban = possible_routes - {"SCO", "CCN", "HUN", "BMT", "SHL"}
+                    if suburban:
+                        possible_routes = suburban
+                    
+                    # Final fallback: alphabetically first
                     rs = sorted(possible_routes)[0]
+                
                 if MB_VERBOSE:
                     vlog(f"Inferred route {rs} from stop {parent} (chose from {possible_routes})")
 
@@ -1040,12 +996,7 @@ def _startup():
 
     BOARD_SETTINGS = _load_board_settings()
 
-    station_route_pairs_path = os.getenv("STATION_LINE_PAIRS_PATH", "station_line_pairs.txt")
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
-
-    # Load curated station→route mappings early so both route inference and
-    # allowed-pair derivation can reuse the same source of truth.
-    STATION_ROUTE_PAIRS = load_station_route_pairs(station_route_pairs_path)
 
     allowed_parents = require_allowed_parents(
         stops="stops.txt",
@@ -1068,8 +1019,6 @@ def _startup():
         agencies_allowed=AGENCY_NAME_ALLOW,
         route_short_allow=ROUTE_SHORT_ALLOW,
         allowed_parents_for_fallback=allowed_parents,
-        station_route_pairs=STATION_ROUTE_PAIRS,
-        station_route_pairs_path=station_route_pairs_path,
     )
 
     wl_path = os.getenv("STATION_WHITELIST_PATH", "stations_whitelist.txt")
@@ -1085,6 +1034,9 @@ def _startup():
     )
 
     CHILD_TO_PARENT = build_child_to_parent("stops.txt")
+    
+    # Load station->route mappings for route inference
+    STATION_ROUTE_PAIRS = load_station_route_pairs("station_line_pairs.csv")
 
     if not STATION_INDEX:
         raise RuntimeError("No stations after filtering")
