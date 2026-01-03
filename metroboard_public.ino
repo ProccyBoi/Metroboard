@@ -70,7 +70,7 @@ struct NightModeCfg {
 } gNightMode = {false, "23:00", "06:00", "off", 20};
 
 struct AnimCfg {
-  String name;   // "pulse", "rainbow", ...
+  String name;   // "pulse", "rainbow", "bounce"
   int speed;     // arbitrary units
   uint8_t r, g, b;
 } gAnim = {"pulse", 120, 255, 80, 0};
@@ -144,6 +144,12 @@ static uint32_t lineColor(Line ln){
   uint8_t r = (h>>16)&0xFF, g = (h>>8)&0xFF, b = h&0xFF;
   return strips[ln].Color(r,g,b);
 }
+static uint32_t wheel(uint8_t pos){
+  pos = 255 - pos;
+  if(pos < 85)   return strips[0].Color(255 - pos * 3, 0, pos * 3);
+  if(pos < 170){ pos -= 85; return strips[0].Color(0, pos * 3, 255 - pos * 3); }
+  pos -= 170;    return strips[0].Color(pos * 3, 255 - pos * 3, 0);
+}
 
 // ===== sequences (synced to tester) =====
 // T9
@@ -210,20 +216,83 @@ const char* const T1_SEQ[] = {
 
 // ===== build & render =====
 void runAnimationStep(){
-  static uint32_t last = 0;
-  uint32_t now = millis();
-  uint32_t dt = now - last;
-  (void)dt;
-  last = now;
+  static uint32_t lastChaseStep = 0;
+  static uint16_t chasePos[LINE_COUNT];
+  static int8_t chaseDir[LINE_COUNT];
+  static bool chaseInit = false;
+  static String lastAnim = "";
 
-  float speed = (gAnim.speed <= 0) ? 100.0f : float(gAnim.speed);
-  float t = (now % (uint32_t)(speed * 20)) / (speed * 20.0f); // wrap
-  float intensity = 0.5f + 0.5f * sinf(2.0f * 3.14159f * t);   // 0..1
+  uint32_t now = millis();
+
+  // Reset per-animation state when switching animations
+  if(!lastAnim.equalsIgnoreCase(gAnim.name)){
+    chaseInit = false;
+    lastAnim = gAnim.name;
+  }
+
+  // Normalize name for comparisons
+  String anim = gAnim.name;
+  anim.toLowerCase();
+
+  uint32_t speed = (gAnim.speed <= 0) ? 100 : (uint32_t)gAnim.speed;
+
+  // ----- Rainbow wheel -----
+  if(anim == "rainbow"){
+    uint32_t shift = now / speed;
+    for(uint8_t ln=0; ln<LINE_COUNT; ln++){
+      strips[ln].setBrightness(gEffectiveBrightness);
+      for(uint16_t i=0; i<STRIP_LEN[ln]; i++){
+        uint8_t hue = (uint8_t)((i * 256 / STRIP_LEN[ln] + shift) & 0xFF);
+        strips[ln].setPixelColor(i, wheel(hue));
+      }
+      strips[ln].show();
+    }
+    return;
+  }
+
+  // ----- Bouncing chase (3-LED train) -----
+  if(anim == "bounce" || anim == "chase"){
+    if(!chaseInit){
+      for(uint8_t ln=0; ln<LINE_COUNT; ln++){ chasePos[ln] = 0; chaseDir[ln] = 1; }
+      chaseInit = true;
+      lastChaseStep = now;
+    }
+
+    if(now - lastChaseStep >= speed){
+      lastChaseStep = now;
+      for(uint8_t ln=0; ln<LINE_COUNT; ln++){
+        uint16_t len = STRIP_LEN[ln];
+        chasePos[ln] = uint16_t(int16_t(chasePos[ln]) + chaseDir[ln]);
+        if(chasePos[ln] == 0 || chasePos[ln] + 1 >= len){
+          chaseDir[ln] = -chaseDir[ln];
+        }
+      }
+    }
+
+    for(uint8_t ln=0; ln<LINE_COUNT; ln++){
+      strips[ln].setBrightness(gEffectiveBrightness);
+      strips[ln].clear();
+      uint32_t col = lineColor((Line)ln);
+      int16_t center = chasePos[ln];
+      for(int k=-1; k<=1; k++){
+        int16_t idx = center + k;
+        if(idx>=0 && idx < (int16_t)STRIP_LEN[ln]){
+          strips[ln].setPixelColor((uint16_t)idx, col);
+        }
+      }
+      strips[ln].show();
+    }
+    return;
+  }
+
+  // ----- Pulse (default) -----
+  uint32_t cycle = speed * 20;
+  float t = cycle ? float(now % cycle) / float(cycle) : 0.0f;
+  float intensity = 0.5f + 0.5f * sinf(2.0f * 3.14159f * t);
 
   uint8_t br = (uint8_t)(gEffectiveBrightness * intensity);
   for(uint8_t ln=0; ln<LINE_COUNT; ln++){
     strips[ln].setBrightness(br);
-    strips[ln].clear();
     for(uint16_t i=0; i<STRIP_LEN[ln]; i++){
       strips[ln].setPixelColor(i, strips[ln].Color(gAnim.r, gAnim.g, gAnim.b));
     }

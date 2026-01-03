@@ -1172,6 +1172,7 @@ def board_settings_page(board_id: str):
                 <label class="field">Name
                   <select name="an_name" id="an_name">
                     <option value="pulse" {"selected" if an_name=="pulse" else ""}>Pulse</option>
+                    <option value="bounce" {"selected" if an_name=="bounce" else ""}>Bounce</option>
                     <option value="rainbow" {"selected" if an_name=="rainbow" else ""}>Rainbow</option>
                   </select>
                 </label>
