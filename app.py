@@ -53,6 +53,8 @@ BOARD_SETTINGS_PATH = os.getenv("BOARD_SETTINGS_PATH", "boards.json")
 
 # board_id -> settings dict
 BOARD_SETTINGS: dict[str, dict] = {}
+BOARD_SETTINGS_VERSION: int = 0
+BOARD_SETTINGS_VERSION: int = 0
 
 # Caching/CORS/logging
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
@@ -108,6 +110,8 @@ def _load_board_settings() -> dict[str, dict]:
     return {}
 
 def _save_board_settings() -> None:
+    global BOARD_SETTINGS_VERSION
+    BOARD_SETTINGS_VERSION += 1
     try:
         with open(BOARD_SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump(BOARD_SETTINGS, f, indent=2, sort_keys=True)
@@ -1347,16 +1351,23 @@ def trains():
         "sample_trains": out
     }
 
+def _as_no_store(resp: JSONResponse) -> JSONResponse:
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.get("/board_settings")
 def board_settings_api(board_id: str = Query(...)):
     board_id = board_id.strip()
     if not board_id:
-        return JSONResponse({"error": "missing board_id"}, status_code=400)
+        return _as_no_store(JSONResponse({"error": "missing board_id"}, status_code=400))
     try:
         cfg = _get_or_create_board(board_id)
     except ValueError:
-        return JSONResponse({"error": "invalid board_id"}, status_code=400)
-    return JSONResponse(cfg)
+        return _as_no_store(JSONResponse({"error": "invalid board_id"}, status_code=400))
+    payload = dict(cfg)
+    payload["settings_version"] = BOARD_SETTINGS_VERSION
+    return _as_no_store(JSONResponse(payload))
 
 
 def _station_subset(only: T.Optional[str]) -> dict[str, dict]:
