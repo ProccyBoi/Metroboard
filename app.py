@@ -395,7 +395,7 @@ def require_allowed_pairs(
     route_short_allow: set[str] = ROUTE_SHORT_ALLOW,
     allowed_parents_for_fallback: T.Optional[set[str]] = None,
     station_route_pairs: T.Optional[dict[str, set[str]]] = None,
-    station_route_pairs_path: str = "station_line_pairs.csv",
+    station_route_pairs_path: str = "station_line_pairs.txt",
 ) -> set[tuple[str, str]]:
     ag_name: dict[str, str] = {}
     with open(agency, encoding="utf-8-sig") as f:
