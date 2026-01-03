@@ -395,7 +395,7 @@ def require_allowed_pairs(
     route_short_allow: set[str] = ROUTE_SHORT_ALLOW,
     allowed_parents_for_fallback: T.Optional[set[str]] = None,
     station_route_pairs: T.Optional[dict[str, set[str]]] = None,
-    station_route_pairs_path: str = "station_line_pairs.csv",
+    station_route_pairs_path: str = "station_line_pairs.txt",
 ) -> set[tuple[str, str]]:
     ag_name: dict[str, str] = {}
     with open(agency, encoding="utf-8-sig") as f:
@@ -637,15 +637,51 @@ def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
     vlog("feed merged vehicles", total)
     return merged, 0.0
 
+def _candidate_pair_paths(path: str) -> list[str]:
+    """Return possible locations for station_line_pairs.* relative to cwd and this file."""
+    if not path:
+        return []
+
+    cand: list[str] = [path]
+    base = os.path.basename(path)
+    here = os.path.dirname(os.path.abspath(__file__))
+    if not os.path.isabs(path):
+        cand.append(os.path.join(here, base))
+
+    stem, ext = os.path.splitext(base)
+    if ext.lower() == ".csv":
+        cand.append(os.path.join(here, f"{stem}.txt"))
+        cand.append(f"{stem}.txt")
+    elif ext.lower() == ".txt":
+        cand.append(os.path.join(here, f"{stem}.csv"))
+        cand.append(f"{stem}.csv")
+
+    # De-duplicate while preserving order.
+    seen = set()
+    uniq: list[str] = []
+    for c in cand:
+        if c and c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+
 def load_station_route_pairs(path: str = "station_line_pairs.txt") -> dict[str, set[str]]:
-    """Load parent_stop_id -> set of route_short from station_line_pairs.txt (tab or comma)."""
+    """Load parent_stop_id -> set of route_short from station_line_pairs.* (tab or comma)."""
     pairs: dict[str, set[str]] = {}
-    if not os.path.exists(path):
-        vlog(f"WARN: {path} not found, route inference will be limited")
+    chosen_path = None
+
+    for cand in _candidate_pair_paths(path):
+        if os.path.exists(cand):
+            chosen_path = cand
+            break
+
+    if not chosen_path:
+        vlog(f"WARN: station_line_pairs not found (tried {_candidate_pair_paths(path)}); route inference will be limited")
         return pairs
     
     try:
-        with open(path, encoding="utf-8-sig", newline="") as f:
+        with open(chosen_path, encoding="utf-8-sig", newline="") as f:
             sample = f.read(1024)
             f.seek(0)
             # Support either comma or tab delimiters.
@@ -661,9 +697,9 @@ def load_station_route_pairs(path: str = "station_line_pairs.txt") -> dict[str, 
                 rs = (row.get("route_short") or "").strip().upper()
                 if pid and rs:
                     pairs.setdefault(pid, set()).add(rs)
-        vlog(f"Loaded {len(pairs)} station->route mappings from {path}")
+        vlog(f"Loaded {len(pairs)} station->route mappings from {chosen_path}")
     except Exception as e:
-        vlog(f"WARN: Failed to load {path}: {e}")
+        vlog(f"WARN: Failed to load {chosen_path}: {e}")
     
     return pairs
 
@@ -856,11 +892,12 @@ def _startup():
 
     BOARD_SETTINGS = _load_board_settings()
 
+    station_route_pairs_path = os.getenv("STATION_LINE_PAIRS_PATH", "station_line_pairs.txt")
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
 
     # Load curated station→route mappings early so both route inference and
     # allowed-pair derivation can reuse the same source of truth.
-    STATION_ROUTE_PAIRS = load_station_route_pairs("station_line_pairs.csv")
+    STATION_ROUTE_PAIRS = load_station_route_pairs(station_route_pairs_path)
 
     allowed_parents = require_allowed_parents(
         stops="stops.txt",
@@ -884,7 +921,7 @@ def _startup():
         route_short_allow=ROUTE_SHORT_ALLOW,
         allowed_parents_for_fallback=allowed_parents,
         station_route_pairs=STATION_ROUTE_PAIRS,
-        station_route_pairs_path="station_line_pairs.csv",
+        station_route_pairs_path=station_route_pairs_path,
     )
 
     wl_path = os.getenv("STATION_WHITELIST_PATH", "stations_whitelist.txt")
