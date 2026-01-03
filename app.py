@@ -659,7 +659,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         "BMT": ["T1"],           # Blue Mountains Line
         "NTH": ["T1", "T9"],     # North Shore Line
         "WST": ["T1"],           # Western Line  
-        "APS": ["T1", "T9"],     # Airport/North Shore
+        "APS": ["T8"],           # Airport & South Line - FIXED! Was wrongly T1/T9
         "CTY": ["T2"],           # Inner West & Leppington
         "T3": ["T3"],            # Bankstown Line
         "IWL": ["T4"],           # Illawarra Line (via Illawarra)
@@ -669,7 +669,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         "T6": ["T6"],            # Lidcombe & Bankstown (new)
         "OLY": ["T7"],           # Olympic Park Line
         "T7": ["T7"],            # Olympic Park
-        "APT": ["T8"],           # AIRPORT LINE - THIS WAS MISSING!
+        "APT": ["T8"],           # Airport Line
         "SHL": ["T8"],           # South/Airport Line
         "AIRS": ["T8"],          # Airport & South
         "AIR": ["T8"],           # Airport
