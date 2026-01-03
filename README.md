@@ -37,7 +37,7 @@ Metroboard is a FastAPI service that turns the TfNSW GTFS Realtime vehicle posit
 
 ## Board settings (optional web UI)
 * Minimal HTML at `/login` and `/board/{board_id}` to edit per-board brightness, mode (`live` vs `animation`), night-mode scheduling, and animation colour/speed; settings persist to `boards.json`. ​:codex-file-citation[codex-file-citation]{line_range_start=783 line_range_end=929 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L783-L929"}​
-* API access via `/board_settings?board_id=...` returns the JSON config for the given board. ​:codex-file-citation[codex-file-citation]{line_range_start=986 line_range_end=996 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L986-L996"}​
+* API access via `/board_settings?board_id=...` returns the JSON config (with a monotonically increasing `settings_version`), and `/board_payload?board_id=...` returns the same settings plus the latest state map; both support optional `?only=` filtering and disable HTTP caching so firmware always sees fresh values. ​:codex-file-citation[codex-file-citation]{line_range_start=986 line_range_end=996 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L986-L996"}​​:codex-file-citation[codex-file-citation]{line_range_start=1098 line_range_end=1143 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L1098-L1143"}​
 
 ## Status codes for LEDs
 * `0` = off
@@ -49,4 +49,3 @@ Metroboard is a FastAPI service that turns the TfNSW GTFS Realtime vehicle posit
 1. Export `TFNSW_API_TOKEN` and any desired filters.
 2. Start the server: `uvicorn app:app --reload --port 8000`.
 3. Hit `http://localhost:8000/states` for live statuses, `http://localhost:8000/stations` for station metadata, and `http://localhost:8000/board/{your_id}` to tweak board settings.
-

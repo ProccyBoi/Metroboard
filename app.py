@@ -13,6 +13,7 @@ import csv
 import json
 import re
 import random
+from datetime import datetime, timezone
 import typing as T
 
 import requests
@@ -52,6 +53,8 @@ BOARD_SETTINGS_PATH = os.getenv("BOARD_SETTINGS_PATH", "boards.json")
 
 # board_id -> settings dict
 BOARD_SETTINGS: dict[str, dict] = {}
+BOARD_SETTINGS_VERSION: int = 0
+BOARD_SETTINGS_VERSION: int = 0
 
 # Caching/CORS/logging
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
@@ -107,6 +110,8 @@ def _load_board_settings() -> dict[str, dict]:
     return {}
 
 def _save_board_settings() -> None:
+    global BOARD_SETTINGS_VERSION
+    BOARD_SETTINGS_VERSION += 1
     try:
         with open(BOARD_SETTINGS_PATH, "w", encoding="utf-8") as f:
             json.dump(BOARD_SETTINGS, f, indent=2, sort_keys=True)
@@ -936,54 +941,309 @@ def board_settings_page(board_id: str):
     an_color_hex = "#%02X%02X%02X" % (an_color[0], an_color[1], an_color[2])
 
     return f"""
+    <!DOCTYPE html>
     <html>
       <head>
+        <meta charset="utf-8" />
         <title>Metroboard {board_id} Settings</title>
+        <style>
+          :root {{
+            color-scheme: light dark;
+            --bg: #0e1116;
+            --panel: #161b22;
+            --border: #2b3340;
+            --accent: #ff6b3d;
+            --muted: #7a8699;
+            --text: #e8edf4;
+            --shadow: 0 10px 40px rgba(0,0,0,0.35);
+          }}
+          * {{ box-sizing: border-box; }}
+          body {{
+            margin: 0;
+            font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+            background: linear-gradient(145deg, #0a0d12 0%, #131926 100%);
+            color: var(--text);
+            min-height: 100vh;
+          }}
+          a {{ color: var(--accent); }}
+          main.page {{
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 32px 20px 60px;
+          }}
+          .hero {{
+            display: flex;
+            align-items: flex-start;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 16px;
+          }}
+          .hero__title {{ font-size: 28px; font-weight: 700; }}
+          .hero__subtitle {{ color: var(--muted); margin-top: 4px; }}
+          .hero__hint {{ margin: 8px 0 0; color: var(--muted); }}
+          .card {{
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 14px;
+            padding: 20px;
+            margin-top: 18px;
+            box-shadow: var(--shadow);
+          }}
+          .section-head {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-bottom: 8px;
+          }}
+          .section-head h3 {{ margin: 0; font-size: 18px; }}
+          .section-head .tag {{
+            background: rgba(255,255,255,0.06);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 6px 10px;
+            font-size: 13px;
+            color: var(--muted);
+          }}
+          .row {{ display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; }}
+          label.field {{
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            min-width: 220px;
+            flex: 1 1 220px;
+            color: var(--muted);
+            font-size: 14px;
+          }}
+          label.field input,
+          label.field select {{
+            background: rgba(255,255,255,0.04);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px 12px;
+            font-size: 15px;
+            outline: none;
+          }}
+          .mode-options {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            margin-top: 12px;
+          }}
+          .option {{
+            border: 1px solid var(--border);
+            padding: 12px 14px;
+            border-radius: 12px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            background: rgba(255,255,255,0.03);
+          }}
+          .pill {{
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            background: rgba(255,107,61,0.14);
+            color: var(--accent);
+            padding: 6px 10px;
+            border-radius: 999px;
+            font-weight: 600;
+            font-size: 13px;
+          }}
+          .muted {{ color: var(--muted); font-size: 14px; margin: 0; }}
+          .slider-row {{
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-top: 12px;
+          }}
+          input[type="range"] {{
+            flex: 1;
+            accent-color: var(--accent);
+          }}
+          .note {{ color: var(--muted); font-size: 13px; margin-top: 8px; }}
+          button.primary {{
+            margin-top: 18px;
+            background: var(--accent);
+            color: #0d0f14;
+            border: none;
+            border-radius: 12px;
+            padding: 12px 18px;
+            font-weight: 700;
+            cursor: pointer;
+            box-shadow: 0 12px 30px rgba(255,107,61,0.35);
+          }}
+          button.primary:hover {{ transform: translateY(-1px); }}
+          .two-col {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }}
+          .status {{ color: #a8ffce; font-weight: 600; font-size: 14px; }}
+          .api-card code {{ background: rgba(255,255,255,0.06); padding: 3px 6px; border-radius: 6px; }}
+          @media (max-width: 640px) {{
+            .hero {{ flex-direction: column; }}
+          }}
+        </style>
       </head>
       <body>
-        <h2>Metroboard {board_id}</h2>
-        <form method="post" action="/board/{board_id}">
-          <h3>Display Mode</h3>
-          <label><input type="radio" name="mode" value="live" {'checked' if mode=='live' else ''}> Live trains</label><br>
-          <label><input type="radio" name="mode" value="animation" {'checked' if mode=='animation' else ''}> Animation</label>
+        <main class="page">
+          <div class="hero">
+            <div>
+              <div class="hero__title">Metroboard</div>
+              <div class="hero__subtitle">Board <code>{board_id}</code></div>
+              <p class="hero__hint">Tweak how your lights behave. Changes save straight into the board payload API.</p>
+            </div>
+            <div class="hero__links"><a href="/login">Switch board</a></div>
+          </div>
 
-          <h3>Brightness</h3>
-          <input type="range" min="0" max="255" name="brightness" value="{b}" />
+          <form id="settingsForm" method="post" action="/board/{board_id}">
+            <section class="card">
+              <div class="section-head">
+                <h3>Display Mode</h3>
+                <span class="tag">Live vs Animation</span>
+              </div>
+              <div class="mode-options">
+                <label class="option">
+                  <input type="radio" name="mode" value="live" {'checked' if mode=='live' else ''} />
+                  <div>
+                    <div><strong>Live trains</strong></div>
+                    <p class="muted">Use the network feed to light up stations.</p>
+                  </div>
+                </label>
+                <label class="option">
+                  <input type="radio" name="mode" value="animation" {'checked' if mode=='animation' else ''} />
+                  <div>
+                    <div><strong>Animation</strong></div>
+                    <p class="muted">Ignore live trains and play the configured effect.</p>
+                  </div>
+                </label>
+              </div>
+            </section>
 
-          <h3>Night Mode</h3>
-          <label>
-            <input type="checkbox" name="nm_enabled" {nm_enabled}> Enable night mode
-          </label><br>
-          <label>Start: <input type="time" name="nm_start" value="{nm_start}"></label><br>
-          <label>End: <input type="time" name="nm_end" value="{nm_end}"></label><br>
-          <label>Action:
-            <select name="nm_action">
-              <option value="off" {"selected" if nm_action=="off" else ""}>Turn off</option>
-              <option value="dim" {"selected" if nm_action=="dim" else ""}>Dim</option>
-            </select>
-          </label><br>
-          <label>Night brightness:
-            <input type="number" name="nm_dim" min="0" max="255" value="{nm_dim}">
-          </label>
+            <section class="card">
+              <div class="section-head">
+                <h3>Brightness</h3>
+                <span class="tag">0–255</span>
+              </div>
+              <div class="slider-row">
+                <input id="brightness" type="range" min="0" max="255" name="brightness" value="{b}" />
+                <div class="pill" id="brightnessValue">{b}</div>
+              </div>
+              <p class="note">Applies to the entire board; night mode can override this later.</p>
+            </section>
 
-          <h3>Animation</h3>
-          <label>Name:
-            <select name="an_name">
-              <option value="pulse" {"selected" if an_name=="pulse" else ""}>Pulse</option>
-              <option value="rainbow" {"selected" if an_name=="rainbow" else ""}>Rainbow</option>
-            </select>
-          </label><br>
-          <label>Speed:
-            <input type="number" name="an_speed" value="{an_speed}">
-          </label><br>
-          <label>Colour:
-            <input type="color" name="an_color" value="{an_color_hex}">
-          </label><br><br>
+            <section class="card">
+              <div class="section-head">
+                <h3>Night Mode</h3>
+                <span class="tag">Schedule</span>
+              </div>
+              <label class="option" style="margin-top: 6px;">
+                <input id="nm_enabled" type="checkbox" name="nm_enabled" {nm_enabled} />
+                <div>
+                  <div><strong>Enable night mode</strong></div>
+                  <p class="muted" id="nightStatus">11:00 PM → 06:00 AM · Turn off</p>
+                </div>
+              </label>
+              <div class="two-col" style="margin-top: 12px;">
+                <label class="field">Start time (e.g., 11:00 PM)
+                  <input data-night-field type="time" name="nm_start" value="{nm_start}" />
+                </label>
+                <label class="field">End time (e.g., 06:00 AM)
+                  <input data-night-field type="time" name="nm_end" value="{nm_end}" />
+                </label>
+              </div>
+              <div class="two-col" style="margin-top: 10px;">
+                <label class="field">Action
+                  <select data-night-field name="nm_action" id="nm_action">
+                    <option value="off" {"selected" if nm_action=="off" else ""}>Turn off</option>
+                    <option value="dim" {"selected" if nm_action=="dim" else ""}>Dim</option>
+                  </select>
+                </label>
+                <label class="field">Night brightness
+                  <input data-night-field type="number" name="nm_dim" min="0" max="255" value="{nm_dim}" />
+                </label>
+              </div>
+            </section>
 
-          <button type="submit">Save</button>
-        </form>
+            <section class="card">
+              <div class="section-head">
+                <h3>Animation</h3>
+                <span class="tag" id="animationTag">Mode: {an_name.title()}</span>
+              </div>
+              <div class="row">
+                <label class="field">Name
+                  <select name="an_name" id="an_name">
+                    <option value="pulse" {"selected" if an_name=="pulse" else ""}>Pulse</option>
+                    <option value="rainbow" {"selected" if an_name=="rainbow" else ""}>Rainbow</option>
+                  </select>
+                </label>
+                <label class="field">Speed
+                  <input type="number" name="an_speed" value="{an_speed}" />
+                </label>
+                <label class="field">Colour
+                  <input type="color" name="an_color" value="{an_color_hex}" />
+                </label>
+              </div>
+              <p class="note">Animation settings are used when the board is in Animation mode.</p>
+            </section>
 
-        <p><a href="/login">Back</a></p>
+            <section class="card api-card">
+              <div class="section-head">
+                <h3>Board payload API</h3>
+                <span class="tag">For firmware</span>
+              </div>
+              <p class="muted">Fetch the current settings and state in one call:</p>
+              <p><code>/board_payload?board_id={board_id}</code></p>
+              <p class="note">Supports <code>?only=Station1,Station2</code> to limit the states payload.</p>
+            </section>
+
+            <button class="primary" type="submit">Save settings</button>
+          </form>
+        </main>
+
+        <script>
+          (function() {{
+            const brightness = document.getElementById("brightness");
+            const brightnessValue = document.getElementById("brightnessValue");
+            const nmToggle = document.getElementById("nm_enabled");
+            const nightFields = document.querySelectorAll("[data-night-field]");
+            const nightStatus = document.getElementById("nightStatus");
+            const nmAction = document.getElementById("nm_action");
+            const startEl = document.querySelector('input[name="nm_start"]');
+            const endEl = document.querySelector('input[name="nm_end"]');
+            const anName = document.getElementById("an_name");
+
+            const syncBrightness = () => brightnessValue.textContent = brightness.value;
+            brightness.addEventListener("input", syncBrightness);
+            syncBrightness();
+
+            const formatTime = (v) => {{
+              if (!v || !v.includes(":")) return v || "—";
+              const [h, m] = v.split(":");
+              const hr = parseInt(h, 10);
+              const suffix = hr >= 12 ? "PM" : "AM";
+              const hour12 = ((hr + 11) % 12) + 1;
+              return `${{hour12}}:${{m}} ${{suffix}}`;
+            }};
+
+            const syncNight = () => {{
+              const on = nmToggle.checked;
+              nightFields.forEach(el => el.disabled = !on);
+              const action = nmAction.value === "off" ? "Turn off" : "Dim to " + (document.querySelector('input[name="nm_dim"]').value || "20");
+              nightStatus.textContent = on
+                ? `${{formatTime(startEl.value)}} → ${{formatTime(endEl.value)}} · ${{action}}`
+                : "Disabled";
+            }};
+            nmToggle.addEventListener("change", syncNight);
+            nightFields.forEach(el => el.addEventListener("input", syncNight));
+            syncNight();
+
+            const animationTag = document.getElementById("animationTag");
+            const syncAnimationTag = () => {{
+              if (animationTag) animationTag.textContent = "Mode: " + (anName.options[anName.selectedIndex]?.textContent || anName.value);
+            }};
+            anName.addEventListener("change", syncAnimationTag);
+            syncAnimationTag();
+          }})();
+        </script>
       </body>
     </html>
     """
@@ -1091,16 +1351,94 @@ def trains():
         "sample_trains": out
     }
 
+def _as_no_store(resp: JSONResponse) -> JSONResponse:
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 @app.get("/board_settings")
 def board_settings_api(board_id: str = Query(...)):
     board_id = board_id.strip()
     if not board_id:
-        return JSONResponse({"error": "missing board_id"}, status_code=400)
+        return _as_no_store(JSONResponse({"error": "missing board_id"}, status_code=400))
     try:
         cfg = _get_or_create_board(board_id)
     except ValueError:
-        return JSONResponse({"error": "invalid board_id"}, status_code=400)
-    return JSONResponse(cfg)
+        return _as_no_store(JSONResponse({"error": "invalid board_id"}, status_code=400))
+    payload = dict(cfg)
+    payload["settings_version"] = BOARD_SETTINGS_VERSION
+    return _as_no_store(JSONResponse(payload))
+
+
+def _station_subset(only: T.Optional[str]) -> dict[str, dict]:
+    subset = STATION_INDEX
+    if only:
+        wanted = [x.strip() for x in only.split(",") if x.strip()]
+        subset = {n: STATION_INDEX[n] for n in wanted if n in STATION_INDEX}
+    return subset
+
+
+def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
+    if not subset:
+        return {}
+
+    feed, _ = fetch_vp_cached()
+    trains, _by_route, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
+
+    if MB_VERBOSE:
+        vlog(f"processing trains={len(trains)} stations={len(subset)}")
+
+    if not trains:
+        return {k: 0 for k in subset.keys()}
+
+    VP_INCOMING = rt.VehiclePosition.INCOMING_AT
+    VP_STOPPED = rt.VehiclePosition.STOPPED_AT
+
+    out: dict[str, int] = {}
+    matches = 0
+    dist_fb = 0
+
+    for name, meta in subset.items():
+        pid = meta["stop_id"]
+        slat, slon = meta["lat"], meta["lon"]
+        station_route = (meta.get("route_short") or "").upper()
+
+        best = 0
+        best_d = None
+
+        for (tlat, tlon, train_route, child_sid, st) in trains:
+            if train_route is not None and train_route != station_route:
+                continue
+
+            if not MB_FORCE_DISTANCE and child_sid:
+                parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
+                if parent == pid:
+                    if st == VP_STOPPED:
+                        best = 3
+                        matches += 1
+                        break
+                    elif st == VP_INCOMING:
+                        best = max(best, 2)
+                        matches += 1
+
+            if best < 3 and tlat is not None and tlon is not None:
+                d = hav_m(slat, slon, tlat, tlon)
+                if best_d is None or d < best_d:
+                    best_d = d
+
+        if best == 0 and best_d is not None:
+            best = status_from_dist(best_d)
+            if best > 0:
+                dist_fb += 1
+
+        out[name] = best
+
+    if MB_VERBOSE:
+        act = sum(1 for v in out.values() if v > 0)
+        vlog(f"result active={act}/{len(subset)} matches={matches} distance_fb={dist_fb}")
+
+    return out
+
 
 @app.get("/stations")
 def stations():
@@ -1118,80 +1456,46 @@ def states(
     """
     if board_id is not None:
         board_id = board_id.strip()
-        if not board_id or board_id not in BOARD_SETTINGS:
+        if not board_id:
             return JSONResponse({"error": "unknown board_id"}, status_code=403)
+        if board_id not in BOARD_SETTINGS:
+            # auto-create so firmware can come online without a prior UI save
+            _get_or_create_board(board_id)
         # You *could* read mode here and e.g. short-circuit if mode=="animation".
 
-    subset = STATION_INDEX
+    subset = _station_subset(only)
+    if only and not subset:
+        return JSONResponse({})
 
-    if only:
-        wanted = [x.strip() for x in only.split(",") if x.strip()]
-        subset = {n: STATION_INDEX[n] for n in wanted if n in STATION_INDEX}
-        if not subset:
-            return JSONResponse({})
+    return JSONResponse(_calculate_states_for_subset(subset))
 
-    feed, _ = fetch_vp_cached()
-    trains, _by_route, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
 
-    if MB_VERBOSE:
-        vlog(f"processing trains={len(trains)} stations={len(subset)}")
+@app.get("/board_payload")
+def board_payload(
+    board_id: str = Query(..., description="Board ID (5-char code)"),
+    only: T.Optional[str] = Query(None, description="Comma-separated station names"),
+):
+    board_id = board_id.strip()
+    if not board_id:
+        return _as_no_store(JSONResponse({"error": "missing board_id"}, status_code=400))
+    try:
+        cfg = _get_or_create_board(board_id)
+    except ValueError:
+        return _as_no_store(JSONResponse({"error": "invalid board_id"}, status_code=400))
 
-    if not trains:
-        return JSONResponse({k: 0 for k in subset.keys()})
+    subset = _station_subset(only)
+    states_payload = _calculate_states_for_subset(subset)
 
-    VP_INCOMING = rt.VehiclePosition.INCOMING_AT
-    VP_STOPPED  = rt.VehiclePosition.STOPPED_AT
-
-    out: dict[str, int] = {}
-    matches = 0
-    dist_fb = 0
-
-    for name, meta in subset.items():
-        pid = meta["stop_id"]
-        slat, slon = meta["lat"], meta["lon"]
-        # THIS IS THE KEY FIX: Each station has its specific route_short
-        station_route = (meta.get("route_short") or "").upper()
-
-        best = 0
-        best_d = None
-
-        # CRITICAL: Only look at trains that match THIS station's route
-        for (tlat, tlon, train_route, child_sid, st) in trains:
-            # SKIP trains that don't match this station's route
-            # Allow None train_route to fall through to distance-only matching
-            if train_route is not None and train_route != station_route:
-                continue
-
-            # VP match first (unless forced distance)
-            if not MB_FORCE_DISTANCE and child_sid:
-                parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
-                if parent == pid:
-                    if st == VP_STOPPED:
-                        best = 3
-                        matches += 1
-                        break
-                    elif st == VP_INCOMING:
-                        best = max(best, 2)
-                        matches += 1
-
-            # Distance fallback (only for trains on the correct route or unknown route)
-            if best < 3 and tlat is not None and tlon is not None:
-                d = hav_m(slat, slon, tlat, tlon)
-                if best_d is None or d < best_d:
-                    best_d = d
-
-        if best == 0 and best_d is not None:
-            best = status_from_dist(best_d)
-            if best > 0:
-                dist_fb += 1
-
-        out[name] = best
-
-    if MB_VERBOSE:
-        act = sum(1 for v in out.values() if v > 0)
-        vlog(f"result active={act}/{len(subset)} matches={matches} distance_fb={dist_fb}")
-
-    return JSONResponse(out)
+    return _as_no_store(JSONResponse({
+        "board_id": board_id,
+        "mode": cfg.get("mode", "live"),
+        "brightness": cfg.get("brightness", 160),
+        "night_mode": cfg.get("night_mode", {}),
+        "animation": cfg.get("animation", {}),
+        "states": states_payload,
+        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+        "settings_version": BOARD_SETTINGS_VERSION,
+    }))
 
 # ---------------- run (dev) ----------------
 if __name__ == "__main__":
