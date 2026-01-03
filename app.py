@@ -394,6 +394,8 @@ def require_allowed_pairs(
     agencies_allowed: set[str] = AGENCY_NAME_ALLOW,
     route_short_allow: set[str] = ROUTE_SHORT_ALLOW,
     allowed_parents_for_fallback: T.Optional[set[str]] = None,
+    station_route_pairs: T.Optional[dict[str, set[str]]] = None,
+    station_route_pairs_path: str = "station_line_pairs.csv",
 ) -> set[tuple[str, str]]:
     ag_name: dict[str, str] = {}
     with open(agency, encoding="utf-8-sig") as f:
@@ -466,6 +468,28 @@ def require_allowed_pairs(
         vlog(f"pairs strict: {len(pairs)}")
         return pairs
 
+    if allowed_parents_for_fallback is None:
+        allowed_parents_for_fallback = {
+            sid
+            for sid, row in stops_map.items()
+            if (row.get("location_type") or "0").strip() == "1" and is_num_parent(sid)
+        }
+
+    # Prefer curated station_line_pairs data over the fully permissive fan-out.
+    if station_route_pairs is None and station_route_pairs_path:
+        station_route_pairs = load_station_route_pairs(station_route_pairs_path)
+
+    if station_route_pairs:
+        curated = {
+            (pid, rs)
+            for pid, routes in station_route_pairs.items()
+            if pid in allowed_parents_for_fallback
+            for rs in routes
+        }
+        if curated:
+            vlog(f"pairs via station_line_pairs: {len(curated)} (filtered to allowed parents)")
+            return curated
+
     # permissive fallback
     if os.getenv("MB_PERMISSIVE_PAIRS", "1") != "0":
         known = _known_tm(route_id_to_short)
@@ -474,11 +498,6 @@ def require_allowed_pairs(
         if not known:
             vlog("WARN: no T*/M* for fallback")
             return set()
-        if not allowed_parents_for_fallback:
-            allowed_parents_for_fallback = {
-                sid for sid, row in stops_map.items()
-                if (row.get("location_type") or "0").strip() == "1" and is_num_parent(sid)
-            }
         fan = {(pid, rs) for pid in allowed_parents_for_fallback for rs in known}
         vlog(f"pairs fallback: {len(fan)}")
         return fan
@@ -839,6 +858,10 @@ def _startup():
 
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
 
+    # Load curated station→route mappings early so both route inference and
+    # allowed-pair derivation can reuse the same source of truth.
+    STATION_ROUTE_PAIRS = load_station_route_pairs("station_line_pairs.csv")
+
     allowed_parents = require_allowed_parents(
         stops="stops.txt",
         routes="routes.txt",
@@ -860,6 +883,8 @@ def _startup():
         agencies_allowed=AGENCY_NAME_ALLOW,
         route_short_allow=ROUTE_SHORT_ALLOW,
         allowed_parents_for_fallback=allowed_parents,
+        station_route_pairs=STATION_ROUTE_PAIRS,
+        station_route_pairs_path="station_line_pairs.csv",
     )
 
     wl_path = os.getenv("STATION_WHITELIST_PATH", "stations_whitelist.txt")
@@ -875,9 +900,6 @@ def _startup():
     )
 
     CHILD_TO_PARENT = build_child_to_parent("stops.txt")
-    
-    # Load station->route mappings for route inference
-    STATION_ROUTE_PAIRS = load_station_route_pairs("station_line_pairs.csv")
 
     if not STATION_INDEX:
         raise RuntimeError("No stations after filtering")
