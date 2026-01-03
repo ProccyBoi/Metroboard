@@ -13,7 +13,7 @@ import csv
 import json
 import re
 import random
-from datetime import datetime, timezone
+from datetime import datetime
 import typing as T
 
 import requests
@@ -1456,11 +1456,8 @@ def states(
     """
     if board_id is not None:
         board_id = board_id.strip()
-        if not board_id:
+        if not board_id or board_id not in BOARD_SETTINGS:
             return JSONResponse({"error": "unknown board_id"}, status_code=403)
-        if board_id not in BOARD_SETTINGS:
-            # auto-create so firmware can come online without a prior UI save
-            _get_or_create_board(board_id)
         # You *could* read mode here and e.g. short-circuit if mode=="animation".
 
     subset = _station_subset(only)
@@ -1477,25 +1474,24 @@ def board_payload(
 ):
     board_id = board_id.strip()
     if not board_id:
-        return _as_no_store(JSONResponse({"error": "missing board_id"}, status_code=400))
+        return JSONResponse({"error": "missing board_id"}, status_code=400)
     try:
         cfg = _get_or_create_board(board_id)
     except ValueError:
-        return _as_no_store(JSONResponse({"error": "invalid board_id"}, status_code=400))
+        return JSONResponse({"error": "invalid board_id"}, status_code=400)
 
     subset = _station_subset(only)
     states_payload = _calculate_states_for_subset(subset)
 
-    return _as_no_store(JSONResponse({
+    return JSONResponse({
         "board_id": board_id,
         "mode": cfg.get("mode", "live"),
         "brightness": cfg.get("brightness", 160),
         "night_mode": cfg.get("night_mode", {}),
         "animation": cfg.get("animation", {}),
         "states": states_payload,
-        "generated_at": datetime.now(tz=timezone.utc).isoformat(),
-        "settings_version": BOARD_SETTINGS_VERSION,
-    }))
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    })
 
 # ---------------- run (dev) ----------------
 if __name__ == "__main__":
