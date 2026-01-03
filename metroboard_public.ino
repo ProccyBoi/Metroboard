@@ -446,7 +446,7 @@ size_t computeBatchEnd(size_t i){
   return j;
 }
 
-int fetchAllBatchesAndRenderOnce(){
+int fetchAllBatchesAndRenderOnce(bool allowRender){
   if (NB == 0) return 0;
 
   WiFiClientSecure client;
@@ -567,14 +567,16 @@ int fetchAllBatchesAndRenderOnce(){
 
     Serial.printf("[BATCH] HTTP %d  (%d bytes)\n", code, body.length());
 
-    delay(40);
+    delay(5);
     yield();
   }
 
-  if (ok > 0) {
-    repaintDirtyLinesAndDecayOnce();
-  } else {
-    renderAll();
+  if (allowRender) {
+    if (ok > 0) {
+      repaintDirtyLinesAndDecayOnce();
+    } else {
+      renderAll();
+    }
   }
 
   return ok;
@@ -582,6 +584,7 @@ int fetchAllBatchesAndRenderOnce(){
 
 // ===== setup / loop =====
 uint32_t lastPoll=0, pollInterval=POLL_MS_MIN;
+TaskHandle_t gPollTaskHandle = nullptr;
 
 void beginStrips(){
   statusStrip.begin(); statusStrip.setBrightness(gEffectiveBrightness);
@@ -597,38 +600,44 @@ void setup(){
   Serial.begin(115200); delay(150);
   Serial.println("\nMetroboard — Solid Station Mode (TTL, fixed colors, BRIGHTNESS=16, coalesced)");
   wifiConnect(); beginStrips(); buildBindings(); renderAll();
+
+  xTaskCreatePinnedToCore(
+    [](void*){
+      for(;;){
+        ensureWifi();
+
+        uint32_t now = millis();
+        if (gMode != "animation" && now - lastPoll >= pollInterval){
+          lastPoll = now;
+
+          statusStrip.setPixelColor(0, statusStrip.Color(0,80,0));
+          statusStrip.show();
+
+          int batches = fetchAllBatchesAndRenderOnce(true);
+
+          statusStrip.setPixelColor(0, statusStrip.Color(0,160,0));
+          statusStrip.show();
+
+          if(batches>0) pollInterval = POLL_MS_MIN;
+          else {
+            uint32_t next = pollInterval + 1500; if(next > POLL_MS_MAX) next = POLL_MS_MAX;
+            pollInterval = next;
+          }
+        } else if (gMode == "animation" && now - lastSettingsFetch >= SETTINGS_FETCH_MS) {
+          fetchAllBatchesAndRenderOnce(false); // refresh settings without stalling the animation render loop
+        }
+
+        vTaskDelay(10 / portTICK_PERIOD_MS);
+      }
+    },
+    "pollTask", 8192, nullptr, 1, &gPollTaskHandle, 0);
 }
 
 void loop(){
-  ensureWifi();
-
-  // Animation mode: no live polling, just effect
   if (gMode == "animation") {
     runAnimationStep();
     delay(20);
-    // Periodically refresh settings/version even in animation mode
-    if (millis() - lastSettingsFetch >= SETTINGS_FETCH_MS) {
-      fetchAllBatchesAndRenderOnce(); // will update settings_version/brightness/etc.
-    }
-    return;
-  }
-
-  // Live mode: poll states+settings together
-  if(millis()-lastPoll >= pollInterval){
-    lastPoll = millis();
-
-    statusStrip.setPixelColor(0, statusStrip.Color(0,80,0));
-    statusStrip.show();
-
-    int batches = fetchAllBatchesAndRenderOnce();
-
-    statusStrip.setPixelColor(0, statusStrip.Color(0,160,0));
-    statusStrip.show();
-
-    if(batches>0) pollInterval = POLL_MS_MIN;
-    else {
-      uint32_t next = pollInterval + 1500; if(next > POLL_MS_MAX) next = POLL_MS_MAX;
-      pollInterval = next;
-    }
+  } else {
+    delay(5); // LED updates handled by poll task; yield to keep watchdog happy
   }
 }
