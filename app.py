@@ -829,6 +829,7 @@ def _startup():
     BOARD_SETTINGS = _load_board_settings()
 
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
+    STATION_ROUTE_PAIRS = load_station_route_pairs("station_line_pairs.csv")
 
     allowed_parents = require_allowed_parents(
         stops="stops.txt",
@@ -841,17 +842,24 @@ def _startup():
         route_short_allow=ROUTE_SHORT_ALLOW,
     )
 
-    allowed_pairs = require_allowed_pairs(
-        stops="stops.txt",
-        routes="routes.txt",
-        trips="trips.txt",
-        stop_times="stop_times.txt",
-        agency="agency.txt",
-        types=(1, 2),
-        agencies_allowed=AGENCY_NAME_ALLOW,
-        route_short_allow=ROUTE_SHORT_ALLOW,
-        allowed_parents_for_fallback=allowed_parents,
-    )
+    if STATION_ROUTE_PAIRS:
+        allowed_parents |= set(STATION_ROUTE_PAIRS.keys())
+        allowed_pairs = {
+            (pid, rs) for pid, routes in STATION_ROUTE_PAIRS.items() for rs in routes
+        }
+        vlog(f"allowed_pairs from station_line_pairs: {len(allowed_pairs)} (stations={len(STATION_ROUTE_PAIRS)})")
+    else:
+        allowed_pairs = require_allowed_pairs(
+            stops="stops.txt",
+            routes="routes.txt",
+            trips="trips.txt",
+            stop_times="stop_times.txt",
+            agency="agency.txt",
+            types=(1, 2),
+            agencies_allowed=AGENCY_NAME_ALLOW,
+            route_short_allow=ROUTE_SHORT_ALLOW,
+            allowed_parents_for_fallback=allowed_parents,
+        )
 
     wl_path = os.getenv("STATION_WHITELIST_PATH", "stations_whitelist.txt")
     sid_w, name_w = load_whitelist(wl_path)
@@ -866,9 +874,6 @@ def _startup():
     )
 
     CHILD_TO_PARENT = build_child_to_parent("stops.txt")
-    
-    # Load station->route mappings for route inference
-    STATION_ROUTE_PAIRS = load_station_route_pairs("station_line_pairs.csv")
 
     if not STATION_INDEX:
         raise RuntimeError("No stations after filtering")
