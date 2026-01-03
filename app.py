@@ -59,6 +59,140 @@ CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN")
 MB_VERBOSE = os.getenv("MB_VERBOSE", "1") == "1"
 MB_FORCE_DISTANCE = os.getenv("MB_FORCE_DISTANCE", "0") == "1"
 
+# TfNSW Location Code → Parent Station Mapping
+# These location codes appear in GTFS-RT but not in stops.txt
+LOCATION_CODE_PATTERNS = {
+    # Pattern: (location_prefix, parent_station_id)
+    "Sydney.": {
+        "SY": "200060",      # Central Station
+        "St James": "200050",
+        "Town Hall": "200070",
+        "Wynyard": "200080",
+        "Circular Quay": "200020",
+        "Martin Place": "200030",
+        "Museum": "200040",
+        "Redfern": "201510",
+        "Macdonaldtown": "201520",
+    },
+    "Sydenham.": {
+        "SM": "204420",      # Sydenham (most SM codes)
+        "Redfern": "201510",
+        "Central": "200060",
+        "Erskineville": "204310",
+        "St Peters": "204410",
+        "Tempe": "204430",
+        "Wolli Creek": "220510",
+        "Arncliffe": "220520",
+        "Bondi": "202210",
+        "Edgecliff": "202710",
+        "Kings Cross": "201110",
+        "ES": "202710",      # Eastern Suburbs → Edgecliff
+        "IR": "201510",      # Illawarra/Redfern
+    },
+    "NorthShore.": {
+        "SH": "206010",      # North Shore → typically North Sydney
+        "NS": "206010",      # North Sydney
+        "Hornsby": "207720",
+        "St Leonards": "206520",
+        "Chatswood": "206710",
+        "Gordon": "207210",
+        "Waitara": "207710",
+        "Asquith": "207730",
+        "GN": "207210",      # Gordon
+    },
+    "Strathfield.": {
+        "ST": "213510",      # Strathfield
+        "Pennant Hills": "212020",
+        "Epping": "212110",
+        "EG": "212110",      # Epping
+        "Ashfield": "213110",
+        "Burwood": "213410",
+    },
+    "Lidcombe.": {
+        "ST": "214110",      # Lidcombe
+        "Parramatta": "215020",
+        "GE": "214240",      # Granville
+    },
+    "Blacktown.": {
+        "BN": "214810",      # Blacktown
+    },
+    "Mountains.": {
+        "M": "214810",       # Mountains → Blacktown area
+        "Penrith": "275010",
+        "Rooty Hill": "276610",
+    },
+    "Glenfield.": {
+        "GL": "216710",      # Glenfield
+        "Campbelltown": "256020",
+        "Macarthur": "256030",
+        "Liverpool": "217020",
+        "Leppington": "217933",
+        "Minto": "256610",
+        "Leumeah": "256010",
+        "LE": "217933",      # Leppington
+    },
+    "Liverpool.": {
+        "S": "217020",       # Liverpool
+        "Guildford": "216110",
+    },
+    "Sutherland.": {
+        "SC": "223210",      # Sutherland
+        "SW": "223330",      # Waterfall
+        "WL": "223330",      # Waterfall
+        "Cronulla": "223020",
+        "Waterfall": "223330",
+        "Heathcote": "223320",
+        "Woolooware": "223010",
+        "CA": "223020",      # Cronulla
+    },
+    "Hurstville.": {
+        "SM": "222010",      # Hurstville
+    },
+    "Ashfield.": {
+        "S": "213110",       # Ashfield
+        "L": "213410",       # Could be multiple stations
+        "ST": "213510",      # Strathfield
+    },
+    "SouthCoast.": {
+        "PKLA": None,        # South Coast Line - regional
+        "THRL": None,        # Thirroul area
+    },
+    "Hornsby.": {
+        "Hornsby": "207720",
+    },
+}
+
+def resolve_location_code(stop_id: str) -> T.Optional[str]:
+    """
+    Resolve TfNSW location codes to parent station IDs.
+    Examples:
+      "Sutherland.CA8/11 Loc" → "223020" (Cronulla)
+      "Sydenham.SM885BER" → "204420" (Sydenham)
+      "Sydney.SY510 Loc" → "200060" (Central)
+    """
+    if not stop_id or not isinstance(stop_id, str):
+        return None
+    
+    # Try each prefix pattern
+    for prefix, mappings in LOCATION_CODE_PATTERNS.items():
+        if not stop_id.startswith(prefix):
+            continue
+        
+        # Remove prefix to get the location part
+        location_part = stop_id[len(prefix):].upper()
+        
+        # Try exact matches first
+        for key, parent_id in mappings.items():
+            if key.upper() in location_part:
+                return parent_id
+        
+        # For code-based patterns (like "SM", "SY"), try prefix match
+        for key, parent_id in mappings.items():
+            if len(key) <= 3 and location_part.startswith(key.upper()):
+                return parent_id
+    
+    return None
+
 # BBox guardrail (None disables)
 DEFAULT_SYD_BBOX = (-34.2, 150.5, -33.4, 151.4)
 def _bbox_env() -> T.Optional[tuple[float, float, float, float]]:
@@ -580,7 +714,10 @@ def load_station_index(
 
 # ---------------- Child→Parent map for VP.stop_id resolution ----------------
 def build_child_to_parent(stops="stops.txt") -> dict[str, str]:
+    """Build child→parent map, including TfNSW location codes."""
     out: dict[str, str] = {}
+    
+    # First, load from stops.txt as before
     with open(stops, encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             sid = (r.get("stop_id") or "").strip()
@@ -590,8 +727,10 @@ def build_child_to_parent(stops="stops.txt") -> dict[str, str]:
                 out[sid] = pid
             if sid and lt == "1" and is_num_parent(sid):
                 out.setdefault(sid, sid)
-    vlog(f"child→parent: {len(out)}")
+    
+    vlog(f"child→parent from stops.txt: {len(out)}")
     return out
+
 
 # ---------------- GTFS-RT: fetch & parse ----------------
 _FEED_CACHE: T.Optional[rt.FeedMessage] = None
@@ -778,8 +917,17 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
 
         # Resolve stop_id to parent station ID early for use in disambiguation
         parent = None
-        if sid and STATION_ROUTE_PAIRS:
-            parent = CHILD_TO_PARENT.get(sid) or (sid if is_num_parent(sid) else None)
+        if sid:
+            # First try: CHILD_TO_PARENT mapping from stops.txt
+            parent = CHILD_TO_PARENT.get(sid)
+            
+            # Second try: Location code pattern matching
+            if not parent or not is_num_parent(parent):
+                parent = resolve_location_code(sid)
+            
+            # Third try: If it's already numeric, use as-is
+            if not parent and is_num_parent(sid):
+                parent = sid
 
         # METHOD 1: Use static GTFS route mapping (most reliable)
         rs = (route_id_to_short.get(rid, "") or "").upper()
