@@ -1008,6 +1008,13 @@ def _startup():
         agencies_allowed=AGENCY_NAME_ALLOW,
         route_short_allow=ROUTE_SHORT_ALLOW,
     )
+    
+    # Force include stations from station_line_pairs if they exist in stops.txt
+    # This ensures stations like Newtown appear for T1/T9 even if trains don't stop.
+    if STATION_ROUTE_PAIRS:
+        for pid in STATION_ROUTE_PAIRS.keys():
+            if is_num_parent(pid):
+                allowed_parents.add(pid)
 
     allowed_pairs = require_allowed_pairs(
         stops="stops.txt",
