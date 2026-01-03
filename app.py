@@ -892,7 +892,7 @@ def _startup():
 
     BOARD_SETTINGS = _load_board_settings()
 
-    station_route_pairs_path = os.getenv("STATION_LINE_PAIRS_PATH", "station_line_pairs.csv")
+    station_route_pairs_path = os.getenv("STATION_LINE_PAIRS_PATH", "station_line_pairs.txt")
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
 
     # Load curated station→route mappings early so both route inference and
