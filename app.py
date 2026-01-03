@@ -618,16 +618,25 @@ def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
     vlog("feed merged vehicles", total)
     return merged, 0.0
 
-def load_station_route_pairs(path: str = "station_line_pairs.csv") -> dict[str, set[str]]:
-    """Load parent_stop_id -> set of route_short from station_line_pairs.csv"""
+def load_station_route_pairs(path: str = "station_line_pairs.txt") -> dict[str, set[str]]:
+    """Load parent_stop_id -> set of route_short from station_line_pairs.txt (tab or comma)."""
     pairs: dict[str, set[str]] = {}
     if not os.path.exists(path):
         vlog(f"WARN: {path} not found, route inference will be limited")
         return pairs
     
     try:
-        with open(path, encoding="utf-8-sig") as f:
-            reader = csv.DictReader(f)
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            sample = f.read(1024)
+            f.seek(0)
+            # Support either comma or tab delimiters.
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",\t")
+                delimiter = dialect.delimiter
+            except Exception:
+                delimiter = "\t" if "\t" in sample else ","
+
+            reader = csv.DictReader(f, delimiter=delimiter)
             for row in reader:
                 pid = (row.get("parent_stop_id") or "").strip()
                 rs = (row.get("route_short") or "").strip().upper()
