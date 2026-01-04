@@ -63,11 +63,12 @@ String gMode = "live"; // "live" or "animation"
 
 struct NightModeCfg {
   bool enabled;
+  bool active;
   String start;   // "HH:MM"
   String end;
   String action;  // "off" or "dim"
   uint8_t dimLevel;
-} gNightMode = {false, "23:00", "06:00", "off", 20};
+} gNightMode = {false, false, "23:00", "06:00", "off", 20};
 
 struct AnimCfg {
   String name;   // "pulse", "rainbow", "bounce"
@@ -528,12 +529,15 @@ int fetchAllBatchesAndRenderOnce(bool allowRender){
 
       int b = root["brightness"] | 16;
       b = constrain(b, 0, 255);
+      int bEff = root["brightness_effective"] | b;
+      bEff = constrain(bEff, 0, 255);
       gBaseBrightness = b;
-      gEffectiveBrightness = gBaseBrightness; // adjust later if you add time-based dimming
+      gEffectiveBrightness = (uint8_t)bEff;
 
       JsonObject nm = root["night_mode"];
       if (!nm.isNull()) {
         gNightMode.enabled = nm["enabled"] | false;
+        gNightMode.active  = root["night_mode_active"] | false;
         gNightMode.start   = nm["start"]   | "23:00";
         gNightMode.end     = nm["end"]     | "06:00";
         gNightMode.action  = nm["action"]  | "off";
@@ -553,8 +557,8 @@ int fetchAllBatchesAndRenderOnce(bool allowRender){
       }
 
       settingsApplied = true;
-      Serial.printf("[CFG] ver=%u mode=%s bright=%u night=%d anim=%s\n",
-        ver, gMode.c_str(), gBaseBrightness, gNightMode.enabled, gAnim.name.c_str());
+      Serial.printf("[CFG] ver=%u mode=%s bright=%u eff=%u night=%d active=%d anim=%s\n",
+        ver, gMode.c_str(), gBaseBrightness, gEffectiveBrightness, gNightMode.enabled, gNightMode.active, gAnim.name.c_str());
     }
 
     // ----- Apply states -----
