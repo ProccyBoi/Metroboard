@@ -121,7 +121,7 @@ def _save_board_settings() -> None:
 def _default_board_settings(board_id: str) -> dict:
     return {
         "board_id": board_id,
-        "brightness": 160,
+        "brightness": 16,
         "mode": "live",  # "live" or "animation"
         "night_mode": {
             "enabled": False,
@@ -945,7 +945,7 @@ def board_settings_page(board_id: str):
     except ValueError:
         return HTMLResponse("Invalid board_id", status_code=400)
 
-    b = cfg.get("brightness", 160)
+    b = cfg.get("brightness", 16)
     mode = cfg.get("mode", "live")
     nm = cfg.get("night_mode", {}) or {}
     an = cfg.get("animation", {}) or {}
@@ -1275,7 +1275,7 @@ def board_settings_page(board_id: str):
 async def board_settings_save(
     board_id: str,
     mode: str = Form("live"),
-    brightness: int = Form(160),
+    brightness: int = Form(16),
     nm_enabled: T.Optional[str] = Form(None),
     nm_start: str = Form("23:00"),
     nm_end: str = Form("06:00"),
@@ -1508,7 +1508,7 @@ def board_payload(
     return JSONResponse({
         "board_id": board_id,
         "mode": cfg.get("mode", "live"),
-        "brightness": cfg.get("brightness", 160),
+        "brightness": cfg.get("brightness", 16),
         "night_mode": cfg.get("night_mode", {}),
         "animation": cfg.get("animation", {}),
         "states": states_payload,
