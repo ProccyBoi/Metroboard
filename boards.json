@@ -1,7 +1,7 @@
 {
   "AB12C": {
     "board_id": "AB12C",
-    "brightness": 160,
+    "brightness": 16,
     "mode": "live",
     "night_mode": {
       "enabled": false,
