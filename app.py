@@ -690,8 +690,10 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         "WOLLONGONG": ["SCO"],
         
         # Metro
+        "SM": ["M1"], 
         "SMNW": ["M1"],          # Sydney Metro Northwest
         "M1": ["M1"],            # Metro M1
+        "M": ["M1"],      # Catch generic "M" prefixes
         "METRO": ["M1"],
         
         # Other patterns
@@ -759,18 +761,37 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                     if MB_VERBOSE:
                         vlog(f"Disambiguated {rid} at {parent}: {candidates} -> {rs}")
                 elif possible:
-                    # Multiple matches, use heuristics
-                    if any(x in rid.upper() for x in ["AIR", "SHL", "APT", "ESS"]) and "T8" in possible:
+                    # Multiple matches - use better heuristics
+                    
+                    # Priority 1: T8 keywords (Airport/South)
+                    if any(x in rid.upper() for x in ["AIR", "SHL", "APT", "ESS", "AIRS"]) and "T8" in possible:
                         rs = "T8"
+                    
+                    # Priority 2: T9 keywords (North Shore express)
+                    elif any(x in rid.upper() for x in ["NSN", "NTH"]) and "T9" in possible and "T1" in possible:
+                        # Use hash of trip_id to distribute between T1 and T9
+                        # This gives consistent assignment per trip without needing to track history
+                        trip_hash = abs(hash(tripid or rid))
+                        # Roughly 60% T1 (stopping), 40% T9 (express) to match real-world distribution
+                        if trip_hash % 10 < 6:
+                            rs = "T1"
+                        else:
+                            rs = "T9"
+                    
+                    # Priority 3: Use trip_id/route_id hash for consistent distribution
                     else:
-                        rs = sorted(possible)[0]
+                        sorted_possible = sorted(possible)
+                        trip_hash = abs(hash(tripid or rid))
+                        rs = sorted_possible[trip_hash % len(sorted_possible)]
+                    
+                    if MB_VERBOSE and len(possible) > 1:
+                        vlog(f"Multi-route disambiguation {rid} at {parent}: {possible} -> {rs}")
                 else:
                     # None of the candidates serve this station - station data might be wrong
-                    # Fall back to hash-based selection
+                    # Fall back to hash-based selection from original candidates
                     rs = candidates[abs(hash(tripid or rid)) % len(candidates)]
             elif candidates:
                 rs = candidates[0] if len(candidates) == 1 else candidates[abs(hash(tripid or rid)) % len(candidates)]
-
         # METHOD 4: Infer from stop_id using station_line_pairs.csv
         # Only used as absolute last resort
         if not rs and parent and parent in STATION_ROUTE_PAIRS:
