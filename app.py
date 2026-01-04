@@ -13,7 +13,7 @@ import csv
 import json
 import re
 import random
-from datetime import datetime
+from datetime import datetime, time as dtime
 import typing as T
 
 import requests
@@ -23,6 +23,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from google.transit import gtfs_realtime_pb2 as rt
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - python <3.9 fallback
+    ZoneInfo = None
 
 # ---------------- Config ----------------
 API_TOKEN = os.getenv("TFNSW_API_TOKEN")
@@ -61,6 +65,7 @@ FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
 CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN")
 MB_VERBOSE = os.getenv("MB_VERBOSE", "1") == "1"
 MB_FORCE_DISTANCE = os.getenv("MB_FORCE_DISTANCE", "0") == "1"
+MB_TIMEZONE = os.getenv("MB_TIMEZONE", "Australia/Sydney")
 
 # BBox guardrail (None disables)
 DEFAULT_SYD_BBOX = (-34.2, 150.5, -33.4, 151.4)
@@ -117,6 +122,52 @@ def _save_board_settings() -> None:
             json.dump(BOARD_SETTINGS, f, indent=2, sort_keys=True)
     except Exception as e:
         vlog("WARN: failed to save boards.json:", e)
+
+def _now_local() -> datetime:
+    """Current time in configured timezone; falls back to UTC if TZ invalid/unavailable."""
+    if ZoneInfo is not None:
+        try:
+            return datetime.now(ZoneInfo(MB_TIMEZONE))
+        except Exception:
+            pass
+    return datetime.utcnow()
+
+def _parse_hhmm(s: str) -> T.Optional[dtime]:
+    try:
+        return datetime.strptime(s, "%H:%M").time()
+    except Exception:
+        return None
+
+def _night_mode_effect(brightness: int, nm: dict) -> tuple[int, bool]:
+    """
+    Returns (effective_brightness, active_flag) based on night-mode settings.
+    If parsing fails or disabled, returns (brightness, False).
+    """
+    if not nm or not nm.get("enabled"):
+        return brightness, False
+
+    start = _parse_hhmm(nm.get("start", ""))
+    end = _parse_hhmm(nm.get("end", ""))
+    if not start or not end:
+        return brightness, False
+
+    now_local = _now_local().time()
+    if start <= end:
+        active = start <= now_local < end
+    else:
+        # Window crosses midnight
+        active = now_local >= start or now_local < end
+
+    if not active:
+        return brightness, False
+
+    action = (nm.get("action") or "").lower()
+    dim_level = int(nm.get("dim_level", 0))
+    dim_level = max(0, min(255, dim_level))
+
+    if action == "off":
+        return 0, True
+    return dim_level, True
 
 def _default_board_settings(board_id: str) -> dict:
     return {
@@ -1505,13 +1556,20 @@ def board_payload(
     subset = _station_subset(only)
     states_payload = _calculate_states_for_subset(subset)
 
+    base_brightness = int(cfg.get("brightness", 16))
+    nm_cfg = cfg.get("night_mode", {}) or {}
+    effective_brightness, nm_active = _night_mode_effect(base_brightness, nm_cfg)
+
     return JSONResponse({
         "board_id": board_id,
         "mode": cfg.get("mode", "live"),
-        "brightness": cfg.get("brightness", 16),
-        "night_mode": cfg.get("night_mode", {}),
+        "brightness": base_brightness,
+        "brightness_effective": effective_brightness,
+        "night_mode": nm_cfg,
+        "night_mode_active": nm_active,
         "animation": cfg.get("animation", {}),
         "states": states_payload,
+        "settings_version": BOARD_SETTINGS_VERSION,
         "generated_at": datetime.utcnow().isoformat() + "Z",
     })
 

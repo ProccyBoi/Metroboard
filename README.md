@@ -18,6 +18,7 @@ Metroboard is a FastAPI service that turns the TfNSW GTFS Realtime vehicle posit
 * `CORS_ALLOW_ORIGIN` (comma-separated origins) ​:codex-file-citation[codex-file-citation]{line_range_start=56 line_range_end=60 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L56-L60"}​
 * `SYD_BBOX` or `SYD_BBOX_DISABLE` to tune/disable map bounding box guardrail ​:codex-file-citation[codex-file-citation]{line_range_start=62 line_range_end=77 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L62-L77"}​
 * `MB_VERBOSE` (default on) and `MB_FORCE_DISTANCE` (force distance-only matching) ​:codex-file-citation[codex-file-citation]{line_range_start=56 line_range_end=61 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L56-L61"}​
+* `MB_TIMEZONE` (IANA TZ name; defaults to `Australia/Sydney`) controls the clock used for night-mode windows. ​:codex-file-citation[codex-file-citation]{line_range_start=56 line_range_end=61 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L56-L61"}​
 
 ## Data loading at startup
 1. Load board settings from `boards.json`, creating defaults per board when needed. ​:codex-file-citation[codex-file-citation]{line_range_start=82 line_range_end=143 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L82-L143"}​​:codex-file-citation[codex-file-citation]{line_range_start=725 line_range_end=772 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L725-L772"}​
@@ -38,7 +39,7 @@ Metroboard is a FastAPI service that turns the TfNSW GTFS Realtime vehicle posit
 ## Board settings (optional web UI)
 * Minimal HTML at `/login` and `/board/{board_id}` to edit per-board brightness, mode (`live` vs `animation`), night-mode scheduling, and animation colour/speed; settings persist to `boards.json`. ​:codex-file-citation[codex-file-citation]{line_range_start=783 line_range_end=929 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L783-L929"}​
 * API access via `/board_settings?board_id=...` returns the JSON config for the given board. ​:codex-file-citation[codex-file-citation]{line_range_start=986 line_range_end=996 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L986-L996"}​
-* Firmware-friendly payload: `/board_payload?board_id=...` returns the settings (mode, brightness, night-mode window, animation) alongside the latest state map, with optional `?only=` filtering. ​:codex-file-citation[codex-file-citation]{line_range_start=1098 line_range_end=1143 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L1098-L1143"}​
+* Firmware-friendly payload: `/board_payload?board_id=...` returns the settings (mode, brightness, *effective* brightness after night-mode, night-mode window/state, animation) plus `settings_version`, alongside the latest state map; supports optional `?only=` filtering. ​:codex-file-citation[codex-file-citation]{line_range_start=1492 line_range_end=1516 path=app.py git_url="https://github.com/ProccyBoi/Metroboard/blob/main/app.py#L1492-L1516"}​
 
 ## Status codes for LEDs
 * `0` = off
