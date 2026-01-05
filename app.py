@@ -630,6 +630,52 @@ def build_child_to_parent(stops="stops.txt") -> dict[str, str]:
     vlog(f"child→parent: {len(out)}")
     return out
 
+def extract_station_name_from_stop_id(stop_id: str) -> T.Optional[str]:
+    """
+    Extract station name from TfNSW location-based stop_ids.
+    Examples:
+      "Blacktown.Seven Hills 2 Loc" -> "Seven Hills"
+      "NorthShore.Lindfield 3 Loc" -> "Lindfield"
+      "Sydney.Circular Quay 1 Loc" -> "Circular Quay"
+      "Glenfield.GFD Dn Ctn Exit Loc" -> None (code pattern)
+      "Lidcombe.AY997/548 Loc" -> None (code pattern)
+    """
+    if not stop_id or "." not in stop_id:
+        return None
+    
+    # Split on dot: "Area.StationInfo"
+    parts = stop_id.split(".", 1)
+    if len(parts) < 2:
+        return None
+    
+    station_part = parts[1].strip()
+    
+    # Remove common suffixes and numeric indicators
+    for suffix in [" Loc", " Entry", " Exit", " Dep", " Arr", " Dn", " Up", " Ctn"]:
+        station_part = station_part.replace(suffix, "")
+    
+    # Remove trailing numbers (platform indicators): " 1", " 2", etc.
+    station_part = re.sub(r'\s+\d+$', '', station_part)
+    
+    station_part = station_part.strip()
+    
+    # Skip if empty or too short
+    if len(station_part) < 3:
+        return None
+    
+    # Skip if it looks like a code (starts with 2-3 capital letters followed by numbers or special chars)
+    if re.match(r'^[A-Z]{2,3}[\d/]', station_part):
+        return None
+    
+    # Skip if it contains slashes with numbers (technical location codes)
+    if '/' in station_part and any(c.isdigit() for c in station_part):
+        return None
+    
+    # Clean up extra spaces
+    station_part = " ".join(station_part.split())
+    
+    return station_part if station_part else None
+
 # ---------------- GTFS-RT: fetch & parse ----------------
 _FEED_CACHE: T.Optional[rt.FeedMessage] = None
 _FEED_TS = 0.0
@@ -898,16 +944,18 @@ ROUTE_ID_TO_SHORT: dict[str, str] = {}
 STATION_INDEX: dict[str, dict] = {}
 CHILD_TO_PARENT: dict[str, str] = {}
 STATION_ROUTE_PAIRS: dict[str, set[str]] = {}
+STATION_NAME_TO_PARENT: dict[str, str] = {}
 
 @app.on_event("startup")
 def _startup():
-    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS, STATION_ROUTE_PAIRS
+    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS, STATION_ROUTE_PAIRS, STATION_NAME_TO_PARENT
 
     BOARD_SETTINGS = _load_board_settings()
 
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
     STATION_ROUTE_PAIRS = load_station_route_pairs("station_line_pairs.csv")
-
+    CHILD_TO_PARENT = build_child_to_parent("stops.txt")
+    
     allowed_parents = require_allowed_parents(
         stops="stops.txt",
         routes="routes.txt",
@@ -950,8 +998,15 @@ def _startup():
         allowed_pairs=allowed_pairs,
     )
 
-    CHILD_TO_PARENT = build_child_to_parent("stops.txt")
-
+    for key, meta in STATION_INDEX.items():
+        base_name = meta.get("base_name")
+        pid = meta.get("stop_id")
+        if base_name and pid:
+            # Store clean name without route suffix
+            STATION_NAME_TO_PARENT[base_name] = pid
+    
+    vlog(f"station_name→parent: {len(STATION_NAME_TO_PARENT)}")
+    
     if not STATION_INDEX:
         raise RuntimeError("No stations after filtering")
     vlog(f"stations loaded: {len(STATION_INDEX)}")
@@ -1470,6 +1525,7 @@ def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
     out: dict[str, int] = {}
     matches = 0
     dist_fb = 0
+    name_matches = 0  # NEW: track name-based matches
 
     for name, meta in subset.items():
         pid = meta["stop_id"]
@@ -1484,7 +1540,17 @@ def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
                 continue
 
             if not MB_FORCE_DISTANCE and child_sid:
+                # Try 1: Direct parent lookup (numeric GTFS stop_ids)
                 parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
+                
+                # Try 2: Extract station name from location-based stop_ids (TfNSW format)
+                if not parent or parent != pid:
+                    extracted_name = extract_station_name_from_stop_id(child_sid)
+                    if extracted_name:
+                        parent = STATION_NAME_TO_PARENT.get(extracted_name)
+                        if parent == pid:
+                            name_matches += 1
+                
                 if parent == pid:
                     if st == VP_STOPPED:
                         best = 3
@@ -1506,9 +1572,10 @@ def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
 
         out[name] = best
 
+
     if MB_VERBOSE:
         act = sum(1 for v in out.values() if v > 0)
-        vlog(f"result active={act}/{len(subset)} matches={matches} distance_fb={dist_fb}")
+        vlog(f"result active={act}/{len(subset)} matches={matches} (name_based={name_matches}) distance_fb={dist_fb}")
 
     return out
 
@@ -1572,6 +1639,30 @@ def board_payload(
         "settings_version": BOARD_SETTINGS_VERSION,
         "generated_at": datetime.utcnow().isoformat() + "Z",
     })
+
+@app.get("/debug_names")
+def debug_names():
+    """Debug endpoint to see name extraction from realtime stop_ids"""
+    feed, age = fetch_vp_cached()
+    trains, _, _ = collect_trains(feed, ROUTE_ID_TO_SHORT)
+    
+    extractions = []
+    for lat, lon, route, stop_id, status in trains[:50]:
+        if stop_id:
+            extracted = extract_station_name_from_stop_id(stop_id)
+            parent = STATION_NAME_TO_PARENT.get(extracted) if extracted else None
+            extractions.append({
+                "stop_id": stop_id,
+                "extracted_name": extracted,
+                "mapped_parent": parent,
+                "route": route
+            })
+    
+    return {
+        "name_to_parent_mapping_size": len(STATION_NAME_TO_PARENT),
+        "sample_mappings": list(STATION_NAME_TO_PARENT.items())[:20],
+        "extraction_samples": extractions
+    }
 
 # ---------------- run (dev) ----------------
 if __name__ == "__main__":
