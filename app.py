@@ -1211,6 +1211,54 @@ def board_settings_page(board_id: str):
             background: #0f1420;
             color: var(--text);
           }}
+          .color-picker {{
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 8px 12px;
+            border-radius: 12px;
+            border: 1px solid var(--border);
+            background: rgba(255,255,255,0.04);
+            cursor: pointer;
+          }}
+          .color-picker__input {{
+            width: 44px;
+            height: 36px;
+            padding: 0;
+            border: none;
+            background: transparent;
+            cursor: pointer;
+          }}
+          .color-picker__input::-webkit-color-swatch-wrapper {{
+            padding: 0;
+          }}
+          .color-picker__input::-webkit-color-swatch {{
+            border: 1px solid rgba(255,255,255,0.18);
+            border-radius: 10px;
+          }}
+          .color-picker__value {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            color: var(--text);
+            font-weight: 600;
+          }}
+          .color-picker__swatch {{
+            width: 18px;
+            height: 18px;
+            border-radius: 6px;
+            border: 1px solid rgba(255,255,255,0.2);
+            box-shadow: 0 0 8px rgba(0,0,0,0.4);
+          }}
+          .color-picker__cta {{
+            font-size: 12px;
+            font-weight: 600;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+          }}
           .mode-options {{
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
@@ -1378,7 +1426,14 @@ def board_settings_page(board_id: str):
                   <input type="number" name="an_speed" value="{an_speed}" />
                 </label>
                 <label class="field" id="pulseColorField">Pulse colour
-                  <input type="color" name="an_color" value="{an_color_hex}" />
+                  <div class="color-picker">
+                    <input class="color-picker__input" type="color" id="an_color" name="an_color" value="{an_color_hex}" />
+                    <span class="color-picker__value">
+                      <span class="color-picker__swatch" id="pulseColorSwatch" style="background: {an_color_hex};"></span>
+                      <span id="pulseColorValue">{an_color_hex}</span>
+                    </span>
+                    <span class="color-picker__cta">Change</span>
+                  </div>
                 </label>
               </div>
               <p class="note" id="pulseColorNote">Pulse is the only animation that uses the custom colour.</p>
@@ -1402,6 +1457,9 @@ def board_settings_page(board_id: str):
             const anName = document.getElementById("an_name");
             const pulseColorField = document.getElementById("pulseColorField");
             const pulseColorNote = document.getElementById("pulseColorNote");
+            const pulseColorInput = document.getElementById("an_color");
+            const pulseColorValue = document.getElementById("pulseColorValue");
+            const pulseColorSwatch = document.getElementById("pulseColorSwatch");
 
             const syncBrightness = () => brightnessValue.textContent = brightness.value;
             brightness.addEventListener("input", syncBrightness);
@@ -1424,6 +1482,14 @@ def board_settings_page(board_id: str):
                 ? `${{formatTime(startEl.value)}} → ${{formatTime(endEl.value)}} · ${{action}}`
                 : "Disabled";
             }};
+
+            const syncPulseColorValue = () => {{
+              if (!pulseColorInput) return;
+              const value = (pulseColorInput.value || "").toUpperCase();
+              if (pulseColorValue) pulseColorValue.textContent = value;
+              if (pulseColorSwatch) pulseColorSwatch.style.background = value;
+            }};
+            if (pulseColorInput) pulseColorInput.addEventListener("input", syncPulseColorValue);
             nmToggle.addEventListener("change", syncNight);
             nightFields.forEach(el => el.addEventListener("input", syncNight));
             syncNight();
@@ -1435,13 +1501,14 @@ def board_settings_page(board_id: str):
             anName.addEventListener("change", syncAnimationTag);
             syncAnimationTag();
 
-            const syncPulseColor = () => {{
+            const syncPulseVisibility = () => {{
               const isPulse = anName.value === "pulse";
               if (pulseColorField) pulseColorField.classList.toggle("hidden", !isPulse);
               if (pulseColorNote) pulseColorNote.classList.toggle("hidden", !isPulse);
             }};
-            anName.addEventListener("change", syncPulseColor);
-            syncPulseColor();
+            anName.addEventListener("change", syncPulseVisibility);
+            syncPulseVisibility();
+            syncPulseColorValue();
           }})();
         </script>
       </body>
