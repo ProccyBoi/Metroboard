@@ -1238,6 +1238,7 @@ def board_settings_page(board_id: str):
             font-size: 13px;
           }}
           .muted {{ color: var(--muted); font-size: 14px; margin: 0; }}
+          .hidden {{ display: none; }}
           .slider-row {{
             display: flex;
             align-items: center;
@@ -1376,10 +1377,11 @@ def board_settings_page(board_id: str):
                 <label class="field">Speed
                   <input type="number" name="an_speed" value="{an_speed}" />
                 </label>
-                <label class="field">Colour
+                <label class="field" id="pulseColorField">Pulse colour
                   <input type="color" name="an_color" value="{an_color_hex}" />
                 </label>
               </div>
+              <p class="note" id="pulseColorNote">Pulse is the only animation that uses the custom colour.</p>
               <p class="note">Animation settings are used when the board is in Animation mode.</p>
             </section>
 
@@ -1398,6 +1400,8 @@ def board_settings_page(board_id: str):
             const startEl = document.querySelector('input[name="nm_start"]');
             const endEl = document.querySelector('input[name="nm_end"]');
             const anName = document.getElementById("an_name");
+            const pulseColorField = document.getElementById("pulseColorField");
+            const pulseColorNote = document.getElementById("pulseColorNote");
 
             const syncBrightness = () => brightnessValue.textContent = brightness.value;
             brightness.addEventListener("input", syncBrightness);
@@ -1430,6 +1434,14 @@ def board_settings_page(board_id: str):
             }};
             anName.addEventListener("change", syncAnimationTag);
             syncAnimationTag();
+
+            const syncPulseColor = () => {{
+              const isPulse = anName.value === "pulse";
+              if (pulseColorField) pulseColorField.classList.toggle("hidden", !isPulse);
+              if (pulseColorNote) pulseColorNote.classList.toggle("hidden", !isPulse);
+            }};
+            anName.addEventListener("change", syncPulseColor);
+            syncPulseColor();
           }})();
         </script>
       </body>
