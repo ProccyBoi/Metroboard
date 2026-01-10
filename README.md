@@ -2,6 +2,10 @@
 
 Metroboard is a FastAPI service that converts Transport for NSW (TfNSW) GTFS-Realtime vehicle positions into simple per-station LED status states for Sydney Trains and Metro boards. It filters the static GTFS feed to rail/metro routes, builds station+line keys (for example `Epping9` or `Central1`), and exposes JSON endpoints plus a minimal web UI for board settings.
 
+## 🔧 **Board settings (edit here)**
+**Use this link to modify board settings:**  
+**https://damp-catlin-metroboard-7be2a3b3.koyeb.app/login**
+
 ## Features
 - Real-time station status from GTFS-Realtime feeds (Sydney Trains + Metro by default).
 - Static GTFS filtering to rail/metro routes (route types 1 and 2) with optional allowlists.
