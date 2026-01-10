@@ -1205,6 +1205,11 @@ def board_settings_page(board_id: str):
             padding: 10px 12px;
             font-size: 15px;
             outline: none;
+            color-scheme: dark;
+          }}
+          label.field select option {{
+            background: #0f1420;
+            color: var(--text);
           }}
           .mode-options {{
             display: grid;
@@ -1273,7 +1278,7 @@ def board_settings_page(board_id: str):
             <div>
               <div class="hero__title">Metroboard</div>
               <div class="hero__subtitle">Board <code>{board_id}</code></div>
-              <p class="hero__hint">Tweak how your lights behave. Changes save straight into the board payload API.</p>
+              <p class="hero__hint">Tweak how your lights behave and save updates to the board.</p>
               <div class="hero__badge">Metro network · Live sync</div>
             </div>
             <div class="hero__links"><a href="/login">Switch board</a></div>
@@ -1376,16 +1381,6 @@ def board_settings_page(board_id: str):
                 </label>
               </div>
               <p class="note">Animation settings are used when the board is in Animation mode.</p>
-            </section>
-
-            <section class="card api-card">
-              <div class="section-head">
-                <h3>Board payload API</h3>
-                <span class="tag">For firmware</span>
-              </div>
-              <p class="muted">Fetch the current settings and state in one call:</p>
-              <p><code>/board_payload?board_id={board_id}</code></p>
-              <p class="note">Supports <code>?only=Station1,Station2</code> to limit the states payload.</p>
             </section>
 
             <button class="primary" type="submit">Save settings</button>
