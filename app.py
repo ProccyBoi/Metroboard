@@ -639,7 +639,6 @@ def extract_station_name_from_stop_id(stop_id: str) -> T.Optional[str]:
       "Sydney.Circular Quay 1 Loc" -> "Circular Quay"
       "Glenfield.GFD Dn Ctn Exit Loc" -> None (code pattern)
       "Lidcombe.AY997/548 Loc" -> None (code pattern)
-      "Strathfield.TH18 Loc" -> None (code pattern)
     """
     if not stop_id or "." not in stop_id:
         return None
@@ -651,12 +650,12 @@ def extract_station_name_from_stop_id(stop_id: str) -> T.Optional[str]:
     
     station_part = parts[1].strip()
     
-    # Remove common suffixes (do this BEFORE checking for codes)
-    for suffix in [" Loc", "LOC", " Entry", " Exit", "BER", "BT", "DT", " Dep", " Arr", " Dn", " Up", " Ctn", " Exit"]:
+    # Remove common suffixes and numeric indicators
+    for suffix in [" Loc", " Entry", " Exit", " Dep", " Arr", " Dn", " Up", " Ctn"]:
         station_part = station_part.replace(suffix, "")
     
     # Remove trailing numbers (platform indicators): " 1", " 2", etc.
-    station_part = re.sub(r'\s+\d+
+    station_part = re.sub(r'\s+\d+$', '', station_part)
     
     station_part = station_part.strip()
     
@@ -763,11 +762,11 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         "NTH": ["T1", "T9"],     # North Shore Line
         "WST": ["T1"],           # Western Line  
         "APS": ["T8"],           # Airport & South Line - FIXED! Was wrongly T1/T9
-        "IWL": ["T2", "T4"],     # Inner West & Leppington
+        "CTY": ["T2"],           # Inner West & Leppington
+        "IWL": ["T2", "T4"],     # Inner West (can be T2 or T4)
         "LPP": ["T2"],           # Leppington specific
         "T2": ["T2"],            # Direct T2 code
         "T3": ["T3"],            # Bankstown Line
-        "IWL": ["T4"],           # Illawarra Line (via Illawarra)
         "ESI": ["T4"],           # Eastern Suburbs & Illawarra
         "CMB": ["T5"],           # Cumberland Line
         "RTTA": ["T6"],          # Carlingford/Lidcombe
@@ -1525,7 +1524,7 @@ def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
     VP_INCOMING = rt.VehiclePosition.INCOMING_AT
     VP_STOPPED = rt.VehiclePosition.STOPPED_AT
 
-        out: dict[str, int] = {}
+    out: dict[str, int] = {}
     matches = 0
     dist_fb = 0
     name_matches = 0  # NEW: track name-based matches
@@ -1574,6 +1573,7 @@ def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
                 dist_fb += 1
 
         out[name] = best
+
 
     if MB_VERBOSE:
         act = sum(1 for v in out.values() if v > 0)
