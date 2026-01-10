@@ -1078,21 +1078,40 @@ def board_settings_page(board_id: str):
         <style>
           :root {{
             color-scheme: light dark;
-            --bg: #0e1116;
-            --panel: #161b22;
-            --border: #2b3340;
+            --bg: #0b0e14;
+            --panel: #131923;
+            --border: #263042;
             --accent: #ff6b3d;
-            --muted: #7a8699;
-            --text: #e8edf4;
-            --shadow: 0 10px 40px rgba(0,0,0,0.35);
+            --muted: #8a96a8;
+            --text: #edf2f7;
+            --shadow: 0 18px 40px rgba(4, 8, 16, 0.45);
+            --line-blue: #2f80ed;
+            --line-green: #27ae60;
+            --line-red: #eb5757;
+            --line-yellow: #f2c94c;
+            --line-purple: #9b51e0;
           }}
           * {{ box-sizing: border-box; }}
           body {{
             margin: 0;
             font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
-            background: linear-gradient(145deg, #0a0d12 0%, #131926 100%);
+            background:
+              radial-gradient(circle at top, rgba(47,128,237,0.18), transparent 50%),
+              radial-gradient(circle at 20% 20%, rgba(155,81,224,0.16), transparent 55%),
+              linear-gradient(145deg, #0a0e16 0%, #131a29 100%);
             color: var(--text);
             min-height: 100vh;
+          }}
+          body::before {{
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image:
+              linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
+              linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px);
+            background-size: 24px 24px;
+            opacity: 0.4;
           }}
           a {{ color: var(--accent); }}
           main.page {{
@@ -1107,9 +1126,42 @@ def board_settings_page(board_id: str):
             gap: 12px;
             margin-bottom: 16px;
           }}
-          .hero__title {{ font-size: 28px; font-weight: 700; }}
+          .hero__title {{
+            font-size: 32px;
+            font-weight: 700;
+            letter-spacing: 0.4px;
+          }}
           .hero__subtitle {{ color: var(--muted); margin-top: 4px; }}
           .hero__hint {{ margin: 8px 0 0; color: var(--muted); }}
+          .hero__badge {{
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            margin-top: 10px;
+            padding: 6px 12px;
+            border-radius: 999px;
+            background: rgba(47,128,237,0.2);
+            border: 1px solid rgba(47,128,237,0.35);
+            color: #b9d7ff;
+            font-size: 13px;
+            font-weight: 600;
+          }}
+          .metro-strip {{
+            display: flex;
+            gap: 8px;
+            margin: 18px 0 6px;
+          }}
+          .metro-strip span {{
+            flex: 1;
+            height: 6px;
+            border-radius: 999px;
+            box-shadow: 0 0 12px rgba(255,255,255,0.12);
+          }}
+          .metro-strip .line-blue {{ background: linear-gradient(90deg, rgba(47,128,237,0.6), var(--line-blue)); }}
+          .metro-strip .line-green {{ background: linear-gradient(90deg, rgba(39,174,96,0.5), var(--line-green)); }}
+          .metro-strip .line-red {{ background: linear-gradient(90deg, rgba(235,87,87,0.5), var(--line-red)); }}
+          .metro-strip .line-yellow {{ background: linear-gradient(90deg, rgba(242,201,76,0.5), var(--line-yellow)); }}
+          .metro-strip .line-purple {{ background: linear-gradient(90deg, rgba(155,81,224,0.5), var(--line-purple)); }}
           .card {{
             background: var(--panel);
             border: 1px solid var(--border);
@@ -1167,7 +1219,7 @@ def board_settings_page(board_id: str):
             display: flex;
             gap: 10px;
             align-items: center;
-            background: rgba(255,255,255,0.03);
+            background: rgba(255,255,255,0.02);
           }}
           .pill {{
             display: inline-flex;
@@ -1203,7 +1255,10 @@ def board_settings_page(board_id: str):
             cursor: pointer;
             box-shadow: 0 12px 30px rgba(255,107,61,0.35);
           }}
-          button.primary:hover {{ transform: translateY(-1px); }}
+          button.primary:hover {{
+            transform: translateY(-1px);
+            box-shadow: 0 16px 32px rgba(255,107,61,0.4);
+          }}
           .two-col {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }}
           .status {{ color: #a8ffce; font-weight: 600; font-size: 14px; }}
           .api-card code {{ background: rgba(255,255,255,0.06); padding: 3px 6px; border-radius: 6px; }}
@@ -1219,8 +1274,16 @@ def board_settings_page(board_id: str):
               <div class="hero__title">Metroboard</div>
               <div class="hero__subtitle">Board <code>{board_id}</code></div>
               <p class="hero__hint">Tweak how your lights behave. Changes save straight into the board payload API.</p>
+              <div class="hero__badge">Metro network · Live sync</div>
             </div>
             <div class="hero__links"><a href="/login">Switch board</a></div>
+          </div>
+          <div class="metro-strip" aria-hidden="true">
+            <span class="line-blue"></span>
+            <span class="line-green"></span>
+            <span class="line-red"></span>
+            <span class="line-yellow"></span>
+            <span class="line-purple"></span>
           </div>
 
           <form id="settingsForm" method="post" action="/board/{board_id}">
