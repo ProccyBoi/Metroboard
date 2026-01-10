@@ -1043,6 +1043,8 @@ async def login_post(board_id: str = Form(...)):
     board_id = board_id.strip()
     if not board_id:
         return RedirectResponse("/login", status_code=303)
+    if board_id not in BOARD_SETTINGS:
+        return HTMLResponse("Board ID not found", status_code=404)
     return RedirectResponse(f"/board/{board_id}", status_code=303)
 
 
