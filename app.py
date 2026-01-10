@@ -1327,8 +1327,8 @@ def board_settings_page(board_id: str):
             <div>
               <div class="hero__title">Metroboard</div>
               <div class="hero__subtitle">Board <code>{board_id}</code></div>
-              <p class="hero__hint">Tweak how your lights behave and save updates to the board.</p>
-              <div class="hero__badge">Metro network · Live sync</div>
+              <p class="hero__hint">Change how your lights behave and save updates to the board.</p>
+              <div class="hero__badge">Train + Metro network · Live sync</div>
             </div>
             <div class="hero__links"><a href="/login">Switch board</a></div>
           </div>
