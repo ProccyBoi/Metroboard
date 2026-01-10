@@ -7,14 +7,18 @@
 #include <WiFiClientSecure.h>
 #include <time.h>
 
+// =========================================
 // ===== User configuration (required) =====
+// =========================================
 // Replace the values below with your own WiFi credentials and unique board ID.
 // These are the ONLY values you should edit before deployment.
 #define WIFI_SSID "YOUR_WIFI_SSID"
 #define WIFI_PASS "YOUR_WIFI_PASSWORD"
-
-// NOTE: Use board_payload for combined settings + states.
 static const char *kBoardId = "YOUR_BOARD_ID";
+// =========================================
+// =========================================
+// =========================================
+
 static const char *kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
 
