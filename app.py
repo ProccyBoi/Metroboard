@@ -763,7 +763,9 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         "NTH": ["T1", "T9"],     # North Shore Line
         "WST": ["T1"],           # Western Line  
         "APS": ["T8"],           # Airport & South Line - FIXED! Was wrongly T1/T9
-        "CTY": ["T2"],           # Inner West & Leppington
+        "IWL": ["T2", "T4"],     # Inner West & Leppington
+        "LPP": ["T2"],           # Leppington specific
+        "T2": ["T2"],            # Direct T2 code
         "T3": ["T3"],            # Bankstown Line
         "IWL": ["T4"],           # Illawarra Line (via Illawarra)
         "ESI": ["T4"],           # Eastern Suburbs & Illawarra
