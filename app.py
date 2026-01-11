@@ -1049,15 +1049,162 @@ def healthz():
 @app.get("/login", response_class=HTMLResponse)
 def login_get():
     return """
+    <!DOCTYPE html>
     <html>
-      <head><title>Metroboard Login</title></head>
+      <head>
+        <meta charset="utf-8" />
+        <title>Metroboard Login</title>
+        <style>
+          :root {
+            color-scheme: light dark;
+            --bg: #0b0e14;
+            --panel: #131923;
+            --border: #263042;
+            --accent: #ff6b3d;
+            --muted: #8a96a8;
+            --text: #edf2f7;
+            --shadow: 0 18px 40px rgba(4, 8, 16, 0.45);
+            --line-blue: #2f80ed;
+            --line-green: #27ae60;
+            --line-red: #eb5757;
+            --line-yellow: #f2c94c;
+            --line-purple: #9b51e0;
+          }
+          * { box-sizing: border-box; }
+          body {
+            margin: 0;
+            font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+            background: radial-gradient(circle at top, #141b2b 0%, var(--bg) 55%);
+            color: var(--text);
+            min-height: 100vh;
+          }
+          .page {
+            max-width: 880px;
+            margin: 0 auto;
+            padding: 32px 20px 60px;
+          }
+          .hero {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 24px;
+            padding: 28px 30px;
+            border-radius: 20px;
+            background: linear-gradient(135deg, rgba(255,107,61,0.16), rgba(19,25,35,0.98));
+            border: 1px solid rgba(255,255,255,0.06);
+            box-shadow: var(--shadow);
+          }
+          .hero__title {
+            font-size: 28px;
+            font-weight: 700;
+            letter-spacing: 0.02em;
+          }
+          .hero__subtitle { color: var(--muted); margin-top: 4px; }
+          .hero__badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 12px;
+            padding: 6px 10px;
+            border-radius: 999px;
+            background: rgba(255,255,255,0.08);
+            color: var(--text);
+            margin-top: 12px;
+          }
+          .metro-strip {
+            display: grid;
+            grid-template-columns: repeat(5, 1fr);
+            gap: 8px;
+            margin: 22px 0;
+          }
+          .metro-strip span {
+            height: 6px;
+            border-radius: 999px;
+            display: block;
+          }
+          .line-blue { background: var(--line-blue); }
+          .line-green { background: var(--line-green); }
+          .line-red { background: var(--line-red); }
+          .line-yellow { background: var(--line-yellow); }
+          .line-purple { background: var(--line-purple); }
+          .card {
+            background: var(--panel);
+            border: 1px solid var(--border);
+            border-radius: 18px;
+            padding: 24px;
+            box-shadow: var(--shadow);
+          }
+          label.field {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+            color: var(--muted);
+            font-size: 14px;
+          }
+          label.field input {
+            background: rgba(255,255,255,0.04);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px 14px;
+            font-size: 16px;
+            outline: none;
+            color-scheme: dark;
+          }
+          .helper {
+            margin: 8px 0 0;
+            font-size: 13px;
+            color: var(--muted);
+          }
+          button.primary {
+            margin-top: 18px;
+            width: 100%;
+            background: var(--accent);
+            color: #0d0f14;
+            border: none;
+            border-radius: 12px;
+            padding: 12px 18px;
+            font-weight: 700;
+            font-size: 15px;
+            cursor: pointer;
+            box-shadow: 0 12px 30px rgba(255,107,61,0.35);
+          }
+          button.primary:hover {
+            transform: translateY(-1px);
+            box-shadow: 0 16px 32px rgba(255,107,61,0.4);
+          }
+          @media (max-width: 720px) {
+            .hero { flex-direction: column; align-items: flex-start; }
+          }
+        </style>
+      </head>
       <body>
-        <h2>Metroboard Login</h2>
-        <form method="post" action="/login">
-          <label>Board ID (5-char code):</label>
-          <input type="text" name="board_id" minlength="5" maxlength="16" required />
-          <button type="submit">Open</button>
-        </form>
+        <main class="page">
+          <div class="hero">
+            <div>
+              <div class="hero__title">Metroboard</div>
+              <div class="hero__subtitle">Sign in to manage your board.</div>
+              <div class="hero__badge">Live network sync · Smart lighting</div>
+            </div>
+          </div>
+          <div class="metro-strip" aria-hidden="true">
+            <span class="line-blue"></span>
+            <span class="line-green"></span>
+            <span class="line-red"></span>
+            <span class="line-yellow"></span>
+            <span class="line-purple"></span>
+          </div>
+
+          <section class="card">
+            <form method="post" action="/login">
+              <label class="field">Board ID
+                <input type="text" name="board_id" minlength="5" maxlength="16" required placeholder="e.g. ABC12" />
+              </label>
+              <p class="helper">Use the 5–16 character code printed on your board packaging.</p>
+              <button class="primary" type="submit">Open board</button>
+            </form>
+          </section>
+        </main>
       </body>
     </html>
     """
