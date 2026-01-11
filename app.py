@@ -87,11 +87,22 @@ def vlog(*a):
     if MB_VERBOSE:
         print("[metroboard]", *a)
 
+def _resolve_local_path(path: str) -> str:
+    if not path:
+        return path
+    if os.path.isabs(path):
+        return path
+    if os.path.exists(path):
+        return path
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base_dir, path)
+
 def _load_board_settings() -> dict[str, dict]:
-    if not os.path.exists(BOARD_SETTINGS_PATH):
+    settings_path = _resolve_local_path(BOARD_SETTINGS_PATH)
+    if not os.path.exists(settings_path):
         return {}
     try:
-        with open(BOARD_SETTINGS_PATH, "r", encoding="utf-8") as f:
+        with open(settings_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
             normalized: dict[str, dict] = {}
@@ -123,8 +134,9 @@ def _load_board_settings() -> dict[str, dict]:
 def _save_board_settings() -> None:
     global BOARD_SETTINGS_VERSION
     BOARD_SETTINGS_VERSION += 1
+    settings_path = _resolve_local_path(BOARD_SETTINGS_PATH)
     try:
-        with open(BOARD_SETTINGS_PATH, "w", encoding="utf-8") as f:
+        with open(settings_path, "w", encoding="utf-8") as f:
             json.dump(BOARD_SETTINGS, f, indent=2, sort_keys=True)
     except Exception as e:
         vlog("WARN: failed to save boards.json:", e)
