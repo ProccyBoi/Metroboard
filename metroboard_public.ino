@@ -108,12 +108,6 @@ uint32_t lastSettingsFetch = 0;
 uint32_t lastSettingsVersion = 0;
 uint32_t lastOtaCheck = 0;
 
-struct FirmwareInfo {
-  String version;
-  String url;
-  String sha256;
-};
-
 // ===== Binding model =====
 struct LedBinding {
   const char *station;
@@ -250,6 +244,12 @@ static String enc(const char *s) {
   }
   return o;
 }
+
+struct FirmwareInfo {
+  String version;
+  String url;
+  String sha256;
+};
 
 static String firmwareMetaUrl() {
   String url = String(kPayloadBase);
@@ -395,7 +395,7 @@ static bool applyOtaUpdate(const FirmwareInfo &info) {
 
   mbedtls_sha256_context ctx;
   mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts(&ctx, 0);
+  mbedtls_sha256_starts_ret(&ctx, 0);
 
   int remaining = contentLength;
   while (http.connected() && (sizeUnknown || remaining > 0)) {
@@ -404,7 +404,7 @@ static bool applyOtaUpdate(const FirmwareInfo &info) {
       int toRead = (int)min((size_t)sizeof(buf), available);
       int read = stream->readBytes(buf, toRead);
       if (read > 0) {
-        mbedtls_sha256_update(&ctx, buf, read);
+        mbedtls_sha256_update_ret(&ctx, buf, read);
         size_t written = Update.write(buf, read);
         if (written != (size_t)read) {
           Update.abort();
@@ -423,7 +423,7 @@ static bool applyOtaUpdate(const FirmwareInfo &info) {
   }
 
   unsigned char digest[32];
-  mbedtls_sha256_finish(&ctx, digest);
+  mbedtls_sha256_finish_ret(&ctx, digest);
   mbedtls_sha256_free(&ctx);
 
   String computed = sha256Hex(digest, sizeof(digest));
