@@ -931,7 +931,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
 
 
 # ---------------- FastAPI app ----------------
-app = FastAPI()
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 
 if CORS_ALLOW_ORIGIN:
     app.add_middleware(
