@@ -1047,8 +1047,16 @@ def healthz():
     return {"status": "ok", "stations": len(STATION_INDEX), "trains_last_fetch_s": age}
 
 @app.get("/login", response_class=HTMLResponse)
-def login_get():
-    return """
+def login_get(error: T.Optional[str] = Query(None)):
+    error_message = ""
+    if error == "missing":
+        error_message = "Enter the 5-character board ID to continue."
+    elif error == "not-found":
+        error_message = "We couldn't find that board ID. Double-check the code and try again."
+    error_html = ""
+    if error_message:
+        error_html = f'<div class="error" role="alert">{error_message}</div>'
+    html = """
     <!DOCTYPE html>
     <html>
       <head>
@@ -1156,6 +1164,15 @@ def login_get():
             font-size: 13px;
             color: var(--muted);
           }
+          .error {
+            margin-top: 14px;
+            padding: 12px 14px;
+            border-radius: 12px;
+            border: 1px solid rgba(235, 87, 87, 0.55);
+            background: rgba(235, 87, 87, 0.12);
+            color: #f5c2c2;
+            font-size: 14px;
+          }
           button.primary {
             margin-top: 18px;
             width: 100%;
@@ -1201,6 +1218,7 @@ def login_get():
                 <input type="text" name="board_id" minlength="5" maxlength="5" required placeholder="e.g. PZ23T" />
               </label>
               <p class="helper">Use the 5 character code printed on your card.</p>
+              __ERROR_HTML__
               <button class="primary" type="submit">Open board</button>
             </form>
           </section>
@@ -1208,15 +1226,16 @@ def login_get():
       </body>
     </html>
     """
+    return html.replace("__ERROR_HTML__", error_html)
 
 @app.post("/login")
 async def login_post(board_id: str = Form(...)):
     board_id = _normalize_board_id(board_id)
     if not board_id:
-        return RedirectResponse("/login", status_code=303)
+        return RedirectResponse("/login?error=missing", status_code=303)
     if board_id not in BOARD_SETTINGS:
         vlog(f"login rejected: board_id {board_id} not found in BOARD_SETTINGS")
-        return HTMLResponse("Board ID not found", status_code=404)
+        return RedirectResponse("/login?error=not-found", status_code=303)
     return RedirectResponse(f"/board/{board_id}", status_code=303)
 
 
