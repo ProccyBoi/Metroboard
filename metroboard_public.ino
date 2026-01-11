@@ -5,6 +5,7 @@
 #include <HTTPClient.h>
 #include <Preferences.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <time.h>
@@ -37,6 +38,7 @@ struct DeviceConfig {
 Preferences gPrefs;
 DeviceConfig gConfig = {DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS, DEFAULT_BOARD_ID};
 WebServer gConfigServer(80);
+DNSServer gDnsServer;
 
 // ===== LEDs =====
 #define STATUS_PIN 25
@@ -601,8 +603,20 @@ void startConfigPortal() {
   Serial.printf("\n[CFG] AP \"%s\" IP=%s\n", apName.c_str(),
                 ip.toString().c_str());
 
+  gDnsServer.start(53, "*", ip);
+
   gConfigServer.on("/", HTTP_GET,
                    []() { gConfigServer.send(200, "text/html", configPageHtml()); });
+  gConfigServer.on("/generate_204", HTTP_GET,
+                   []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
+  gConfigServer.on("/hotspot-detect.html", HTTP_GET,
+                   []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
+  gConfigServer.on("/ncsi.txt", HTTP_GET,
+                   []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
+  gConfigServer.on("/connecttest.txt", HTTP_GET,
+                   []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
+  gConfigServer.on("/redirect", HTTP_GET,
+                   []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
   gConfigServer.on("/save", HTTP_POST, []() {
     DeviceConfig next = gConfig;
     next.ssid = gConfigServer.arg("ssid");
@@ -630,6 +644,7 @@ void startConfigPortal() {
 
   setStatus(STATUS_SERVER_ACTIVE);
   for (;;) {
+    gDnsServer.processNextRequest();
     gConfigServer.handleClient();
     delay(10);
   }
