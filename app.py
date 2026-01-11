@@ -1015,7 +1015,7 @@ def _startup():
 
 @app.get("/")
 def root():
-    return {"ok": True, "endpoints": ["/states", "/stations", "/healthz", "/debug", "/trains"]}
+    return {"ok": True}
 
 @app.get("/healthz")
 def healthz():
