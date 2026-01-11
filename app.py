@@ -11,6 +11,7 @@ import os
 import time
 import csv
 import json
+import shutil
 import re
 import random
 from datetime import datetime, time as dtime
@@ -53,7 +54,7 @@ ROUTE_SHORT_ALLOW: set[str] = {s.strip().upper() for s in os.getenv("MB_ROUTE_SH
 # Route short-name overrides
 ROUTE_SHORT_OVERRIDES_PATH = os.getenv("ROUTE_SHORT_OVERRIDES_PATH", "route_overrides.csv")
 ROUTE_SHORT_OVERRIDES_JSON = os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "")
-BOARD_SETTINGS_PATH = os.getenv("BOARD_SETTINGS_PATH", "boards.json")
+BOARD_SETTINGS_PATH = os.getenv("BOARD_SETTINGS_PATH") or os.path.join("data", "boards.json")
 
 # board_id -> settings dict
 BOARD_SETTINGS: dict[str, dict] = {}
@@ -99,6 +100,16 @@ def _resolve_local_path(path: str) -> str:
 
 def _load_board_settings() -> dict[str, dict]:
     settings_path = _resolve_local_path(BOARD_SETTINGS_PATH)
+    legacy_path = _resolve_local_path("boards.json")
+    if not os.path.exists(settings_path) and settings_path != legacy_path and os.path.exists(legacy_path):
+        try:
+            settings_dir = os.path.dirname(settings_path)
+            if settings_dir:
+                os.makedirs(settings_dir, exist_ok=True)
+            shutil.copy2(legacy_path, settings_path)
+            vlog(f"migrated legacy boards.json from {legacy_path} to {settings_path}")
+        except Exception as e:
+            vlog(f"WARN: failed to migrate legacy boards.json: {e}")
     if not os.path.exists(settings_path):
         vlog(f"WARN: boards.json not found at {settings_path}")
         return {}
@@ -138,6 +149,9 @@ def _save_board_settings() -> None:
     BOARD_SETTINGS_VERSION += 1
     settings_path = _resolve_local_path(BOARD_SETTINGS_PATH)
     try:
+        settings_dir = os.path.dirname(settings_path)
+        if settings_dir:
+            os.makedirs(settings_dir, exist_ok=True)
         with open(settings_path, "w", encoding="utf-8") as f:
             json.dump(BOARD_SETTINGS, f, indent=2, sort_keys=True)
     except Exception as e:
@@ -1703,6 +1717,7 @@ def board_settings_page(board_id: str):
             anName.addEventListener("change", syncPulseVisibility);
             syncPulseVisibility();
             syncPulseColorValue();
+
           }})();
         </script>
       </body>
