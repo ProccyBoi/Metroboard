@@ -1198,7 +1198,7 @@ def login_get():
           <section class="card">
             <form method="post" action="/login">
               <label class="field">Board ID
-                <input type="text" name="board_id" minlength="5" maxlength="5" required placeholder="e.g. ABC12" />
+                <input type="text" name="board_id" minlength="5" maxlength="5" required placeholder="e.g. PZ23T" />
               </label>
               <p class="helper">Use the 5 character code printed on your card.</p>
               <button class="primary" type="submit">Open board</button>
