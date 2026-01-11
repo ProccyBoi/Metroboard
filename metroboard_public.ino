@@ -3,18 +3,19 @@
 #include <Adafruit_NeoPixel.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
+#include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <time.h>
 
 // =========================================
-// ===== User configuration (required) =====
+// ===== Optional defaults (leave blank) ===
 // =========================================
-// Replace the values below with your own WiFi credentials and unique board ID.
-// These are the ONLY values you should edit before deployment.
-#define WIFI_SSID "YOUR_WIFI_SSID"
-#define WIFI_PASS "YOUR_WIFI_PASSWORD"
-static const char *kBoardId = "YOUR_BOARD_ID";
+// These values are only used if no settings are saved in flash.
+#define DEFAULT_WIFI_SSID ""
+#define DEFAULT_WIFI_PASS ""
+#define DEFAULT_BOARD_ID ""
 // =========================================
 // =========================================
 // =========================================
@@ -24,6 +25,18 @@ static const char *kPayloadBase =
 
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
 static const uint32_t SETTINGS_FETCH_MS = 30000;
+
+struct DeviceConfig {
+  String ssid;
+  String pass;
+  String boardId;
+
+  bool isValid() const { return ssid.length() > 0 && boardId.length() > 0; }
+};
+
+Preferences gPrefs;
+DeviceConfig gConfig = {DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS, DEFAULT_BOARD_ID};
+WebServer gConfigServer(80);
 
 // ===== LEDs =====
 #define STATUS_PIN 25
@@ -488,19 +501,125 @@ void renderAll() {
       ttlBuf[i]--;
 }
 
+bool loadConfigFromPrefs() {
+  gPrefs.begin("metroboard", true);
+  String ssid = gPrefs.getString("ssid", gConfig.ssid);
+  String pass = gPrefs.getString("pass", gConfig.pass);
+  String board = gPrefs.getString("board", gConfig.boardId);
+  gPrefs.end();
+
+  gConfig.ssid = ssid;
+  gConfig.pass = pass;
+  gConfig.boardId = board;
+  return gConfig.isValid();
+}
+
+void saveConfigToPrefs(const DeviceConfig &cfg) {
+  gPrefs.begin("metroboard", false);
+  gPrefs.putString("ssid", cfg.ssid);
+  gPrefs.putString("pass", cfg.pass);
+  gPrefs.putString("board", cfg.boardId);
+  gPrefs.end();
+}
+
+String configPageHtml() {
+  String html =
+      "<!doctype html><html><head><meta charset='utf-8'/>"
+      "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
+      "<title>Metroboard Setup</title>"
+      "<style>body{font-family:Arial,Helvetica,sans-serif;margin:24px;}"
+      "label{display:block;margin-top:12px;font-weight:600;}"
+      "input{width:100%;max-width:360px;padding:8px;margin-top:6px;}"
+      "button{margin-top:18px;padding:10px 16px;font-size:15px;}"
+      ".note{margin-top:18px;color:#555;}</style></head><body>"
+      "<h1>Metroboard Setup</h1>"
+      "<form method='POST' action='/save'>"
+      "<label>WiFi SSID</label>"
+      "<input name='ssid' required value='" +
+      gConfig.ssid + "'/>"
+                     "<label>WiFi Password</label>"
+                     "<input name='pass' type='password' value='" +
+      gConfig.pass +
+      "'/>"
+      "<label>Board ID</label>"
+      "<input name='board' required value='" +
+      gConfig.boardId +
+      "'/>"
+      "<button type='submit'>Save & Restart</button>"
+      "</form>"
+      "<p class='note'>After saving, the board will reboot and connect to your "
+      "WiFi.</p>"
+      "</body></html>";
+  return html;
+}
+
+void startConfigPortal() {
+  WiFi.disconnect(true, true);
+  WiFi.mode(WIFI_AP);
+  uint32_t suffix = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF);
+  String apName = "Metroboard-Setup-" + String(suffix, HEX);
+  WiFi.softAP(apName.c_str());
+  IPAddress ip = WiFi.softAPIP();
+  Serial.printf("\n[CFG] AP \"%s\" IP=%s\n", apName.c_str(),
+                ip.toString().c_str());
+
+  gConfigServer.on("/", HTTP_GET,
+                   []() { gConfigServer.send(200, "text/html", configPageHtml()); });
+  gConfigServer.on("/save", HTTP_POST, []() {
+    DeviceConfig next = gConfig;
+    next.ssid = gConfigServer.arg("ssid");
+    next.pass = gConfigServer.arg("pass");
+    next.boardId = gConfigServer.arg("board");
+    next.ssid.trim();
+    next.boardId.trim();
+
+    if (!next.isValid()) {
+      gConfigServer.send(400, "text/plain",
+                         "SSID and Board ID are required.");
+      return;
+    }
+
+    saveConfigToPrefs(next);
+    gConfigServer.send(200, "text/html",
+                       "<html><body><h2>Saved.</h2>"
+                       "<p>Rebooting...</p></body></html>");
+    delay(500);
+    ESP.restart();
+  });
+  gConfigServer.onNotFound(
+      []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
+  gConfigServer.begin();
+
+  statusOrange();
+  for (;;) {
+    gConfigServer.handleClient();
+    delay(10);
+  }
+}
+
 // ===== networking & polling =====
-void wifiConnect() {
+bool wifiConnect(uint32_t timeoutMs = 20000) {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.printf("WiFi: \"%s\"", WIFI_SSID);
-  while (WiFi.status() != WL_CONNECTED) {
+  if (gConfig.pass.length() > 0)
+    WiFi.begin(gConfig.ssid.c_str(), gConfig.pass.c_str());
+  else
+    WiFi.begin(gConfig.ssid.c_str());
+  Serial.printf("WiFi: \"%s\"", gConfig.ssid.c_str());
+  uint32_t t0 = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) {
     delay(300);
     Serial.print('.');
   }
-  Serial.printf("\nIP=%s heap=%u\n", WiFi.localIP().toString().c_str(),
-                ESP.getFreeHeap());
-  statusGreen();
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nIP=%s heap=%u\n", WiFi.localIP().toString().c_str(),
+                  ESP.getFreeHeap());
+    statusGreen();
+    return true;
+  }
+  Serial.println("\n[WiFi] FAILED to connect.");
+  statusOrange();
+  return false;
 }
 void ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) {
@@ -513,7 +632,10 @@ void ensureWifi() {
 
   WiFi.disconnect(true, true);
   delay(100);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  if (gConfig.pass.length() > 0)
+    WiFi.begin(gConfig.ssid.c_str(), gConfig.pass.c_str());
+  else
+    WiFi.begin(gConfig.ssid.c_str());
 
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
@@ -536,8 +658,8 @@ static const uint8_t MAX_BATCHES_PER_POLL = 6;
 
 size_t computeBatchEnd(size_t i) {
   const char *base = kPayloadBase;
-  size_t baseLen =
-      strlen(base) + strlen("?board_id=") + strlen(kBoardId) + strlen("&only=");
+  size_t baseLen = strlen(base) + strlen("?board_id=") +
+                   gConfig.boardId.length() + strlen("&only=");
 
   size_t used = baseLen;
   size_t j = i;
@@ -585,7 +707,7 @@ int fetchAllBatchesAndRenderOnce(bool allowRender) {
 
     String url = String(kPayloadBase);
     url += "?board_id=";
-    url += kBoardId;
+    url += gConfig.boardId;
     url += "&only=";
     for (size_t j = i; j < end; j++) {
       if (j > i)
@@ -732,7 +854,15 @@ void setup() {
   delay(150);
   Serial.println("\nMetroboard — Solid Station Mode (TTL, fixed colors, "
                  "BRIGHTNESS=16, coalesced)");
-  wifiConnect();
+  loadConfigFromPrefs();
+  if (!gConfig.isValid()) {
+    Serial.println("[CFG] Missing settings. Starting setup portal.");
+    startConfigPortal();
+  }
+  if (!wifiConnect()) {
+    Serial.println("[CFG] WiFi failed. Starting setup portal.");
+    startConfigPortal();
+  }
   beginStrips();
   buildBindings();
   renderAll();
