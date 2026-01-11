@@ -66,9 +66,6 @@ CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN")
 MB_VERBOSE = os.getenv("MB_VERBOSE", "1") == "1"
 MB_FORCE_DISTANCE = os.getenv("MB_FORCE_DISTANCE", "0") == "1"
 MB_TIMEZONE = os.getenv("MB_TIMEZONE", "Australia/Sydney")
-FIRMWARE_VERSION = os.getenv("MB_FIRMWARE_VERSION", "").strip()
-FIRMWARE_URL = os.getenv("MB_FIRMWARE_URL", "").strip()
-FIRMWARE_SHA256 = os.getenv("MB_FIRMWARE_SHA256", "").strip()
 
 # BBox guardrail (None disables)
 DEFAULT_SYD_BBOX = (-34.2, 150.5, -33.4, 151.4)
@@ -1048,16 +1045,6 @@ def root():
 def healthz():
     age = None if _FEED_TS == 0 else (time.time() - _FEED_TS)
     return {"status": "ok", "stations": len(STATION_INDEX), "trains_last_fetch_s": age}
-
-@app.get("/firmware/latest")
-def firmware_latest():
-    if not FIRMWARE_VERSION or not FIRMWARE_URL or not FIRMWARE_SHA256:
-        return JSONResponse({"error": "firmware metadata not configured"}, status_code=404)
-    return {
-        "version": FIRMWARE_VERSION,
-        "url": FIRMWARE_URL,
-        "sha256": FIRMWARE_SHA256,
-    }
 
 @app.get("/login", response_class=HTMLResponse)
 def login_get(error: T.Optional[str] = Query(None)):
