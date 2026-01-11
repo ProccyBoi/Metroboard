@@ -193,8 +193,7 @@ def _get_or_create_board(board_id: str) -> dict:
     if not board_id:
         raise ValueError("empty board_id")
     if board_id not in BOARD_SETTINGS:
-        BOARD_SETTINGS[board_id] = _default_board_settings(board_id)
-        _save_board_settings()
+        raise ValueError("unknown board_id")
     return BOARD_SETTINGS[board_id]
 
 EXCLUDE_SUB = ("wharf", "light rail", "b-line", "interchange", "motorway", " m2")

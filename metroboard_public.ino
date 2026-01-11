@@ -42,6 +42,8 @@ WebServer gConfigServer(80);
 #define STATUS_PIN 25
 uint8_t gBaseBrightness = 16;
 uint8_t gEffectiveBrightness = 16;
+static const uint8_t kStatusBrightness = 16;
+bool gBoardIdValid = false;
 
 enum Line : uint8_t {
   L_T9,
@@ -57,7 +59,7 @@ enum Line : uint8_t {
   LINE_COUNT
 };
 const uint8_t STRIP_PINS[LINE_COUNT] = {4, 13, 14, 16, 17, 18, 19, 21, 22, 23};
-const uint16_t STRIP_LEN[LINE_COUNT] = {43, 31, 38, 6, 30, 33, 2, 38, 31, 56};
+const uint16_t STRIP_LEN[LINE_COUNT] = {31, 31, 38, 6, 30, 33, 2, 38, 31, 56};
 bool REVERSE[LINE_COUNT] = {0, 0, 0, 0, 0, 0, 1, 0, 0, 0};
 
 const uint32_t LINE_COLOR_HEX[LINE_COUNT] = {
@@ -114,13 +116,51 @@ uint8_t *ttlBuf = nullptr;
 static const uint8_t GRACE_POLLS = 3;
 
 // ===== helpers =====
-void statusOrange() {
-  statusStrip.setPixelColor(0, statusStrip.Color(200, 80, 0));
-  statusStrip.show();
-}
+enum StatusCode : uint8_t {
+  STATUS_POWER_ON,
+  STATUS_WIFI_CONNECTED_VALID,
+  STATUS_SERVER_ACTIVE,
+  STATUS_WIFI_CONNECTING,
+  STATUS_WIFI_DISCONNECTED,
+  STATUS_BOARD_INVALID
+};
 
-void statusGreen() {
-  statusStrip.setPixelColor(0, statusStrip.Color(0, 160, 0));
+void setStatus(StatusCode code) {
+  uint8_t r = 0, g = 0, b = 0;
+  switch (code) {
+  case STATUS_POWER_ON:
+    r = 160;
+    g = 160;
+    b = 160;
+    break;
+  case STATUS_WIFI_CONNECTED_VALID:
+    r = 0;
+    g = 160;
+    b = 0;
+    break;
+  case STATUS_SERVER_ACTIVE:
+    r = 80;
+    g = 180;
+    b = 255;
+    break;
+  case STATUS_WIFI_CONNECTING:
+    r = 200;
+    g = 80;
+    b = 0;
+    break;
+  case STATUS_WIFI_DISCONNECTED:
+    r = 200;
+    g = 0;
+    b = 0;
+    break;
+  case STATUS_BOARD_INVALID:
+    r = 200;
+    g = 0;
+    b = 120;
+    break;
+  }
+  statusStrip.setBrightness(kStatusBrightness);
+  statusStrip.setPixelColor(0, statusStrip.Color(r, g, b));
   statusStrip.show();
 }
 
@@ -462,7 +502,6 @@ void applyBatchToState(JsonVariantConst states) {
 }
 
 void repaintDirtyLinesAndDecayOnce() {
-  statusStrip.setBrightness(gEffectiveBrightness);
   for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
     strips[ln].setBrightness(gEffectiveBrightness);
     if (!dirtyLine[ln])
@@ -484,7 +523,6 @@ void repaintDirtyLinesAndDecayOnce() {
 }
 
 void renderAll() {
-  statusStrip.setBrightness(gEffectiveBrightness);
   for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
     strips[ln].setBrightness(gEffectiveBrightness);
     strips[ln].clear();
@@ -590,7 +628,7 @@ void startConfigPortal() {
       []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
   gConfigServer.begin();
 
-  statusOrange();
+  setStatus(STATUS_SERVER_ACTIVE);
   for (;;) {
     gConfigServer.handleClient();
     delay(10);
@@ -601,6 +639,7 @@ void startConfigPortal() {
 bool wifiConnect(uint32_t timeoutMs = 20000) {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
+  setStatus(STATUS_WIFI_CONNECTING);
   if (gConfig.pass.length() > 0)
     WiFi.begin(gConfig.ssid.c_str(), gConfig.pass.c_str());
   else
@@ -614,21 +653,25 @@ bool wifiConnect(uint32_t timeoutMs = 20000) {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("\nIP=%s heap=%u\n", WiFi.localIP().toString().c_str(),
                   ESP.getFreeHeap());
-    statusGreen();
+    if (gBoardIdValid) {
+      setStatus(STATUS_WIFI_CONNECTED_VALID);
+    }
     return true;
   }
   Serial.println("\n[WiFi] FAILED to connect.");
-  statusOrange();
+  setStatus(STATUS_WIFI_DISCONNECTED);
   return false;
 }
 void ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) {
-    statusGreen();
+    if (gBoardIdValid) {
+      setStatus(STATUS_WIFI_CONNECTED_VALID);
+    }
     return;
   }
 
   Serial.println("[WiFi] LOST connection. Reconnecting...");
-  statusOrange();
+  setStatus(STATUS_WIFI_CONNECTING);
 
   WiFi.disconnect(true, true);
   delay(100);
@@ -646,9 +689,12 @@ void ensureWifi() {
   if (WiFi.status() == WL_CONNECTED) {
     Serial.printf("\n[WiFi] Reconnected. IP=%s\n",
                   WiFi.localIP().toString().c_str());
-    statusGreen();
+    if (gBoardIdValid) {
+      setStatus(STATUS_WIFI_CONNECTED_VALID);
+    }
   } else {
     Serial.println("\n[WiFi] FAILED to reconnect.");
+    setStatus(STATUS_WIFI_DISCONNECTED);
   }
 }
 
@@ -837,10 +883,6 @@ uint32_t lastPoll = 0, pollInterval = POLL_MS_MIN;
 TaskHandle_t gPollTaskHandle = nullptr;
 
 void beginStrips() {
-  statusStrip.begin();
-  statusStrip.setBrightness(gEffectiveBrightness);
-  statusOrange();
-  statusStrip.show();
   for (uint8_t i = 0; i < LINE_COUNT; i++) {
     strips[i].begin();
     strips[i].setBrightness(gEffectiveBrightness);
@@ -849,20 +891,70 @@ void beginStrips() {
   }
 }
 
+void initStatusLed() {
+  statusStrip.begin();
+  statusStrip.setBrightness(kStatusBrightness);
+  setStatus(STATUS_POWER_ON);
+}
+
+bool isBoardIdValid() {
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(20000);
+  client.setHandshakeTimeout(20000);
+
+  HTTPClient http;
+  String url = String(kPayloadBase);
+  int slash = url.lastIndexOf('/');
+  if (slash > 0) {
+    url = url.substring(0, slash);
+    url += "/board_settings?board_id=";
+  } else {
+    url += "/board_settings?board_id=";
+  }
+  url += enc(gConfig.boardId.c_str());
+
+  if (!http.begin(client, url)) {
+    http.end();
+    return true;
+  }
+
+  int code = http.GET();
+  http.end();
+
+  if (code == HTTP_CODE_OK) {
+    return true;
+  }
+  if (code == HTTP_CODE_BAD_REQUEST || code == HTTP_CODE_NOT_FOUND ||
+      code == HTTP_CODE_FORBIDDEN) {
+    return false;
+  }
+  return true;
+}
+
 void setup() {
   Serial.begin(115200);
   delay(150);
   Serial.println("\nMetroboard — Solid Station Mode (TTL, fixed colors, "
                  "BRIGHTNESS=16, coalesced)");
+  initStatusLed();
   loadConfigFromPrefs();
   if (!gConfig.isValid()) {
     Serial.println("[CFG] Missing settings. Starting setup portal.");
     startConfigPortal();
   }
-  if (!wifiConnect()) {
+  if (!wifiConnect(90000)) {
     Serial.println("[CFG] WiFi failed. Starting setup portal.");
+    setStatus(STATUS_WIFI_DISCONNECTED);
     startConfigPortal();
   }
+  gBoardIdValid = isBoardIdValid();
+  if (!gBoardIdValid) {
+    Serial.println("[CFG] Board ID invalid. Starting setup portal.");
+    setStatus(STATUS_BOARD_INVALID);
+    startConfigPortal();
+  }
+  setStatus(STATUS_WIFI_CONNECTED_VALID);
   beginStrips();
   buildBindings();
   renderAll();
@@ -876,13 +968,7 @@ void setup() {
           if (gMode != "animation" && now - lastPoll >= pollInterval) {
             lastPoll = now;
 
-            statusStrip.setPixelColor(0, statusStrip.Color(0, 80, 0));
-            statusStrip.show();
-
             int batches = fetchAllBatchesAndRenderOnce(true);
-
-            statusStrip.setPixelColor(0, statusStrip.Color(0, 160, 0));
-            statusStrip.show();
 
             if (batches > 0)
               pollInterval = POLL_MS_MIN;
