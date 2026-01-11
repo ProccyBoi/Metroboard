@@ -1055,7 +1055,7 @@ def board_settings_page(board_id: str):
     except ValueError:
         return HTMLResponse("Invalid board_id", status_code=400)
 
-    b = cfg.get("brightness", 16)
+    b = min(150, int(cfg.get("brightness", 16)))
     mode = cfg.get("mode", "live")
     nm = cfg.get("night_mode", {}) or {}
     an = cfg.get("animation", {}) or {}
@@ -1369,10 +1369,10 @@ def board_settings_page(board_id: str):
             <section class="card">
               <div class="section-head">
                 <h3>Brightness</h3>
-                <span class="tag">0–255</span>
+                <span class="tag">0–150</span>
               </div>
               <div class="slider-row">
-                <input id="brightness" type="range" min="0" max="255" name="brightness" value="{b}" />
+                <input id="brightness" type="range" min="0" max="150" name="brightness" value="{b}" />
                 <div class="pill" id="brightnessValue">{b}</div>
               </div>
               <p class="note">Applies to the entire board; night mode can override this later.</p>
@@ -1535,7 +1535,7 @@ async def board_settings_save(
     cfg = _get_or_create_board(board_id)
 
     mode = mode if mode in ("live", "animation") else "live"
-    brightness = max(0, min(255, brightness))
+    brightness = max(0, min(150, brightness))
     nm_dim = max(0, min(255, nm_dim))
 
     def _parse_hex_color(s: str) -> list[int]:
