@@ -4,10 +4,12 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include <Update.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <mbedtls/sha256.h>
 #include <time.h>
 
 // =========================================
@@ -23,9 +25,11 @@
 
 static const char *kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
+static const char *kFirmwareVersion = "1.0.0";
 
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
 static const uint32_t SETTINGS_FETCH_MS = 30000;
+static const uint32_t OTA_CHECK_MS = 6UL * 60UL * 60UL * 1000UL;
 
 struct DeviceConfig {
   String ssid;
@@ -102,6 +106,7 @@ struct AnimCfg {
 
 uint32_t lastSettingsFetch = 0;
 uint32_t lastSettingsVersion = 0;
+uint32_t lastOtaCheck = 0;
 
 // ===== Binding model =====
 struct LedBinding {
@@ -238,6 +243,204 @@ static String enc(const char *s) {
     }
   }
   return o;
+}
+
+struct FirmwareInfo {
+  String version;
+  String url;
+  String sha256;
+};
+
+static String firmwareMetaUrl() {
+  String url = String(kPayloadBase);
+  int slash = url.lastIndexOf('/');
+  if (slash > 0) {
+    url = url.substring(0, slash);
+  }
+  url += "/firmware/latest";
+  return url;
+}
+
+static void parseSemver(const String &version, int parts[3]) {
+  parts[0] = 0;
+  parts[1] = 0;
+  parts[2] = 0;
+  String v = version;
+  if (v.startsWith("v") || v.startsWith("V")) {
+    v = v.substring(1);
+  }
+  int partIndex = 0;
+  int start = 0;
+  for (int i = 0; i <= v.length(); i++) {
+    if (i == v.length() || v[i] == '.') {
+      if (partIndex > 2)
+        break;
+      String token = v.substring(start, i);
+      parts[partIndex++] = token.toInt();
+      start = i + 1;
+    }
+  }
+}
+
+static int compareSemver(const String &a, const String &b) {
+  int pa[3], pb[3];
+  parseSemver(a, pa);
+  parseSemver(b, pb);
+  for (int i = 0; i < 3; i++) {
+    if (pa[i] != pb[i])
+      return pa[i] > pb[i] ? 1 : -1;
+  }
+  return 0;
+}
+
+static bool isNewerVersion(const String &remote, const String &current) {
+  return compareSemver(remote, current) > 0;
+}
+
+static bool fetchFirmwareInfo(FirmwareInfo &info) {
+  String url = firmwareMetaUrl();
+  bool isHttps = url.startsWith("https://");
+  HTTPClient http;
+  bool ok = false;
+
+  if (isHttps) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(20000);
+    client.setHandshakeTimeout(20000);
+    if (http.begin(client, url)) {
+      int code = http.GET();
+      if (code == HTTP_CODE_OK) {
+        String payload = http.getString();
+        DynamicJsonDocument doc(1024);
+        if (deserializeJson(doc, payload) == DeserializationError::Ok) {
+          info.version = doc["version"] | "";
+          info.url = doc["url"] | "";
+          info.sha256 = doc["sha256"] | "";
+          ok = info.version.length() > 0 && info.url.length() > 0 &&
+               info.sha256.length() > 0;
+        }
+      }
+    }
+  } else {
+    WiFiClient client;
+    if (http.begin(client, url)) {
+      int code = http.GET();
+      if (code == HTTP_CODE_OK) {
+        String payload = http.getString();
+        DynamicJsonDocument doc(1024);
+        if (deserializeJson(doc, payload) == DeserializationError::Ok) {
+          info.version = doc["version"] | "";
+          info.url = doc["url"] | "";
+          info.sha256 = doc["sha256"] | "";
+          ok = info.version.length() > 0 && info.url.length() > 0 &&
+               info.sha256.length() > 0;
+        }
+      }
+    }
+  }
+
+  http.end();
+  return ok;
+}
+
+static String sha256Hex(const unsigned char *digest, size_t len) {
+  static const char *hex = "0123456789abcdef";
+  String out;
+  out.reserve(len * 2);
+  for (size_t i = 0; i < len; i++) {
+    out += hex[(digest[i] >> 4) & 0x0F];
+    out += hex[digest[i] & 0x0F];
+  }
+  return out;
+}
+
+static bool applyOtaUpdate(const FirmwareInfo &info) {
+  bool isHttps = info.url.startsWith("https://");
+  HTTPClient http;
+  int contentLength = -1;
+  bool sizeUnknown = true;
+
+  if (isHttps) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(30000);
+    client.setHandshakeTimeout(30000);
+    if (!http.begin(client, info.url)) {
+      return false;
+    }
+  } else {
+    WiFiClient client;
+    if (!http.begin(client, info.url)) {
+      return false;
+    }
+  }
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    http.end();
+    return false;
+  }
+
+  contentLength = http.getSize();
+  sizeUnknown = contentLength <= 0;
+
+  if (!Update.begin(sizeUnknown ? UPDATE_SIZE_UNKNOWN : contentLength)) {
+    http.end();
+    return false;
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  uint8_t buf[1024];
+
+  mbedtls_sha256_context ctx;
+  mbedtls_sha256_init(&ctx);
+  mbedtls_sha256_starts_ret(&ctx, 0);
+
+  int remaining = contentLength;
+  while (http.connected() && (sizeUnknown || remaining > 0)) {
+    size_t available = stream->available();
+    if (available) {
+      int toRead = (int)min((size_t)sizeof(buf), available);
+      int read = stream->readBytes(buf, toRead);
+      if (read > 0) {
+        mbedtls_sha256_update_ret(&ctx, buf, read);
+        size_t written = Update.write(buf, read);
+        if (written != (size_t)read) {
+          Update.abort();
+          mbedtls_sha256_free(&ctx);
+          http.end();
+          return false;
+        }
+        if (!sizeUnknown) {
+          remaining -= read;
+        }
+      }
+    } else {
+      delay(1);
+    }
+    yield();
+  }
+
+  unsigned char digest[32];
+  mbedtls_sha256_finish_ret(&ctx, digest);
+  mbedtls_sha256_free(&ctx);
+
+  String computed = sha256Hex(digest, sizeof(digest));
+  if (!computed.equalsIgnoreCase(info.sha256)) {
+    Update.abort();
+    http.end();
+    return false;
+  }
+
+  bool ended = Update.end(sizeUnknown);
+  http.end();
+
+  if (!ended || !Update.isFinished()) {
+    return false;
+  }
+
+  return true;
 }
 static uint32_t lineColor(Line ln) {
   uint32_t h = LINE_COLOR_HEX[ln];
@@ -880,6 +1083,7 @@ int fetchAllBatchesAndRenderOnce(bool allowRender) {
 
     delay(5);
     yield();
+    vTaskDelay(1 / portTICK_PERIOD_MS);
   }
 
   if (allowRender) {
@@ -947,6 +1151,38 @@ bool isBoardIdValid() {
   return true;
 }
 
+void maybeCheckForOta() {
+  uint32_t now = millis();
+  if (now - lastOtaCheck < OTA_CHECK_MS) {
+    return;
+  }
+  lastOtaCheck = now;
+
+  if (WiFi.status() != WL_CONNECTED) {
+    return;
+  }
+
+  FirmwareInfo info;
+  if (!fetchFirmwareInfo(info)) {
+    return;
+  }
+
+  if (!isNewerVersion(info.version, kFirmwareVersion)) {
+    return;
+  }
+
+  Serial.printf("[OTA] Update available: %s -> %s\n",
+                kFirmwareVersion, info.version.c_str());
+
+  if (applyOtaUpdate(info)) {
+    Serial.println("[OTA] Update applied, rebooting.");
+    delay(500);
+    ESP.restart();
+  } else {
+    Serial.println("[OTA] Update failed.");
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(150);
@@ -978,6 +1214,7 @@ void setup() {
       [](void *) {
         for (;;) {
           ensureWifi();
+          maybeCheckForOta();
 
           uint32_t now = millis();
           if (gMode != "animation" && now - lastPoll >= pollInterval) {
