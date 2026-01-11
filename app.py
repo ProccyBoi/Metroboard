@@ -56,6 +56,14 @@ ROUTE_SHORT_OVERRIDES_PATH = os.getenv("ROUTE_SHORT_OVERRIDES_PATH", "route_over
 ROUTE_SHORT_OVERRIDES_JSON = os.getenv("ROUTE_SHORT_OVERRIDES_JSON", "")
 BOARD_SETTINGS_PATH = os.getenv("BOARD_SETTINGS_PATH") or os.path.join("data", "boards.json")
 
+def _env_flag(name: str, default: bool = True) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in ("0", "false", "no", "off")
+
+PERSIST_USER_SETTINGS = _env_flag("PERSIST_USER_SETTINGS", True)
+
 # board_id -> settings dict
 BOARD_SETTINGS: dict[str, dict] = {}
 BOARD_SETTINGS_VERSION: int = 0
@@ -99,6 +107,9 @@ def _resolve_local_path(path: str) -> str:
     return os.path.join(base_dir, path)
 
 def _load_board_settings() -> dict[str, dict]:
+    if not PERSIST_USER_SETTINGS:
+        vlog("persisted board settings disabled; skipping load")
+        return {}
     settings_path = _resolve_local_path(BOARD_SETTINGS_PATH)
     legacy_path = _resolve_local_path("boards.json")
     if not os.path.exists(settings_path) and settings_path != legacy_path and os.path.exists(legacy_path):
@@ -147,6 +158,9 @@ def _load_board_settings() -> dict[str, dict]:
 def _save_board_settings() -> None:
     global BOARD_SETTINGS_VERSION
     BOARD_SETTINGS_VERSION += 1
+    if not PERSIST_USER_SETTINGS:
+        vlog("persisted board settings disabled; skipping save")
+        return
     settings_path = _resolve_local_path(BOARD_SETTINGS_PATH)
     try:
         settings_dir = os.path.dirname(settings_path)
@@ -154,6 +168,7 @@ def _save_board_settings() -> None:
             os.makedirs(settings_dir, exist_ok=True)
         with open(settings_path, "w", encoding="utf-8") as f:
             json.dump(BOARD_SETTINGS, f, indent=2, sort_keys=True)
+        vlog(f"boards.json saved to {settings_path}")
     except Exception as e:
         vlog("WARN: failed to save boards.json:", e)
 
