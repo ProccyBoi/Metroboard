@@ -100,6 +100,7 @@ def _resolve_local_path(path: str) -> str:
 def _load_board_settings() -> dict[str, dict]:
     settings_path = _resolve_local_path(BOARD_SETTINGS_PATH)
     if not os.path.exists(settings_path):
+        vlog(f"WARN: boards.json not found at {settings_path}")
         return {}
     try:
         with open(settings_path, "r", encoding="utf-8") as f:
@@ -126,6 +127,7 @@ def _load_board_settings() -> dict[str, dict]:
                     continue
                 cfg["board_id"] = normalized_id
                 normalized[normalized_id] = cfg
+            vlog(f"boards.json loaded: {len(normalized)} boards from {settings_path}")
             return normalized
     except Exception as e:
         vlog("WARN: failed to load boards.json:", e)
@@ -212,8 +214,10 @@ def _normalize_board_id(board_id: T.Optional[str]) -> str:
 def _get_or_create_board(board_id: str) -> dict:
     board_id = _normalize_board_id(board_id)
     if not board_id:
+        vlog("invalid board_id: empty")
         raise ValueError("empty board_id")
     if board_id not in BOARD_SETTINGS:
+        vlog(f"invalid board_id: {board_id} not in BOARD_SETTINGS")
         raise ValueError("unknown board_id")
     return BOARD_SETTINGS[board_id]
 
@@ -1064,6 +1068,7 @@ async def login_post(board_id: str = Form(...)):
     if not board_id:
         return RedirectResponse("/login", status_code=303)
     if board_id not in BOARD_SETTINGS:
+        vlog(f"login rejected: board_id {board_id} not found in BOARD_SETTINGS")
         return HTMLResponse("Board ID not found", status_code=404)
     return RedirectResponse(f"/board/{board_id}", status_code=303)
 
