@@ -94,6 +94,7 @@ def _load_board_settings() -> dict[str, dict]:
         with open(BOARD_SETTINGS_PATH, "r", encoding="utf-8") as f:
             data = json.load(f)
         if isinstance(data, dict):
+            normalized: dict[str, dict] = {}
             # Backward-compat: older boards.json stored brightness as a dict.
             for bid, cfg in data.items():
                 if not isinstance(cfg, dict):
@@ -109,7 +110,12 @@ def _load_board_settings() -> dict[str, dict]:
                         cfg["brightness"] = int(anim)
                 elif isinstance(b, (int, float)):
                     cfg["brightness"] = int(b)
-            return data
+                normalized_id = _normalize_board_id(bid or cfg.get("board_id"))
+                if not normalized_id:
+                    continue
+                cfg["board_id"] = normalized_id
+                normalized[normalized_id] = cfg
+            return normalized
     except Exception as e:
         vlog("WARN: failed to load boards.json:", e)
     return {}
@@ -188,8 +194,11 @@ def _default_board_settings(board_id: str) -> dict:
         },
     }
 
+def _normalize_board_id(board_id: T.Optional[str]) -> str:
+    return (board_id or "").strip().upper()
+
 def _get_or_create_board(board_id: str) -> dict:
-    board_id = (board_id or "").strip()
+    board_id = _normalize_board_id(board_id)
     if not board_id:
         raise ValueError("empty board_id")
     if board_id not in BOARD_SETTINGS:
@@ -1039,7 +1048,7 @@ def login_get():
 
 @app.post("/login")
 async def login_post(board_id: str = Form(...)):
-    board_id = board_id.strip()
+    board_id = _normalize_board_id(board_id)
     if not board_id:
         return RedirectResponse("/login", status_code=303)
     if board_id not in BOARD_SETTINGS:
@@ -1049,6 +1058,7 @@ async def login_post(board_id: str = Form(...)):
 
 @app.get("/board/{board_id}", response_class=HTMLResponse)
 def board_settings_page(board_id: str):
+    board_id = _normalize_board_id(board_id)
     try:
         cfg = _get_or_create_board(board_id)
     except ValueError:
@@ -1531,6 +1541,7 @@ async def board_settings_save(
     an_speed: int = Form(120),
     an_color: str = Form("#FF5000"),
 ):
+    board_id = _normalize_board_id(board_id)
     cfg = _get_or_create_board(board_id)
 
     mode = mode if mode in ("live", "animation") else "live"
@@ -1626,7 +1637,7 @@ def _as_no_store(resp: JSONResponse) -> JSONResponse:
 
 @app.get("/board_settings")
 def board_settings_api(board_id: str = Query(...)):
-    board_id = board_id.strip()
+    board_id = _normalize_board_id(board_id)
     if not board_id:
         return _as_no_store(JSONResponse({"error": "missing board_id"}, status_code=400))
     try:
@@ -1735,7 +1746,7 @@ def states(
     If board_id is provided, we require that board to exist in boards.json.
     """
     if board_id is not None:
-        board_id = board_id.strip()
+        board_id = _normalize_board_id(board_id)
         if not board_id or board_id not in BOARD_SETTINGS:
             return JSONResponse({"error": "unknown board_id"}, status_code=403)
         # You *could* read mode here and e.g. short-circuit if mode=="animation".
@@ -1752,7 +1763,7 @@ def board_payload(
     board_id: str = Query(..., description="Board ID (5-char code)"),
     only: T.Optional[str] = Query(None, description="Comma-separated station names"),
 ):
-    board_id = board_id.strip()
+    board_id = _normalize_board_id(board_id)
     if not board_id:
         return JSONResponse({"error": "missing board_id"}, status_code=400)
     try:
