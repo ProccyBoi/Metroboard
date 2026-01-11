@@ -1184,7 +1184,7 @@ def login_get():
             <div>
               <div class="hero__title">Metroboard</div>
               <div class="hero__subtitle">Sign in to manage your board.</div>
-              <div class="hero__badge">Live network sync · Smart lighting</div>
+              <div class="hero__badge">Train + Metro network · Live sync</div>
             </div>
           </div>
           <div class="metro-strip" aria-hidden="true">
