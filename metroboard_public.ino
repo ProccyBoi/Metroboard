@@ -39,6 +39,12 @@ struct DeviceConfig {
   bool isValid() const { return ssid.length() > 0 && boardId.length() > 0; }
 };
 
+struct FirmwareInfo {
+  String version;
+  String url;
+  String sha256;
+};
+
 Preferences gPrefs;
 DeviceConfig gConfig = {DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS, DEFAULT_BOARD_ID};
 WebServer gConfigServer(80);
@@ -245,12 +251,6 @@ static String enc(const char *s) {
   return o;
 }
 
-struct FirmwareInfo {
-  String version;
-  String url;
-  String sha256;
-};
-
 static String firmwareMetaUrl() {
   String url = String(kPayloadBase);
   int slash = url.lastIndexOf('/');
@@ -355,6 +355,33 @@ static String sha256Hex(const unsigned char *digest, size_t len) {
   return out;
 }
 
+static inline void sha256Starts(mbedtls_sha256_context *ctx) {
+#if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03000000
+  mbedtls_sha256_starts_ret(ctx, 0);
+#else
+  mbedtls_sha256_starts(ctx, 0);
+#endif
+}
+
+static inline void sha256Update(mbedtls_sha256_context *ctx,
+                                const unsigned char *data,
+                                size_t len) {
+#if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03000000
+  mbedtls_sha256_update_ret(ctx, data, len);
+#else
+  mbedtls_sha256_update(ctx, data, len);
+#endif
+}
+
+static inline void sha256Finish(mbedtls_sha256_context *ctx,
+                                unsigned char output[32]) {
+#if defined(MBEDTLS_VERSION_NUMBER) && MBEDTLS_VERSION_NUMBER >= 0x03000000
+  mbedtls_sha256_finish_ret(ctx, output);
+#else
+  mbedtls_sha256_finish(ctx, output);
+#endif
+}
+
 static bool applyOtaUpdate(const FirmwareInfo &info) {
   bool isHttps = info.url.startsWith("https://");
   HTTPClient http;
@@ -395,7 +422,7 @@ static bool applyOtaUpdate(const FirmwareInfo &info) {
 
   mbedtls_sha256_context ctx;
   mbedtls_sha256_init(&ctx);
-  mbedtls_sha256_starts_ret(&ctx, 0);
+  sha256Starts(&ctx);
 
   int remaining = contentLength;
   while (http.connected() && (sizeUnknown || remaining > 0)) {
@@ -404,7 +431,7 @@ static bool applyOtaUpdate(const FirmwareInfo &info) {
       int toRead = (int)min((size_t)sizeof(buf), available);
       int read = stream->readBytes(buf, toRead);
       if (read > 0) {
-        mbedtls_sha256_update_ret(&ctx, buf, read);
+        sha256Update(&ctx, buf, read);
         size_t written = Update.write(buf, read);
         if (written != (size_t)read) {
           Update.abort();
@@ -423,7 +450,7 @@ static bool applyOtaUpdate(const FirmwareInfo &info) {
   }
 
   unsigned char digest[32];
-  mbedtls_sha256_finish_ret(&ctx, digest);
+  sha256Finish(&ctx, digest);
   mbedtls_sha256_free(&ctx);
 
   String computed = sha256Hex(digest, sizeof(digest));
