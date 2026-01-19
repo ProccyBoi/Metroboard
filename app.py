@@ -797,6 +797,14 @@ def load_station_route_pairs(path: str = "station_line_pairs.csv") -> dict[str, 
 # Call this at startup
 STATION_ROUTE_PAIRS: dict[str, set[str]] = {}
 
+FORCE_T1_PARENT_STOPS = {
+    "207310",  # Pymble
+    "207410",  # Turramurra
+    "207420",  # Warrawee
+    "207610",  # Wahroonga
+    "207710",  # Waitara
+}
+
 def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> tuple[
     list[tuple[T.Optional[float], T.Optional[float], T.Optional[str], str, int]],
     dict[str, int],
@@ -960,6 +968,9 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                     rs = sorted(possible_routes)[0]
                 if MB_VERBOSE:
                     vlog(f"Inferred route {rs} from stop {parent} (chose from {possible_routes})")
+
+        if parent in FORCE_T1_PARENT_STOPS and rs == "T9":
+            rs = "T1"
 
         rs = rs or None
         route_debug[rid] = rs
