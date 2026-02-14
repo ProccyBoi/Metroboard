@@ -21,12 +21,12 @@
     }
   },
   "Q7X9M": {
-    "board_id": "AB12C",
+    "board_id": "Q7X9M",
     "brightness": 16,
     "mode": "live",
     "night_mode": {
-      "enabled": false,
-      "start": "23:00",
+      "enabled": true,
+      "start": "22:30",
       "end": "06:00",
       "action": "off",
       "dim_level": 20
@@ -42,7 +42,7 @@
     }
   },
   "L2A5T": {
-    "board_id": "AB12C",
+    "board_id": "L2A5T",
     "brightness": 16,
     "mode": "live",
     "night_mode": {
@@ -63,7 +63,7 @@
     }
   },
   "ZP81N": {
-    "board_id": "AB12C",
+    "board_id": "ZP81N",
     "brightness": 16,
     "mode": "live",
     "night_mode": {
@@ -84,7 +84,7 @@
     }
   },
   "W3C6R": {
-    "board_id": "AB12C",
+    "board_id": "W3C6R",
     "brightness": 16,
     "mode": "live",
     "night_mode": {
