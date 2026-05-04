@@ -10,6 +10,7 @@
 import os
 import time
 import csv
+import gzip
 import json
 import shutil
 import re
@@ -122,10 +123,34 @@ def _gtfs_data_path(filename: str) -> str:
     candidate = os.path.join("gtfs", filename)
     if os.path.exists(_resolve_local_path(candidate)):
         return candidate
+    if filename == "stop_times.txt" and os.path.exists(_resolve_local_path(candidate + ".gz")):
+        return candidate
     return filename
+
+def _stop_times_has_valid_header(path: str) -> bool:
+    required = {"trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"}
+    if not os.path.exists(path):
+        return False
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        reader = csv.DictReader(f)
+        fields = set(reader.fieldnames or [])
+    return not (required - fields)
+
+def _inflate_stop_times_from_gzip(path: str) -> bool:
+    gz_path = os.getenv("STOP_TIMES_GZ_PATH") or (path + ".gz")
+    if not os.path.exists(gz_path):
+        return False
+    tmp = path + ".inflate"
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with gzip.open(gz_path, "rb") as f_in, open(tmp, "wb") as f_out:
+        shutil.copyfileobj(f_in, f_out, length=1024 * 1024)
+    os.replace(tmp, path)
+    return True
 
 def validate_stop_times_file(path: str) -> None:
     required = {"trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"}
+    if not _stop_times_has_valid_header(path):
+        _inflate_stop_times_from_gzip(path)
     try:
         with open(path, encoding="utf-8-sig", newline="") as f:
             reader = csv.DictReader(f)
