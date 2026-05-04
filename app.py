@@ -76,6 +76,7 @@ MB_VERBOSE = os.getenv("MB_VERBOSE", "1") == "1"
 MB_FORCE_DISTANCE = os.getenv("MB_FORCE_DISTANCE", "0") == "1"
 MB_TIMEZONE = os.getenv("MB_TIMEZONE", "Australia/Sydney")
 MB_STRICT_ROUTE_MATCH = _env_flag("MB_STRICT_ROUTE_MATCH", True)
+MB_ROUTE_NEAREST_MARGIN_M = int(os.getenv("MB_ROUTE_NEAREST_MARGIN_M", "250"))
 
 # BBox guardrail (None disables)
 DEFAULT_SYD_BBOX = (-34.2, 150.5, -33.4, 151.4)
@@ -389,6 +390,22 @@ def load_route_shortnames(routes_path: str = "routes.txt") -> dict[str, str]:
             if rs:
                 out[rid] = rs
     vlog(f"route_short: {len(out)} (ov={len(ov)})")
+    return out
+
+def load_trip_route_shortnames(
+    trips_path: str = "trips.txt",
+    routes_path: str = "routes.txt",
+) -> dict[str, str]:
+    route_id_to_short = load_route_shortnames(routes_path)
+    out: dict[str, str] = {}
+    with open(trips_path, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            tid = (r.get("trip_id") or "").strip()
+            rid = (r.get("route_id") or "").strip()
+            rs = (route_id_to_short.get(rid, "") or "").upper()
+            if tid and rs:
+                out[tid] = rs
+    vlog(f"trip_route_short: {len(out)}")
     return out
 
 # ---------------- Static GTFS filters: allowed parents & pairs ----------------
@@ -730,6 +747,39 @@ def extract_station_name_from_stop_id(stop_id: str) -> T.Optional[str]:
     
     return station_part if station_part else None
 
+def station_parent_from_realtime_stop_id(stop_id: str) -> T.Optional[str]:
+    parent = CHILD_TO_PARENT.get(stop_id) or (stop_id if is_num_parent(stop_id) else None)
+    if parent:
+        return parent
+    extracted_name = extract_station_name_from_stop_id(stop_id)
+    if extracted_name:
+        return STATION_NAME_TO_PARENT.get(extracted_name)
+    return None
+
+def route_nearest_station_names(
+    route_short: str,
+    lat: T.Optional[float],
+    lon: T.Optional[float],
+) -> set[str]:
+    if lat is None or lon is None:
+        return set()
+
+    route_short = (route_short or "").upper()
+    best_d: T.Optional[float] = None
+    distances: list[tuple[str, float]] = []
+
+    for name, meta in STATION_INDEX.items():
+        if (meta.get("route_short") or "").upper() != route_short:
+            continue
+        d = hav_m(meta["lat"], meta["lon"], lat, lon)
+        if best_d is None or d < best_d:
+            best_d = d
+        distances.append((name, d))
+
+    if best_d is None:
+        return set()
+    return {name for name, d in distances if d <= best_d + MB_ROUTE_NEAREST_MARGIN_M}
+
 # ---------------- GTFS-RT: fetch & parse ----------------
 _FEED_CACHE: T.Optional[rt.FeedMessage] = None
 _FEED_TS = 0.0
@@ -919,10 +969,12 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         # Resolve stop_id to parent station ID early for use in disambiguation
         parent = None
         if sid and STATION_ROUTE_PAIRS:
-            parent = CHILD_TO_PARENT.get(sid) or (sid if is_num_parent(sid) else None)
+            parent = station_parent_from_realtime_stop_id(sid)
 
-        # METHOD 1: Use static GTFS route mapping (most reliable)
+        # METHOD 1: Use exact static GTFS route/trip mapping when the feed provides it.
         rs = (route_id_to_short.get(rid, "") or "").upper()
+        if not rs and tripid:
+            rs = (TRIP_ID_TO_SHORT.get(tripid, "") or "").upper()
 
         # METHOD 2: Extract T/M code from route_id or trip_id
         if not rs:
@@ -949,7 +1001,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                         candidates = opts
                         break
             
-            # If we have candidates, use station info to pick the right one
+            # If we have candidates, use station info to pick the right one.
             if candidates and len(candidates) > 1 and parent and parent in STATION_ROUTE_PAIRS:
                 # Filter candidates to only those that serve this station
                 possible = set(candidates) & STATION_ROUTE_PAIRS[parent]
@@ -958,37 +1010,19 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                     if MB_VERBOSE:
                         vlog(f"Disambiguated {rid} at {parent}: {candidates} -> {rs}")
                 elif possible:
-                    # Multiple matches - use better heuristics
-                    
-                    # Priority 1: T8 keywords (Airport/South)
+                    # Multiple matches - only accept strong hints. Do not hash/guess.
                     if any(x in rid.upper() for x in ["AIR", "SHL", "APT", "ESS", "AIRS"]) and "T8" in possible:
                         rs = "T8"
-                    
-                    # Priority 2: T9 keywords (North Shore express)
+                    elif parent in FORCE_T1_PARENT_STOPS and "T1" in possible:
+                        rs = "T1"
                     elif any(x in rid.upper() for x in ["NSN", "NTH"]) and "T9" in possible and "T1" in possible:
-                        # Use hash of trip_id to distribute between T1 and T9
-                        # This gives consistent assignment per trip without needing to track history
-                        trip_hash = abs(hash(tripid or rid))
-                        # Roughly 60% T1 (stopping), 40% T9 (express) to match real-world distribution
-                        if trip_hash % 10 < 6:
-                            rs = "T1"
-                        else:
-                            rs = "T9"
-                    
-                    # Priority 3: Use trip_id/route_id hash for consistent distribution
-                    else:
-                        sorted_possible = sorted(possible)
-                        trip_hash = abs(hash(tripid or rid))
-                        rs = sorted_possible[trip_hash % len(sorted_possible)]
-                    
-                    if MB_VERBOSE and len(possible) > 1:
+                        rs = None
+                    if MB_VERBOSE and rs:
                         vlog(f"Multi-route disambiguation {rid} at {parent}: {possible} -> {rs}")
                 else:
-                    # None of the candidates serve this station - station data might be wrong
-                    # Fall back to hash-based selection from original candidates
-                    rs = candidates[abs(hash(tripid or rid)) % len(candidates)]
+                    rs = None
             elif candidates:
-                rs = candidates[0] if len(candidates) == 1 else candidates[abs(hash(tripid or rid)) % len(candidates)]
+                rs = candidates[0] if len(candidates) == 1 else None
 
         # METHOD 4: Infer from exact platform only when static GTFS says it is unique.
         if not rs and sid and sid in STOP_ROUTE_PAIRS:
@@ -1051,6 +1085,7 @@ if CORS_ALLOW_ORIGIN:
     )
 
 ROUTE_ID_TO_SHORT: dict[str, str] = {}
+TRIP_ID_TO_SHORT: dict[str, str] = {}
 STATION_INDEX: dict[str, dict] = {}
 CHILD_TO_PARENT: dict[str, str] = {}
 STATION_ROUTE_PAIRS: dict[str, set[str]] = {}
@@ -1059,11 +1094,12 @@ STATION_NAME_TO_PARENT: dict[str, str] = {}
 
 @app.on_event("startup")
 def _startup():
-    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS, STATION_ROUTE_PAIRS, STOP_ROUTE_PAIRS, STATION_NAME_TO_PARENT
+    global ROUTE_ID_TO_SHORT, TRIP_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS, STATION_ROUTE_PAIRS, STOP_ROUTE_PAIRS, STATION_NAME_TO_PARENT
 
     BOARD_SETTINGS = _load_board_settings()
 
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
+    TRIP_ID_TO_SHORT = load_trip_route_shortnames("trips.txt", "routes.txt")
     STATION_ROUTE_PAIRS = load_station_route_pairs("station_line_pairs.csv")
     STOP_ROUTE_PAIRS = load_stop_route_pairs("stops.txt", "routes.txt", "trips.txt", "stop_times.txt")
     CHILD_TO_PARENT = build_child_to_parent("stops.txt")
@@ -1947,6 +1983,7 @@ def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
     matches = 0
     dist_fb = 0
     name_matches = 0  # NEW: track name-based matches
+    nearest_by_train: dict[int, set[str]] = {}
 
     for name, meta in subset.items():
         pid = meta["stop_id"]
@@ -1956,13 +1993,14 @@ def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
         best = 0
         best_d = None
 
-        for (tlat, tlon, train_route, child_sid, st) in trains:
+        for train_idx, (tlat, tlon, train_route, child_sid, st) in enumerate(trains):
             if train_route is None:
                 if MB_STRICT_ROUTE_MATCH:
                     continue
             elif train_route != station_route:
                 continue
 
+            parent = None
             if not MB_FORCE_DISTANCE and child_sid:
                 # Try 1: Direct parent lookup (numeric GTFS stop_ids)
                 parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
@@ -1985,6 +2023,12 @@ def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
                         matches += 1
 
             if best < 3 and tlat is not None and tlon is not None:
+                if parent != pid:
+                    if train_idx not in nearest_by_train:
+                        nearest_by_train[train_idx] = route_nearest_station_names(station_route, tlat, tlon)
+                    nearest = nearest_by_train[train_idx]
+                    if nearest and name not in nearest:
+                        continue
                 d = hav_m(slat, slon, tlat, tlon)
                 if best_d is None or d < best_d:
                     best_d = d
