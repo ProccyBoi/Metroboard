@@ -75,6 +75,7 @@ CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN")
 MB_VERBOSE = os.getenv("MB_VERBOSE", "1") == "1"
 MB_FORCE_DISTANCE = os.getenv("MB_FORCE_DISTANCE", "0") == "1"
 MB_TIMEZONE = os.getenv("MB_TIMEZONE", "Australia/Sydney")
+MB_STRICT_ROUTE_MATCH = _env_flag("MB_STRICT_ROUTE_MATCH", True)
 
 # BBox guardrail (None disables)
 DEFAULT_SYD_BBOX = (-34.2, 150.5, -33.4, 151.4)
@@ -794,8 +795,44 @@ def load_station_route_pairs(path: str = "station_line_pairs.csv") -> dict[str, 
     
     return pairs
 
-# Call this at startup
-STATION_ROUTE_PAIRS: dict[str, set[str]] = {}
+def load_stop_route_pairs(
+    stops="stops.txt",
+    routes="routes.txt",
+    trips="trips.txt",
+    stop_times="stop_times.txt",
+    route_short_allow: set[str] = ROUTE_SHORT_ALLOW,
+) -> dict[str, set[str]]:
+    """Load child stop_id -> set of route_short from static GTFS stop_times."""
+    route_id_to_short = load_route_shortnames(routes)
+
+    trip_route: dict[str, str] = {}
+    with open(trips, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            trip_route[(r.get("trip_id") or "").strip()] = (r.get("route_id") or "").strip()
+
+    stops_seen: set[str] = set()
+    with open(stops, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            sid = (r.get("stop_id") or "").strip()
+            if sid:
+                stops_seen.add(sid)
+
+    pairs: dict[str, set[str]] = {}
+    with open(stop_times, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            sid = (r.get("stop_id") or "").strip()
+            if not sid or sid not in stops_seen:
+                continue
+            rid = trip_route.get((r.get("trip_id") or "").strip(), "")
+            rs = (route_id_to_short.get(rid, "") or "").upper()
+            if not rs:
+                continue
+            if route_short_allow and rs not in route_short_allow:
+                continue
+            pairs.setdefault(sid, set()).add(rs)
+
+    vlog(f"Loaded {len(pairs)} stop->route mappings from static GTFS")
+    return pairs
 
 FORCE_T1_PARENT_STOPS = {
     "207310",  # Pymble
@@ -952,7 +989,16 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                     rs = candidates[abs(hash(tripid or rid)) % len(candidates)]
             elif candidates:
                 rs = candidates[0] if len(candidates) == 1 else candidates[abs(hash(tripid or rid)) % len(candidates)]
-        # METHOD 4: Infer from stop_id using station_line_pairs.csv
+
+        # METHOD 4: Infer from exact platform only when static GTFS says it is unique.
+        if not rs and sid and sid in STOP_ROUTE_PAIRS:
+            possible_routes = STOP_ROUTE_PAIRS[sid]
+            if len(possible_routes) == 1:
+                rs = next(iter(possible_routes))
+                if MB_VERBOSE:
+                    vlog(f"Inferred route {rs} from stop_id {sid} (unique platform)")
+
+        # METHOD 5: Infer from stop_id using station_line_pairs.csv
         # Only used as absolute last resort
         if not rs and parent and parent in STATION_ROUTE_PAIRS:
             possible_routes = STATION_ROUTE_PAIRS[parent]
@@ -961,13 +1007,11 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                 if MB_VERBOSE:
                     vlog(f"Inferred route {rs} from stop {parent} (only option)")
             elif len(possible_routes) > 1:
-                # Prefer T8 if AIR/SHL keywords present
+                # Only choose from a multi-line station when the feed carries a strong route hint.
                 if any(x in rid.upper() for x in ["AIR", "SHL", "APT", "ESS"]) and "T8" in possible_routes:
                     rs = "T8"
-                else:
-                    rs = sorted(possible_routes)[0]
-                if MB_VERBOSE:
-                    vlog(f"Inferred route {rs} from stop {parent} (chose from {possible_routes})")
+                    if MB_VERBOSE:
+                        vlog(f"Inferred route {rs} from stop {parent} (keyword from {possible_routes})")
 
         if parent in FORCE_T1_PARENT_STOPS and rs == "T9":
             rs = "T1"
@@ -1010,16 +1054,18 @@ ROUTE_ID_TO_SHORT: dict[str, str] = {}
 STATION_INDEX: dict[str, dict] = {}
 CHILD_TO_PARENT: dict[str, str] = {}
 STATION_ROUTE_PAIRS: dict[str, set[str]] = {}
+STOP_ROUTE_PAIRS: dict[str, set[str]] = {}
 STATION_NAME_TO_PARENT: dict[str, str] = {}
 
 @app.on_event("startup")
 def _startup():
-    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS, STATION_ROUTE_PAIRS, STATION_NAME_TO_PARENT
+    global ROUTE_ID_TO_SHORT, STATION_INDEX, CHILD_TO_PARENT, BOARD_SETTINGS, STATION_ROUTE_PAIRS, STOP_ROUTE_PAIRS, STATION_NAME_TO_PARENT
 
     BOARD_SETTINGS = _load_board_settings()
 
     ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
     STATION_ROUTE_PAIRS = load_station_route_pairs("station_line_pairs.csv")
+    STOP_ROUTE_PAIRS = load_stop_route_pairs("stops.txt", "routes.txt", "trips.txt", "stop_times.txt")
     CHILD_TO_PARENT = build_child_to_parent("stops.txt")
     
     allowed_parents = require_allowed_parents(
@@ -1911,7 +1957,10 @@ def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
         best_d = None
 
         for (tlat, tlon, train_route, child_sid, st) in trains:
-            if train_route is not None and train_route != station_route:
+            if train_route is None:
+                if MB_STRICT_ROUTE_MATCH:
+                    continue
+            elif train_route != station_route:
                 continue
 
             if not MB_FORCE_DISTANCE and child_sid:
