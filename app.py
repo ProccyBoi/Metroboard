@@ -1216,7 +1216,12 @@ def root():
 @app.get("/healthz")
 def healthz():
     age = None if _FEED_TS == 0 else (time.time() - _FEED_TS)
-    return {"status": "ok", "stations": len(STATION_INDEX), "trains_last_fetch_s": age}
+    return {
+        "status": "ok",
+        "stations": len(STATION_INDEX),
+        "stop_route_pairs": len(STOP_ROUTE_PAIRS),
+        "trains_last_fetch_s": age,
+    }
 
 @app.get("/login", response_class=HTMLResponse)
 def login_get(error: T.Optional[str] = Query(None)):
@@ -1936,6 +1941,7 @@ def debug():
     trains, by_route, route_debug = collect_trains(feed, ROUTE_ID_TO_SHORT)
     return {
         "stations_count": len(STATION_INDEX),
+        "stop_route_pairs": len(STOP_ROUTE_PAIRS),
         "bbox": list(SYD_BBOX) if SYD_BBOX else None,
         "feeds": URLS_VP,
         "total_trains": len(trains),
