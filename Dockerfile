@@ -4,6 +4,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY stops.txt routes.txt trips.txt agency.txt /app/
 COPY gtfs/stop_times.txt /app/gtfs/stop_times.txt
+COPY gtfs/stop_times.txt.gz /app/gtfs/stop_times.txt.gz
 COPY scripts/ensure_stop_times.py /app/scripts/ensure_stop_times.py
 ENV STOP_TIMES_PATH=/app/gtfs/stop_times.txt
 RUN python /app/scripts/ensure_stop_times.py
