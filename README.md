@@ -15,7 +15,7 @@ Metroboard is a FastAPI service that converts Transport for NSW (TfNSW) GTFS-Rea
 - Firmware payload endpoint for easy embedded-device integration.
 
 ## How it works (technical overview)
-1. **Static GTFS load**: Reads `stops.txt`, `routes.txt`, `trips.txt`, `stop_times.txt`, and `agency.txt` from the repository root. Optional files include `stations_whitelist.txt` and `route_overrides.csv`.
+1. **Static GTFS load**: Reads `stops.txt`, `routes.txt`, `trips.txt`, and `agency.txt` from the repository root, plus the Git LFS-backed `gtfs/stop_times.txt`. Optional files include `stations_whitelist.txt` and `route_overrides.csv`.
 2. **Route mapping**: Builds a route short-name mapping and applies overrides (CSV or JSON) when present.
 3. **Station index**: Filters to rail/metro routes, keeps numeric parent stations, and builds station+route keys used by the LED board.
 4. **Realtime merge**: Fetches GTFS-Realtime feeds, merges data, and caches responses for a short interval.
@@ -39,6 +39,7 @@ Environment variables:
 - `MB_AGENCIES`, `MB_ROUTE_SHORT_ALLOW` (allowlists for agencies/route shorts).
 - `ROUTE_SHORT_OVERRIDES_PATH`, `ROUTE_SHORT_OVERRIDES_JSON` (override route short names).
 - `BOARD_SETTINGS_PATH` (board config file; default `boards.json`).
+- `STOP_TIMES_PATH` or `GTFS_STOP_TIMES_PATH` (override the stop times file; default prefers `gtfs/stop_times.txt`).
 - `CORS_ALLOW_ORIGIN` (comma-separated CORS origins).
 - `SYD_BBOX` or `SYD_BBOX_DISABLE` (configure/disable bounding box guardrail).
 - `MB_VERBOSE` (logging verbosity; default on).
@@ -47,7 +48,7 @@ Environment variables:
 
 ## Data files
 Place these alongside `app.py` (repository root):
-- Required: `stops.txt`, `routes.txt`, `trips.txt`, `stop_times.txt`, `agency.txt`
+- Required: `stops.txt`, `routes.txt`, `trips.txt`, `agency.txt`, `gtfs/stop_times.txt`
 - Optional: `stations_whitelist.txt`, `route_overrides.csv`
 
 ## API endpoints

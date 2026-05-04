@@ -108,6 +108,37 @@ def _resolve_local_path(path: str) -> str:
     base_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_dir, path)
 
+GTFS_DIR = os.getenv("GTFS_DIR", "").strip()
+
+def _gtfs_data_path(filename: str) -> str:
+    stem = os.path.splitext(filename)[0].upper()
+    override = os.getenv(f"GTFS_{stem}_PATH")
+    if filename == "stop_times.txt":
+        override = os.getenv("STOP_TIMES_PATH") or override
+    if override:
+        return override
+    if GTFS_DIR:
+        return os.path.join(GTFS_DIR, filename)
+    candidate = os.path.join("gtfs", filename)
+    if os.path.exists(_resolve_local_path(candidate)):
+        return candidate
+    return filename
+
+def validate_stop_times_file(path: str) -> None:
+    required = {"trip_id", "arrival_time", "departure_time", "stop_id", "stop_sequence"}
+    try:
+        with open(path, encoding="utf-8-sig", newline="") as f:
+            reader = csv.DictReader(f)
+            fields = set(reader.fieldnames or [])
+    except FileNotFoundError:
+        raise RuntimeError(f"Missing GTFS stop_times file: {path}")
+    missing = required - fields
+    if missing:
+        found = ", ".join(reader.fieldnames or [])
+        raise RuntimeError(
+            f"Invalid GTFS stop_times file {path}: missing {sorted(missing)}; found [{found}]"
+        )
+
 def _load_board_settings() -> dict[str, dict]:
     if not PERSIST_USER_SETTINGS:
         vlog("persisted board settings disabled; skipping load")
@@ -850,10 +881,19 @@ def load_stop_route_pairs(
     routes="routes.txt",
     trips="trips.txt",
     stop_times="stop_times.txt",
+    types=(1, 2),
     route_short_allow: set[str] = ROUTE_SHORT_ALLOW,
 ) -> dict[str, set[str]]:
     """Load child stop_id -> set of route_short from static GTFS stop_times."""
     route_id_to_short = load_route_shortnames(routes)
+    route_types: dict[str, int] = {}
+    with open(routes, encoding="utf-8-sig") as f:
+        for r in csv.DictReader(f):
+            rid = (r.get("route_id") or "").strip()
+            try:
+                route_types[rid] = int((r.get("route_type") or "3").strip() or "3")
+            except Exception:
+                route_types[rid] = 3
 
     trip_route: dict[str, str] = {}
     with open(trips, encoding="utf-8-sig") as f:
@@ -874,6 +914,8 @@ def load_stop_route_pairs(
             if not sid or sid not in stops_seen:
                 continue
             rid = trip_route.get((r.get("trip_id") or "").strip(), "")
+            if types and route_types.get(rid) not in types:
+                continue
             rs = (route_id_to_short.get(rid, "") or "").upper()
             if not rs:
                 continue
@@ -1098,18 +1140,26 @@ def _startup():
 
     BOARD_SETTINGS = _load_board_settings()
 
-    ROUTE_ID_TO_SHORT = load_route_shortnames("routes.txt")
-    TRIP_ID_TO_SHORT = load_trip_route_shortnames("trips.txt", "routes.txt")
+    stops_path = _gtfs_data_path("stops.txt")
+    routes_path = _gtfs_data_path("routes.txt")
+    trips_path = _gtfs_data_path("trips.txt")
+    stop_times_path = _gtfs_data_path("stop_times.txt")
+    agency_path = _gtfs_data_path("agency.txt")
+
+    validate_stop_times_file(stop_times_path)
+
+    ROUTE_ID_TO_SHORT = load_route_shortnames(routes_path)
+    TRIP_ID_TO_SHORT = load_trip_route_shortnames(trips_path, routes_path)
     STATION_ROUTE_PAIRS = load_station_route_pairs("station_line_pairs.csv")
-    STOP_ROUTE_PAIRS = load_stop_route_pairs("stops.txt", "routes.txt", "trips.txt", "stop_times.txt")
-    CHILD_TO_PARENT = build_child_to_parent("stops.txt")
+    STOP_ROUTE_PAIRS = load_stop_route_pairs(stops_path, routes_path, trips_path, stop_times_path)
+    CHILD_TO_PARENT = build_child_to_parent(stops_path)
     
     allowed_parents = require_allowed_parents(
-        stops="stops.txt",
-        routes="routes.txt",
-        trips="trips.txt",
-        stop_times="stop_times.txt",
-        agency="agency.txt",
+        stops=stops_path,
+        routes=routes_path,
+        trips=trips_path,
+        stop_times=stop_times_path,
+        agency=agency_path,
         types=(1, 2),
         agencies_allowed=AGENCY_NAME_ALLOW,
         route_short_allow=ROUTE_SHORT_ALLOW,
@@ -1123,11 +1173,11 @@ def _startup():
         vlog(f"allowed_pairs from station_line_pairs: {len(allowed_pairs)} (stations={len(STATION_ROUTE_PAIRS)})")
     else:
         allowed_pairs = require_allowed_pairs(
-            stops="stops.txt",
-            routes="routes.txt",
-            trips="trips.txt",
-            stop_times="stop_times.txt",
-            agency="agency.txt",
+            stops=stops_path,
+            routes=routes_path,
+            trips=trips_path,
+            stop_times=stop_times_path,
+            agency=agency_path,
             types=(1, 2),
             agencies_allowed=AGENCY_NAME_ALLOW,
             route_short_allow=ROUTE_SHORT_ALLOW,
@@ -1138,7 +1188,7 @@ def _startup():
     sid_w, name_w = load_whitelist(wl_path)
 
     STATION_INDEX = load_station_index(
-        "stops.txt",
+        stops_path,
         bbox=SYD_BBOX,
         sid_whitelist=sid_w,
         name_whitelist=name_w,

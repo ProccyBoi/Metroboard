@@ -2,7 +2,11 @@ FROM python:3.11-slim
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY stops.txt routes.txt trips.txt stop_times.txt agency.txt /app/
+COPY stops.txt routes.txt trips.txt agency.txt /app/
+COPY gtfs/stop_times.txt /app/gtfs/stop_times.txt
+COPY scripts/ensure_stop_times.py /app/scripts/ensure_stop_times.py
+ENV STOP_TIMES_PATH=/app/gtfs/stop_times.txt
+RUN python /app/scripts/ensure_stop_times.py
 COPY station_line_pairs.txt station_line_pairs.csv /app/
 COPY boards.json /app/
 COPY app.py .
