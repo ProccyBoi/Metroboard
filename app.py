@@ -119,12 +119,19 @@ def _gtfs_data_path(filename: str) -> str:
     if override:
         return override
     if GTFS_DIR:
-        return os.path.join(GTFS_DIR, filename)
+        candidate = os.path.join(GTFS_DIR, filename)
+        if os.path.exists(_resolve_local_path(candidate)):
+            return candidate
+        if filename == "stop_times.txt" and os.path.exists(_resolve_local_path(candidate + ".gz")):
+            return candidate
     candidate = os.path.join("gtfs", filename)
     if os.path.exists(_resolve_local_path(candidate)):
         return candidate
     if filename == "stop_times.txt" and os.path.exists(_resolve_local_path(candidate + ".gz")):
         return candidate
+    root_candidate = _resolve_local_path(filename)
+    if os.path.exists(root_candidate):
+        return root_candidate
     return filename
 
 def _stop_times_has_valid_header(path: str) -> bool:
