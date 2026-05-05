@@ -83,8 +83,20 @@ MB_GUESS_AMBIGUOUS = _env_flag("MB_GUESS_AMBIGUOUS", True)
 MB_ROUTE_NEAREST_MARGIN_M = int(os.getenv("MB_ROUTE_NEAREST_MARGIN_M", "250"))
 
 IGNORED_ROUTE_PREFIXES = {"RTTA"}
+NO_STATION_INFERENCE_PREFIXES = IGNORED_ROUTE_PREFIXES | {"CTY"}
 ROUTE_PREFIX_DEFAULTS = {
     "NTH": "T9",
+}
+ROUTE_ID_EXACT_MAP = {
+    # Confirmed against the AnyTrip route endpoint used by tfnsw.joshchans.com.
+    # These operational route IDs are not present in static GTFS routes.txt.
+    "CTY_NC1A": "NRC",
+    "CTY_NC2": "NRC",
+    "CTY_NW1D": "NRW",
+    "CTY_W2A": "WST",
+    "CTY_S1C": "STH",
+    "CTY_S2A": "STH",
+    "CTY_S2B": "STH",
 }
 
 # BBox guardrail (None disables)
@@ -1024,10 +1036,10 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
     ROUTE_PREFIX_MAP = {
         # Core Sydney Trains lines
         "BMT": ["BMT"],          # Blue Mountains Line
-        "NTH": ["T1", "T9"],     # Northern/North Shore ambiguous; prefer T9 if forced to guess
+        "NTH": ["T9"],           # Northern Line
         "WST": ["T1"],           # Western Line  
         "APS": ["T8"],           # Airport & South Line - FIXED! Was wrongly T1/T9
-        "CTY": ["T2"],           # Inner West & Leppington
+        "CTY": [],               # NSW TrainLink exact IDs handled above
         "IWL": ["T2"],           # Inner West & Leppington
         "LPP": ["T2"],           # Leppington specific
         "T2": ["T2"],            # Direct T2 code
@@ -1038,12 +1050,12 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         "OLY": ["T7"],           # Olympic Park Line
         "T7": ["T7"],            # Olympic Park
         "APT": ["T8"],           # Airport Line
-        "SHL": ["T8"],           # South/Airport Line
+        "SHL": ["SHL"],          # Southern Highlands Line
         "AIRS": ["T8"],          # Airport & South
         "AIR": ["T8"],           # Airport
         "ESS": ["T8"],           # Eastern Suburbs South
         "T8": ["T8"],            # Direct T8
-        "NSN": ["T9"],           # Northern Line
+        "NSN": ["T1"],           # North Shore Line
         
         # Regional lines
         "SCO": ["SCO"],          # South Coast Line
@@ -1089,6 +1101,11 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                     rs = m.group(1).upper()
                     break
 
+        # METHOD 2.5: Resolve full realtime operational route IDs that static
+        # GTFS does not list, but public departure data exposes directly.
+        if not rs and rid:
+            rs = ROUTE_ID_EXACT_MAP.get(rid.upper(), "")
+
         # METHOD 3: Use prefix mapping with station-based disambiguation
         if not rs and rid:
             prefix = route_id_prefix(rid)
@@ -1125,8 +1142,10 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                     preferred_route_candidate(prefix, candidates) if MB_GUESS_AMBIGUOUS else None
                 )
 
+        allow_station_inference = route_id_prefix(rid) not in NO_STATION_INFERENCE_PREFIXES
+
         # METHOD 4: Infer from exact platform only when static GTFS says it is unique.
-        if not rs and sid and sid in STOP_ROUTE_PAIRS:
+        if not rs and allow_station_inference and sid and sid in STOP_ROUTE_PAIRS:
             possible_routes = STOP_ROUTE_PAIRS[sid]
             if len(possible_routes) == 1:
                 rs = next(iter(possible_routes))
@@ -1135,7 +1154,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
 
         # METHOD 5: Infer from stop_id using station_line_pairs.csv
         # Only used as absolute last resort
-        if not rs and parent and parent in STATION_ROUTE_PAIRS:
+        if not rs and allow_station_inference and parent and parent in STATION_ROUTE_PAIRS:
             possible_routes = STATION_ROUTE_PAIRS[parent]
             if len(possible_routes) == 1:
                 rs = list(possible_routes)[0]
