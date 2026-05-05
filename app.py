@@ -74,10 +74,13 @@ BOARD_SETTINGS_VERSION: int = 0
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
 CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN")
 MB_VERBOSE = os.getenv("MB_VERBOSE", "1") == "1"
+MB_RESOLUTION_VERBOSE = os.getenv("MB_RESOLUTION_VERBOSE", "0") == "1"
 MB_FORCE_DISTANCE = os.getenv("MB_FORCE_DISTANCE", "0") == "1"
 MB_TIMEZONE = os.getenv("MB_TIMEZONE", "Australia/Sydney")
 MB_STRICT_ROUTE_MATCH = _env_flag("MB_STRICT_ROUTE_MATCH", True)
 MB_ROUTE_NEAREST_MARGIN_M = int(os.getenv("MB_ROUTE_NEAREST_MARGIN_M", "250"))
+
+IGNORED_ROUTE_PREFIXES = {"RTTA"}
 
 # BBox guardrail (None disables)
 DEFAULT_SYD_BBOX = (-34.2, 150.5, -33.4, 151.4)
@@ -98,6 +101,9 @@ SYD_BBOX = _bbox_env()
 def vlog(*a):
     if MB_VERBOSE:
         print("[metroboard]", *a)
+
+def route_id_prefix(route_id: str) -> str:
+    return (route_id or "").split("_", 1)[0].split(".", 1)[0].upper()
 
 def _resolve_local_path(path: str) -> str:
     if not path:
@@ -987,7 +993,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         "WST": ["T1"],           # Western Line  
         "APS": ["T8"],           # Airport & South Line - FIXED! Was wrongly T1/T9
         "CTY": ["T2"],           # Inner West & Leppington
-        "IWL": ["T2", "T4"],     # Inner West (can be T2 or T4)
+        "IWL": ["T2"],           # Inner West & Leppington
         "LPP": ["T2"],           # Leppington specific
         "T2": ["T2"],            # Direct T2 code
         "T3": ["T3"],            # Bankstown Line
@@ -1050,7 +1056,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
 
         # METHOD 3: Use prefix mapping with station-based disambiguation
         if not rs and rid:
-            prefix = rid.split("_", 1)[0].split(".")[0].upper()
+            prefix = route_id_prefix(rid)
             candidates = []
             
             # Try exact match first
@@ -1063,7 +1069,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                 possible = set(candidates) & STATION_ROUTE_PAIRS[parent]
                 if len(possible) == 1:
                     rs = list(possible)[0]
-                    if MB_VERBOSE:
+                    if MB_RESOLUTION_VERBOSE:
                         vlog(f"Disambiguated {rid} at {parent}: {candidates} -> {rs}")
                 elif possible:
                     # Multiple matches - only accept strong hints. Do not hash/guess.
@@ -1073,7 +1079,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                         rs = "T1"
                     elif any(x in rid.upper() for x in ["NSN", "NTH"]) and "T9" in possible and "T1" in possible:
                         rs = None
-                    if MB_VERBOSE and rs:
+                    if MB_RESOLUTION_VERBOSE and rs:
                         vlog(f"Multi-route disambiguation {rid} at {parent}: {possible} -> {rs}")
                 else:
                     rs = None
@@ -1085,7 +1091,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
             possible_routes = STOP_ROUTE_PAIRS[sid]
             if len(possible_routes) == 1:
                 rs = next(iter(possible_routes))
-                if MB_VERBOSE:
+                if MB_RESOLUTION_VERBOSE:
                     vlog(f"Inferred route {rs} from stop_id {sid} (unique platform)")
 
         # METHOD 5: Infer from stop_id using station_line_pairs.csv
@@ -1094,13 +1100,13 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
             possible_routes = STATION_ROUTE_PAIRS[parent]
             if len(possible_routes) == 1:
                 rs = list(possible_routes)[0]
-                if MB_VERBOSE:
+                if MB_RESOLUTION_VERBOSE:
                     vlog(f"Inferred route {rs} from stop {parent} (only option)")
             elif len(possible_routes) > 1:
                 # Only choose from a multi-line station when the feed carries a strong route hint.
                 if any(x in rid.upper() for x in ["AIR", "SHL", "APT", "ESS"]) and "T8" in possible_routes:
                     rs = "T8"
-                    if MB_VERBOSE:
+                    if MB_RESOLUTION_VERBOSE:
                         vlog(f"Inferred route {rs} from stop {parent} (keyword from {possible_routes})")
 
         if parent in FORCE_T1_PARENT_STOPS and rs == "T9":
@@ -1112,7 +1118,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
 
         rs = rs or None
         route_debug[rid] = rs
-        if not rs and rid:
+        if not rs and rid and route_id_prefix(rid) not in IGNORED_ROUTE_PREFIXES:
             missing_routes[rid] = missing_routes.get(rid, 0) + 1
 
         if rs and ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW:
@@ -1961,7 +1967,14 @@ def debug():
         "feeds": URLS_VP,
         "total_trains": len(trains),
         "routes_found": sorted(by_route.keys()),
-        "routes_missing": [r for r, v in route_debug.items() if v is None],
+        "routes_missing": [
+            r for r, v in route_debug.items()
+            if v is None and route_id_prefix(r) not in IGNORED_ROUTE_PREFIXES
+        ],
+        "routes_ignored": [
+            r for r, v in route_debug.items()
+            if v is None and route_id_prefix(r) in IGNORED_ROUTE_PREFIXES
+        ],
         "routes_resolved": route_debug,
     }
 
