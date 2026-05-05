@@ -843,6 +843,36 @@ def route_nearest_station_names(
         return set()
     return {name for name, d in distances if d <= best_d + MB_ROUTE_NEAREST_MARGIN_M}
 
+def route_nearest_distance_m(
+    route_short: str,
+    lat: T.Optional[float],
+    lon: T.Optional[float],
+) -> float:
+    if lat is None or lon is None:
+        return float("inf")
+    route_short = (route_short or "").upper()
+    best = float("inf")
+    for meta in STATION_INDEX.values():
+        if (meta.get("route_short") or "").upper() != route_short:
+            continue
+        best = min(best, hav_m(meta["lat"], meta["lon"], lat, lon))
+    return best
+
+def route_assignment_is_plausible(
+    route_short: str,
+    parent: T.Optional[str],
+    lat: T.Optional[float],
+    lon: T.Optional[float],
+) -> bool:
+    route_short = (route_short or "").upper()
+    if not route_short:
+        return False
+
+    if parent and parent in STATION_ROUTE_PAIRS:
+        return route_short in STATION_ROUTE_PAIRS[parent]
+
+    return route_nearest_distance_m(route_short, lat, lon) <= D_FAR
+
 # ---------------- GTFS-RT: fetch & parse ----------------
 _FEED_CACHE: T.Optional[rt.FeedMessage] = None
 _FEED_TS = 0.0
@@ -1068,12 +1098,6 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
             # Try exact match first
             if prefix in ROUTE_PREFIX_MAP:
                 candidates = ROUTE_PREFIX_MAP[prefix]
-            else:
-                # Try substring match
-                for key, opts in ROUTE_PREFIX_MAP.items():
-                    if key and key in prefix:
-                        candidates = opts
-                        break
             
             # If we have candidates, use station info to pick the right one.
             if candidates and len(candidates) > 1 and parent and parent in STATION_ROUTE_PAIRS:
@@ -1124,6 +1148,15 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         if parent in FORCE_T1_PARENT_STOPS and rs == "T9":
             rs = "T1"
 
+        status = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
+        lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
+        lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
+
+        if rs and not route_assignment_is_plausible(rs, parent, lat, lon):
+            if MB_VERBOSE:
+                vlog(f"Rejected implausible route {rs} for rid={rid} stop={sid} parent={parent} lat={lat} lon={lon}")
+            rs = ""
+
         rs = rs or None
         route_debug[rid] = rs
         if not rs and rid:
@@ -1132,9 +1165,6 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         if rs and ROUTE_SHORT_ALLOW and rs not in ROUTE_SHORT_ALLOW:
             continue
 
-        status = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
-        lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
-        lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
         trains.append((lat, lon, rs, sid, status))
         if rs:
             by_route[rs] = by_route.get(rs, 0) + 1
