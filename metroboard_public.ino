@@ -1,76 +1,64 @@
-// Metroboard — public deployment sketch.
+// Metroboard — Solid-at-Station with settings+states payload, no flicker,
+// BRIGHTNESS=16, Grace TTL, Coalesced Batch Updates
 
 #include <Adafruit_NeoPixel.h>
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
-#include <Preferences.h>
-#include <Update.h>
-#include <WebServer.h>
-#include <DNSServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <time.h>
 
-// =========================================
-// ===== Optional defaults (leave blank) ===
-// =========================================
-// These values are only used if no settings are saved in flash.
-#define DEFAULT_WIFI_SSID ""
-#define DEFAULT_WIFI_PASS ""
-#define DEFAULT_BOARD_ID ""
-// =========================================
-// =========================================
-// =========================================
+// ===== WiFi / Endpoint =====
+#define WIFI_SSID "Bob"
+#define WIFI_PASS "96365509"
 
-static const char *kPayloadBase =
+// NOTE: Use board_payload for combined settings + states
+static const char* kBoardId = "AB12C";  // unique per Metroboard
+static const char* kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
 
-static const char *kFirmwareVersion = "1.4.1";
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
-static const uint32_t SETTINGS_FETCH_MS = 30000;
-static const uint32_t OTA_CHECK_MS = 15UL * 60UL * 1000UL;
-static const uint32_t OTA_STARTUP_DELAY_MS = 60UL * 1000UL;
-
-struct DeviceConfig {
-  String ssid;
-  String pass;
-  String boardId;
-
-  bool isValid() const { return ssid.length() > 0 && boardId.length() > 0; }
-};
-
-Preferences gPrefs;
-DeviceConfig gConfig = {DEFAULT_WIFI_SSID, DEFAULT_WIFI_PASS, DEFAULT_BOARD_ID};
-WebServer gConfigServer(80);
-DNSServer gDnsServer;
+static const uint32_t SETTINGS_FETCH_MS =
+    30000;  // refresh settings every 30s even if version unchanged
 
 // ===== LEDs =====
 #define STATUS_PIN 25
-uint8_t gBaseBrightness = 16;
-uint8_t gEffectiveBrightness = 16;
-static const uint8_t kStatusBrightness = 16;
-bool gBoardIdValid = false;
+uint8_t gBaseBrightness = 16;       // updated from settings
+uint8_t gEffectiveBrightness = 16;  // can later factor in night mode
 
 enum Line : uint8_t {
-  L_T9,
-  L_T5,
-  L_T2,
-  L_T6,
-  L_T3,
-  L_T4,
-  L_T7,
-  L_T8,
-  L_M1,
-  L_T1,
-  LINE_COUNT
+    L_T9,
+    L_T5,
+    L_T2,
+    L_T6,
+    L_T3,
+    L_T4,
+    L_T7,
+    L_T8,
+    L_M1,
+    L_T1,
+    LINE_COUNT
 };
 const uint8_t STRIP_PINS[LINE_COUNT] = {4, 13, 14, 16, 17, 18, 19, 21, 22, 23};
-const uint16_t STRIP_LEN[LINE_COUNT] = {31, 31, 38, 6, 30, 33, 2, 38, 31, 56};
-bool REVERSE[LINE_COUNT] = {0, 0, 0, 0, 0, 0, 1, 0, 0, 0};
+//                                     T9  T5  T2  T6  T3  T4  T7  T8  M1  T1
+const uint16_t STRIP_LEN[LINE_COUNT] = {43, 31, 38, 6, 30, 33,
+                                        2,  38, 31, 56};  // synced to tester
+bool REVERSE[LINE_COUNT] = {0, 0, 0, 0, 0,
+                            0, 1, 0, 0, 0};  // T7 reversed physically
 
+// Fixed per-line colors (LED-friendly palette synced to tester)
 const uint32_t LINE_COLOR_HEX[LINE_COUNT] = {
-    0xE53935, 0xD81B60, 0x00ACC1, 0xA0522D, 0xFB8C00,
-    0x0D47A1, 0x9E9E9E, 0x006400, 0x26C6DA, 0xF39C12};
+    0xE53935,  // T9 red
+    0xD81B60,  // T5 magenta
+    0x00ACC1,  // T2 teal/cyan
+    0xA0522D,  // T6 brown (Sienna, LED-friendly)
+    0xFB8C00,  // T3 orange
+    0x0D47A1,  // T4 dark blue
+    0x9E9E9E,  // T7 grey
+    0x006400,  // T8 dark green (pure green)
+    0x26C6DA,  // M1 light teal
+    0xF39C12   // T1 yellow/orange
+};
 
 Adafruit_NeoPixel strips[LINE_COUNT] = {
     Adafruit_NeoPixel(STRIP_LEN[0], STRIP_PINS[0], NEO_GRB + NEO_KHZ800),
@@ -87,196 +75,139 @@ Adafruit_NeoPixel strips[LINE_COUNT] = {
 Adafruit_NeoPixel statusStrip(1, STATUS_PIN, NEO_GRB + NEO_KHZ800);
 DynamicJsonDocument gDoc(8192);
 
-String gMode = "live";
+String gMode = "live";  // "live" or "animation"
 
 struct NightModeCfg {
-  bool enabled;
-  bool active;
-  String start;
-  String end;
-  String action;
-  uint8_t dimLevel;
-} gNightMode = {false, false, "23:00", "06:00", "off", 20};
+    bool enabled;
+    String start;  // "HH:MM"
+    String end;
+    String action;  // "off" or "dim"
+    uint8_t dimLevel;
+} gNightMode = {false, "23:00", "06:00", "off", 20};
 
 struct AnimCfg {
-  String name;
-  int speed;
-  uint8_t r, g, b;
+    String name;  // "pulse", "rainbow", "bounce"
+    int speed;    // arbitrary units
+    uint8_t r, g, b;
 } gAnim = {"pulse", 120, 255, 80, 0};
 
 uint32_t lastSettingsFetch = 0;
 uint32_t lastSettingsVersion = 0;
-uint32_t lastOtaCheck = 0;
-volatile bool gOtaInProgress = false;
 
 // ===== Binding model =====
 struct LedBinding {
-  const char *station;
-  Line line;
-  uint16_t led;
+    const char* station;
+    Line line;
+    uint16_t led;
 };
 #define MAX_BINDINGS 500
 LedBinding B[MAX_BINDINGS];
 size_t NB = 0;
 
-uint8_t *stateBuf = nullptr;
-uint8_t *ttlBuf = nullptr;
-static const uint8_t GRACE_POLLS = 3;
+// Persistent state + tiny hold-time after last solid to avoid blink-offs
+uint8_t* stateBuf = nullptr;           // 0..3 (we light only when ==3)
+uint8_t* ttlBuf = nullptr;             // polls-to-hold after last 3
+static const uint8_t GRACE_POLLS = 3;  // a touch longer to mask late batches
 
 // ===== helpers =====
-enum StatusCode : uint8_t {
-  STATUS_POWER_ON,
-  STATUS_WIFI_CONNECTED_VALID,
-  STATUS_SERVER_ACTIVE,
-  STATUS_WIFI_CONNECTING,
-  STATUS_WIFI_DISCONNECTED,
-  STATUS_BOARD_INVALID,
-  STATUS_OTA_UPDATING
-};
-
-void setStatus(StatusCode code) {
-  uint8_t r = 0, g = 0, b = 0;
-  switch (code) {
-  case STATUS_POWER_ON:
-    r = 160;
-    g = 160;
-    b = 160;
-    break;
-  case STATUS_WIFI_CONNECTED_VALID:
-    r = 0;
-    g = 160;
-    b = 0;
-    break;
-  case STATUS_SERVER_ACTIVE:
-    r = 80;
-    g = 180;
-    b = 255;
-    break;
-  case STATUS_WIFI_CONNECTING:
-    r = 200;
-    g = 80;
-    b = 0;
-    break;
-  case STATUS_WIFI_DISCONNECTED:
-    r = 200;
-    g = 0;
-    b = 0;
-    break;
-  case STATUS_BOARD_INVALID:
-    r = 200;
-    g = 0;
-    b = 120;
-    break;
-  case STATUS_OTA_UPDATING:
-    r = 180;
-    g = 180;
-    b = 40;
-    break;
-  }
-  statusStrip.setBrightness(kStatusBrightness);
-  statusStrip.setPixelColor(0, statusStrip.Color(r, g, b));
-  statusStrip.show();
+void statusOrange() {
+    statusStrip.setPixelColor(0, statusStrip.Color(200, 80, 0));  // orange
+    statusStrip.show();
 }
 
-static const char *routeSuffix(Line ln) {
-  switch (ln) {
-  case L_T9:
-    return "9";
-  case L_T5:
-    return "5";
-  case L_T2:
-    return "2";
-  case L_T6:
-    return "6";
-  case L_T3:
-    return "3";
-  case L_T4:
-    return "4";
-  case L_T7:
-    return "7";
-  case L_T8:
-    return "8";
-  case L_M1:
-    return "M";
-  case L_T1:
-    return "1";
-  default:
-    return "?";
-  }
+void statusGreen() {
+    statusStrip.setPixelColor(0, statusStrip.Color(0, 160, 0));  // green
+    statusStrip.show();
 }
-static char *makeKey(const char *base, Line ln) {
-  const char *suf = routeSuffix(ln);
-  size_t lb = strlen(base), ls = strlen(suf);
-  char *out = (char *)malloc(lb + ls + 1);
-  if (!out)
-    return nullptr;
-  memcpy(out, base, lb);
-  memcpy(out + lb, suf, ls);
-  out[lb + ls] = '\0';
-  return out;
+
+static const char* routeSuffix(Line ln) {
+    switch (ln) {
+        case L_T9:
+            return "9";
+        case L_T5:
+            return "5";
+        case L_T2:
+            return "2";
+        case L_T6:
+            return "6";
+        case L_T3:
+            return "3";
+        case L_T4:
+            return "4";
+        case L_T7:
+            return "7";
+        case L_T8:
+            return "8";
+        case L_M1:
+            return "M";
+        case L_T1:
+            return "1";
+        default:
+            return "?";
+    }
+}
+static char* makeKey(const char* base, Line ln) {
+    const char* suf = routeSuffix(ln);
+    size_t lb = strlen(base), ls = strlen(suf);
+    char* out = (char*)malloc(lb + ls + 1);
+    if (!out) return nullptr;
+    memcpy(out, base, lb);
+    memcpy(out + lb, suf, ls);
+    out[lb + ls] = '\0';
+    return out;
 }
 static inline uint16_t physIdx(Line ln, uint16_t led) {
-  return REVERSE[ln] ? uint16_t(STRIP_LEN[ln] - 1 - led) : led;
+    return REVERSE[ln] ? uint16_t(STRIP_LEN[ln] - 1 - led) : led;
 }
-void addBind(const char *base, Line ln, uint16_t led) {
-  if (NB >= MAX_BINDINGS)
-    return;
-  uint16_t idx = physIdx(ln, led);
-  if (idx >= STRIP_LEN[ln])
-    return;
-  char *key = makeKey(base, ln);
-  if (!key)
-    return;
-  B[NB++] = {key, ln, idx};
+void addBind(const char* base, Line ln, uint16_t led) {
+    if (NB >= MAX_BINDINGS) return;
+    uint16_t idx = physIdx(ln, led);
+    if (idx >= STRIP_LEN[ln]) return;
+    char* key = makeKey(base, ln);
+    if (!key) return;
+    B[NB++] = {key, ln, idx};
 }
-void bindSeq(Line ln, const char *const *seq, size_t n, uint16_t start = 0) {
-  for (size_t i = 0; i < n; i++)
-    addBind(seq[i], ln, start + (uint16_t)i);
+void bindSeq(Line ln, const char* const* seq, size_t n, uint16_t start = 0) {
+    for (size_t i = 0; i < n; i++) addBind(seq[i], ln, start + (uint16_t)i);
 }
 static inline bool unres(char c) {
-  return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-         (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+           (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+           c == '~';
 }
-static String enc(const char *s) {
-  String o;
-  while (*s) {
-    char c = *s++;
-    if (unres(c))
-      o += c;
-    else {
-      char b[4];
-      snprintf(b, sizeof(b), "%%%02X", (unsigned char)c);
-      o += b;
+static String enc(const char* s) {
+    String o;
+    while (*s) {
+        char c = *s++;
+        if (unres(c))
+            o += c;
+        else {
+            char b[4];
+            snprintf(b, sizeof(b), "%%%02X", (unsigned char)c);
+            o += b;
+        }
     }
-  }
-  return o;
-}
-static String serviceBaseUrl() {
-  String url = String(kPayloadBase);
-  int slash = url.lastIndexOf('/');
-  if (slash > 0)
-    return url.substring(0, slash);
-  return url;
+    return o;
 }
 static uint32_t lineColor(Line ln) {
-  uint32_t h = LINE_COLOR_HEX[ln];
-  uint8_t r = (h >> 16) & 0xFF, g = (h >> 8) & 0xFF, b = h & 0xFF;
-  return strips[ln].Color(r, g, b);
+    uint32_t h = LINE_COLOR_HEX[ln];
+    uint8_t r = (h >> 16) & 0xFF, g = (h >> 8) & 0xFF, b = h & 0xFF;
+    return strips[ln].Color(r, g, b);
 }
 static uint32_t wheel(uint8_t pos) {
-  pos = 255 - pos;
-  if (pos < 85)
-    return strips[0].Color(255 - pos * 3, 0, pos * 3);
-  if (pos < 170) {
-    pos -= 85;
-    return strips[0].Color(0, pos * 3, 255 - pos * 3);
-  }
-  pos -= 170;
-  return strips[0].Color(pos * 3, 255 - pos * 3, 0);
+    pos = 255 - pos;
+    if (pos < 85) return strips[0].Color(255 - pos * 3, 0, pos * 3);
+    if (pos < 170) {
+        pos -= 85;
+        return strips[0].Color(0, pos * 3, 255 - pos * 3);
+    }
+    pos -= 170;
+    return strips[0].Color(pos * 3, 255 - pos * 3, 0);
 }
 
 // ===== sequences (synced to tester) =====
-const char *const T9_SEQ[] = {
+// T9
+const char* const T9_SEQ[] = {
     "Hornsby",       "Normanhurst",       "Thornleigh",  "Pennant Hills",
     "Beecroft",      "Cheltenham",        "Epping",      "Eastwood",
     "Denistone",     "West Ryde",         "Meadowbank",  "Rhodes",
@@ -285,7 +216,8 @@ const char *const T9_SEQ[] = {
     "Milsons Point", "North Sydney",      "Waverton",    "Wollstonecraft",
     "St Leonards",   "Artarmon",          "Chatswood",   "Roseville",
     "Lindfield",     "Killara",           "Gordon"};
-const char *const T5_SEQ[] = {
+// T5
+const char* const T5_SEQ[] = {
     "Richmond",       "East Richmond", "Clarendon",      "Windsor",
     "Mulgrave",       "Vineyard",      "Riverstone",     "Schofields",
     "Quakers Hill",   "Marayong",      "Blacktown",      "Seven Hills",
@@ -294,19 +226,22 @@ const char *const T5_SEQ[] = {
     "Yennora",        "Fairfield",     "Canley Vale",    "Cabramatta",
     "Warwick Farm",   "Liverpool",     "Casula",         "Glenfield",
     "Edmondson Park", "Leppington"};
-const char *const T2_SEG1[] = {"Leppington", "Edmondson Park", "Glenfield",
+// T2
+const char* const T2_SEG1[] = {"Leppington", "Edmondson Park", "Glenfield",
                                "Casula",     "Liverpool",      "Warwick Farm",
                                "Cabramatta", "Canley Vale",    "Fairfield",
                                "Yennora",    "Guildford",      "Merrylands"};
-const char *const T2_SEG2[] = {
+const char* const T2_SEG2[] = {
     "Parramatta", "Harris Park", "Granville",     "Clyde",       "Auburn",
     "Lidcombe",   "Flemington",  "Homebush",      "Strathfield", "Burwood",
     "Croydon",    "Ashfield",    "Summer Hill",   "Lewisham",    "Petersham",
     "Stanmore",   "Newtown",     "Macdonaldtown", "Redfern",     "Central",
     "Town Hall",  "Wynyard",     "Circular Quay", "St James",    "Museum"};
-const char *const T6_SEQ[] = {"Bankstown",    "Yagoona", "Birrong",
+// T6
+const char* const T6_SEQ[] = {"Bankstown",    "Yagoona", "Birrong",
                               "Regents Park", "Berala",  "Lidcombe"};
-const char *const T3_SEQ[] = {
+// T3
+const char* const T3_SEQ[] = {
     "Liverpool",    "Warwick Farm",  "Cabramatta",    "Carramar",
     "Villawood",    "Leightonfield", "Chester Hill",  "Sefton",
     "Regents Park", "Berala",        "Lidcombe",      "Flemington",
@@ -315,7 +250,8 @@ const char *const T3_SEQ[] = {
     "Stanmore",     "Newtown",       "Macdonaldtown", "Redfern",
     "Central",      "Town Hall",     "Wynyard",       "Circular Quay",
     "St James",     "Museum"};
-const char *const T4_SEQ[] = {
+// T4
+const char* const T4_SEQ[] = {
     "Waterfall",   "Heathcote",  "Engadine",      "Loftus",      "Cronulla",
     "Woolooware",  "Caringbah",  "Miranda",       "Gymea",       "Kirrawee",
     "Sutherland",  "Jannali",    "Como",          "Oatley",      "Mortdale",
@@ -323,8 +259,10 @@ const char *const T4_SEQ[] = {
     "Rockdale",    "Banksia",    "Arncliffe",     "Wolli Creek", "Tempe",
     "Sydenham",    "Redfern",    "Central",       "Town Hall",   "Martin Place",
     "Kings Cross", "Edgecliff",  "Bondi Junction"};
-const char *const T7_SEQ[] = {"Lidcombe", "Olympic Park"};
-const char *const T8_SEQ[] = {"Macarthur",
+// T7
+const char* const T7_SEQ[] = {"Lidcombe", "Olympic Park"};
+// T8
+const char* const T8_SEQ[] = {"Macarthur",
                               "Campbelltown",
                               "Leumeah",
                               "Minto",
@@ -358,7 +296,8 @@ const char *const T8_SEQ[] = {"Macarthur",
                               "Circular Quay",
                               "St James",
                               "Museum"};
-const char *const M1_SEQ[] = {"Tallawong",      "Rouse Hill",
+// M1
+const char* const M1_SEQ[] = {"Tallawong",      "Rouse Hill",
                               "Kellyville",     "Bella Vista",
                               "Norwest",        "Hills Showground",
                               "Castle Hill",    "Cherrybrook",
@@ -374,722 +313,404 @@ const char *const M1_SEQ[] = {"Tallawong",      "Rouse Hill",
                               "Belmore",        "Lakemba",
                               "Wiley Park",     "Punchbowl",
                               "Bankstown"};
-const char *const T1_SEQ[] = {
-    "Berowra",       "Mount Kuring-gai", "Mount Colah", "Asquith",
-    "Hornsby",       "Waitara",          "Wahroonga",   "Warrawee",
-    "Turramurra",    "Pymble",           "Gordon",      "Killara",
-    "Lindfield",     "Roseville",        "Chatswood",   "Artarmon",
-    "St Leonards",   "Wollstonecraft",   "Waverton",    "North Sydney",
-    "Milsons Point", "Wynyard",          "Town Hall",   "Central",
-    "Redfern",       "Strathfield",      "Lidcombe",    "Auburn",
-    "Clyde",         "Granville",        "Harris Park", "Parramatta",
-    "Westmead",      "Wentworthville",   "Pendle Hill", "Toongabbie",
-    "Seven Hills",   "Blacktown",        "Doonside",    "Rooty Hill",
-    "Mount Druitt",  "St Marys",         "Werrington",  "Kingswood",
-    "Penrith",       "Emu Plains",       "Marayong",    "Quakers Hill",
-    "Schofields",    "Riverstone",       "Vineyard",    "Mulgrave",
+// T1
+const char* const T1_SEQ[] = {
+    "Berowra",       "Mount Kuring-gai", "Mount Colah",   "Asquith",
+    "Hornsby",       "Waitara",          "Wahroonga",     "Warrawee",
+    "Turramurra",    "Pymble",           "Gordon",        "Killara",
+    "Lindfield",     "Roseville",        "Chatswood",     "Artarmon",
+    "St Leonards",   "Wollstonecraft",   "Waverton",      "North Sydney",
+    "Milsons Point", "Wynyard",          "Town Hall",     "Central",
+    "Redfern",       "Strathfield",      "Lidcombe",      "Auburn",
+    "Clyde",         "Granville",        "Harris Park",   "Parramatta",
+    "Westmead",      "Wentworthville",   "Pendle Hill",   "Toongabbie",
+    "Seven Hills",   "Blacktown",        "Doonside",      "Rooty Hill",
+    "Mount Druitt",  "St Marys",         "Werrington",    "Kingswood",
+    "Penrith",       "Emu Plains",       "Marayong",      "Quakers Hill",
+    "Schofields",    "Riverstone",       "Vineyard",      "Mulgrave",
     "Windsor",       "Clarendon",        "East Richmond", "Richmond"};
 
 // ===== build & render =====
 void runAnimationStep() {
-  static uint32_t lastChaseStep = 0;
-  static uint16_t chasePos[LINE_COUNT];
-  static int8_t chaseDir[LINE_COUNT];
-  static bool chaseInit = false;
-  static String lastAnim = "";
+    static uint32_t lastChaseStep = 0;
+    static uint16_t chasePos[LINE_COUNT];
+    static int8_t chaseDir[LINE_COUNT];
+    static bool chaseInit = false;
+    static String lastAnim = "";
 
-  uint32_t now = millis();
+    uint32_t now = millis();
 
-  if (!lastAnim.equalsIgnoreCase(gAnim.name)) {
-    chaseInit = false;
-    lastAnim = gAnim.name;
-  }
-
-  String anim = gAnim.name;
-  anim.toLowerCase();
-
-  uint32_t speed = (gAnim.speed <= 0) ? 100 : (uint32_t)gAnim.speed;
-
-  if (anim == "rainbow") {
-    uint32_t shift = now / speed;
-    for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
-      strips[ln].setBrightness(gEffectiveBrightness);
-      for (uint16_t i = 0; i < STRIP_LEN[ln]; i++) {
-        uint8_t hue = (uint8_t)((i * 256 / STRIP_LEN[ln] + shift) & 0xFF);
-        strips[ln].setPixelColor(i, wheel(hue));
-      }
-      strips[ln].show();
-    }
-    return;
-  }
-
-  if (anim == "bounce" || anim == "chase") {
-    if (!chaseInit) {
-      for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
-        chasePos[ln] = 0;
-        chaseDir[ln] = 1;
-      }
-      chaseInit = true;
-      lastChaseStep = now;
+    // Reset per-animation state when switching animations
+    if (!lastAnim.equalsIgnoreCase(gAnim.name)) {
+        chaseInit = false;
+        lastAnim = gAnim.name;
     }
 
-    if (now - lastChaseStep >= speed) {
-      lastChaseStep = now;
-      for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
-        uint16_t len = STRIP_LEN[ln];
-        chasePos[ln] = uint16_t(int16_t(chasePos[ln]) + chaseDir[ln]);
-        if (chasePos[ln] == 0 || chasePos[ln] + 1 >= len) {
-          chaseDir[ln] = -chaseDir[ln];
+    // Normalize name for comparisons
+    String anim = gAnim.name;
+    anim.toLowerCase();
+
+    uint32_t speed = (gAnim.speed <= 0) ? 100 : (uint32_t)gAnim.speed;
+
+    // ----- Rainbow wheel -----
+    if (anim == "rainbow") {
+        uint32_t shift = now / speed;
+        for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
+            strips[ln].setBrightness(gEffectiveBrightness);
+            for (uint16_t i = 0; i < STRIP_LEN[ln]; i++) {
+                uint8_t hue =
+                    (uint8_t)((i * 256 / STRIP_LEN[ln] + shift) & 0xFF);
+                strips[ln].setPixelColor(i, wheel(hue));
+            }
+            strips[ln].show();
         }
-      }
+        return;
     }
 
-    for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
-      strips[ln].setBrightness(gEffectiveBrightness);
-      strips[ln].clear();
-      uint32_t col = lineColor((Line)ln);
-      int16_t center = chasePos[ln];
-      for (int k = -1; k <= 1; k++) {
-        int16_t idx = center + k;
-        if (idx >= 0 && idx < (int16_t)STRIP_LEN[ln]) {
-          strips[ln].setPixelColor((uint16_t)idx, col);
+    // ----- Bouncing chase (3-LED train) -----
+    if (anim == "bounce" || anim == "chase") {
+        if (!chaseInit) {
+            for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
+                chasePos[ln] = 0;
+                chaseDir[ln] = 1;
+            }
+            chaseInit = true;
+            lastChaseStep = now;
         }
-      }
-      strips[ln].show();
-    }
-    return;
-  }
 
-  uint32_t cycle = speed * 20;
-  float t = cycle ? float(now % cycle) / float(cycle) : 0.0f;
-  float intensity = 0.5f + 0.5f * sinf(2.0f * 3.14159f * t);
+        if (now - lastChaseStep >= speed) {
+            lastChaseStep = now;
+            for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
+                uint16_t len = STRIP_LEN[ln];
+                chasePos[ln] = uint16_t(int16_t(chasePos[ln]) + chaseDir[ln]);
+                if (chasePos[ln] == 0 || chasePos[ln] + 1 >= len) {
+                    chaseDir[ln] = -chaseDir[ln];
+                }
+            }
+        }
 
-  uint8_t br = (uint8_t)(gEffectiveBrightness * intensity);
-  for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
-    strips[ln].setBrightness(br);
-    for (uint16_t i = 0; i < STRIP_LEN[ln]; i++) {
-      strips[ln].setPixelColor(i, strips[ln].Color(gAnim.r, gAnim.g, gAnim.b));
+        for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
+            strips[ln].setBrightness(gEffectiveBrightness);
+            strips[ln].clear();
+            uint32_t col = lineColor((Line)ln);
+            int16_t center = chasePos[ln];
+            for (int k = -1; k <= 1; k++) {
+                int16_t idx = center + k;
+                if (idx >= 0 && idx < (int16_t)STRIP_LEN[ln]) {
+                    strips[ln].setPixelColor((uint16_t)idx, col);
+                }
+            }
+            strips[ln].show();
+        }
+        return;
     }
-    strips[ln].show();
-  }
+
+    // ----- Pulse (default) -----
+    uint32_t cycle = speed * 20;
+    float t = cycle ? float(now % cycle) / float(cycle) : 0.0f;
+    float intensity = 0.5f + 0.5f * sinf(2.0f * 3.14159f * t);
+
+    uint8_t br = (uint8_t)(gEffectiveBrightness * intensity);
+    for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
+        strips[ln].setBrightness(br);
+        for (uint16_t i = 0; i < STRIP_LEN[ln]; i++) {
+            strips[ln].setPixelColor(
+                i, strips[ln].Color(gAnim.r, gAnim.g, gAnim.b));
+        }
+        strips[ln].show();
+    }
 }
 
 void buildBindings() {
-  bindSeq(L_T9, T9_SEQ, sizeof(T9_SEQ) / sizeof(*T9_SEQ));
-  bindSeq(L_T5, T5_SEQ, sizeof(T5_SEQ) / sizeof(*T5_SEQ));
-  bindSeq(L_T2, T2_SEG1, sizeof(T2_SEG1) / sizeof(*T2_SEG1), 0);
-  bindSeq(L_T2, T2_SEG2, sizeof(T2_SEG2) / sizeof(*T2_SEG2), 12);
-  bindSeq(L_T6, T6_SEQ, sizeof(T6_SEQ) / sizeof(*T6_SEQ));
-  bindSeq(L_T3, T3_SEQ, sizeof(T3_SEQ) / sizeof(*T3_SEQ));
-  bindSeq(L_T4, T4_SEQ, sizeof(T4_SEQ) / sizeof(*T4_SEQ));
-  bindSeq(L_T7, T7_SEQ, sizeof(T7_SEQ) / sizeof(*T7_SEQ));
-  bindSeq(L_T8, T8_SEQ, sizeof(T8_SEQ) / sizeof(*T8_SEQ));
-  bindSeq(L_M1, M1_SEQ, sizeof(M1_SEQ) / sizeof(*M1_SEQ));
-  bindSeq(L_T1, T1_SEQ, sizeof(T1_SEQ) / sizeof(*T1_SEQ));
+    bindSeq(L_T9, T9_SEQ, sizeof(T9_SEQ) / sizeof(*T9_SEQ));
+    bindSeq(L_T5, T5_SEQ, sizeof(T5_SEQ) / sizeof(*T5_SEQ));
+    bindSeq(L_T2, T2_SEG1, sizeof(T2_SEG1) / sizeof(*T2_SEG1), 0);
+    bindSeq(L_T2, T2_SEG2, sizeof(T2_SEG2) / sizeof(*T2_SEG2), 12);
+    bindSeq(L_T6, T6_SEQ, sizeof(T6_SEQ) / sizeof(*T6_SEQ));
+    bindSeq(L_T3, T3_SEQ, sizeof(T3_SEQ) / sizeof(*T3_SEQ));
+    bindSeq(L_T4, T4_SEQ, sizeof(T4_SEQ) / sizeof(*T4_SEQ));
+    bindSeq(L_T7, T7_SEQ, sizeof(T7_SEQ) / sizeof(*T7_SEQ));
+    bindSeq(L_T8, T8_SEQ, sizeof(T8_SEQ) / sizeof(*T8_SEQ));
+    bindSeq(L_M1, M1_SEQ, sizeof(M1_SEQ) / sizeof(*M1_SEQ));
+    bindSeq(L_T1, T1_SEQ, sizeof(T1_SEQ) / sizeof(*T1_SEQ));
 
-  stateBuf = (uint8_t *)malloc(NB ? NB : 1);
-  ttlBuf = (uint8_t *)malloc(NB ? NB : 1);
-  if (stateBuf)
-    memset(stateBuf, 0, NB);
-  if (ttlBuf)
-    memset(ttlBuf, 0, NB);
-  Serial.printf("Bindings=%u\n", (unsigned)NB);
+    stateBuf = (uint8_t*)malloc(NB ? NB : 1);
+    ttlBuf = (uint8_t*)malloc(NB ? NB : 1);
+    if (stateBuf) memset(stateBuf, 0, NB);
+    if (ttlBuf) memset(ttlBuf, 0, NB);
+    Serial.printf("Bindings=%u\n", (unsigned)NB);
 }
 
 bool dirtyLine[LINE_COUNT] = {0};
 inline void clearDirty() {
-  for (uint8_t i = 0; i < LINE_COUNT; i++)
-    dirtyLine[i] = false;
+    for (uint8_t i = 0; i < LINE_COUNT; i++) dirtyLine[i] = false;
 }
 
 void applyBatchToState(JsonVariantConst states) {
-  if (!states.is<JsonObjectConst>())
-    return;
-  JsonObjectConst obj = states.as<JsonObjectConst>();
-  for (size_t i = 0; i < NB; i++) {
-    JsonVariantConst v = obj[B[i].station];
-    if (v.isNull())
-      continue;
+    if (!states.is<JsonObjectConst>()) return;
+    JsonObjectConst obj = states.as<JsonObjectConst>();
+    for (size_t i = 0; i < NB; i++) {
+        JsonVariantConst v = obj[B[i].station];
+        if (v.isNull()) continue;
 
-    int s = v.as<int>();
-    if (s < 0)
-      s = 0;
-    if (s > 3)
-      s = 3;
+        int s = v.as<int>();
+        if (s < 0) s = 0;
+        if (s > 3) s = 3;
 
-    stateBuf[i] = (uint8_t)s;
-    if (s == 3)
-      ttlBuf[i] = GRACE_POLLS;
-    dirtyLine[B[i].line] = true;
-  }
+        stateBuf[i] = (uint8_t)s;
+        if (s == 3) ttlBuf[i] = GRACE_POLLS;
+        dirtyLine[B[i].line] = true;
+    }
 }
 
 void repaintDirtyLinesAndDecayOnce() {
-  for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
-    strips[ln].setBrightness(gEffectiveBrightness);
-    if (!dirtyLine[ln])
-      continue;
-    strips[ln].clear();
-    for (size_t i = 0; i < NB; i++) {
-      if (B[i].line != (Line)ln)
-        continue;
-      bool on = (stateBuf[i] == 3) || (ttlBuf[i] > 0);
-      if (on)
-        strips[ln].setPixelColor(B[i].led, lineColor(B[i].line));
+    statusStrip.setBrightness(gEffectiveBrightness);
+    for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
+        strips[ln].setBrightness(gEffectiveBrightness);
+        if (!dirtyLine[ln]) continue;
+        strips[ln].clear();
+        for (size_t i = 0; i < NB; i++) {
+            if (B[i].line != (Line)ln) continue;
+            bool on = (stateBuf[i] == 3) || (ttlBuf[i] > 0);
+            if (on) strips[ln].setPixelColor(B[i].led, lineColor(B[i].line));
+        }
+        strips[ln].show();
     }
-    strips[ln].show();
-  }
-  for (size_t i = 0; i < NB; i++)
-    if (stateBuf[i] != 3 && ttlBuf[i] > 0)
-      ttlBuf[i]--;
-  clearDirty();
+    for (size_t i = 0; i < NB; i++)
+        if (stateBuf[i] != 3 && ttlBuf[i] > 0) ttlBuf[i]--;
+    clearDirty();
 }
 
 void renderAll() {
-  for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
-    strips[ln].setBrightness(gEffectiveBrightness);
-    strips[ln].clear();
-  }
-  for (size_t i = 0; i < NB; i++) {
-    bool on = (stateBuf[i] == 3) || (ttlBuf[i] > 0);
-    if (on)
-      strips[B[i].line].setPixelColor(B[i].led, lineColor(B[i].line));
-  }
-  for (uint8_t ln = 0; ln < LINE_COUNT; ln++)
-    strips[ln].show();
-  for (size_t i = 0; i < NB; i++)
-    if (stateBuf[i] != 3 && ttlBuf[i] > 0)
-      ttlBuf[i]--;
-}
-
-bool loadConfigFromPrefs() {
-  gPrefs.begin("metroboard", true);
-  String ssid = gPrefs.getString("ssid", gConfig.ssid);
-  String pass = gPrefs.getString("pass", gConfig.pass);
-  String board = gPrefs.getString("board", gConfig.boardId);
-  gPrefs.end();
-
-  gConfig.ssid = ssid;
-  gConfig.pass = pass;
-  gConfig.boardId = board;
-  return gConfig.isValid();
-}
-
-void saveConfigToPrefs(const DeviceConfig &cfg) {
-  gPrefs.begin("metroboard", false);
-  gPrefs.putString("ssid", cfg.ssid);
-  gPrefs.putString("pass", cfg.pass);
-  gPrefs.putString("board", cfg.boardId);
-  gPrefs.end();
-}
-
-String configPageHtml() {
-  String html =
-      "<!doctype html><html><head><meta charset='utf-8'/>"
-      "<meta name='viewport' content='width=device-width,initial-scale=1'/>"
-      "<title>Metroboard Setup</title>"
-      "<style>body{font-family:Arial,Helvetica,sans-serif;margin:24px;}"
-      "label{display:block;margin-top:12px;font-weight:600;}"
-      "input{width:100%;max-width:360px;padding:8px;margin-top:6px;}"
-      "button{margin-top:18px;padding:10px 16px;font-size:15px;}"
-      ".note{margin-top:18px;color:#555;}</style></head><body>"
-      "<h1>Metroboard Setup</h1>"
-      "<form method='POST' action='/save'>"
-      "<label>WiFi SSID</label>"
-      "<input name='ssid' required value='" +
-      gConfig.ssid + "'/>"
-                     "<label>WiFi Password</label>"
-                     "<input name='pass' type='password' value='" +
-      gConfig.pass +
-      "'/>"
-      "<label>Board ID</label>"
-      "<input name='board' required value='" +
-      gConfig.boardId +
-      "'/>"
-      "<button type='submit'>Save & Restart</button>"
-      "</form>"
-      "<p class='note'>After saving, the board will reboot and connect to your "
-      "WiFi.</p>"
-      "</body></html>";
-  return html;
-}
-
-void startConfigPortal() {
-  WiFi.disconnect(true, true);
-  WiFi.mode(WIFI_AP);
-  uint32_t suffix = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF);
-  String apName = "Metroboard-Setup-" + String(suffix, HEX);
-  WiFi.softAP(apName.c_str());
-  IPAddress ip = WiFi.softAPIP();
-  Serial.printf("\n[CFG] AP \"%s\" IP=%s\n", apName.c_str(),
-                ip.toString().c_str());
-
-  gDnsServer.start(53, "*", ip);
-
-  gConfigServer.on("/", HTTP_GET,
-                   []() { gConfigServer.send(200, "text/html", configPageHtml()); });
-  gConfigServer.on("/generate_204", HTTP_GET,
-                   []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
-  gConfigServer.on("/hotspot-detect.html", HTTP_GET,
-                   []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
-  gConfigServer.on("/ncsi.txt", HTTP_GET,
-                   []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
-  gConfigServer.on("/connecttest.txt", HTTP_GET,
-                   []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
-  gConfigServer.on("/redirect", HTTP_GET,
-                   []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
-  gConfigServer.on("/save", HTTP_POST, []() {
-    DeviceConfig next = gConfig;
-    next.ssid = gConfigServer.arg("ssid");
-    next.pass = gConfigServer.arg("pass");
-    next.boardId = gConfigServer.arg("board");
-    next.ssid.trim();
-    next.boardId.trim();
-
-    if (!next.isValid()) {
-      gConfigServer.send(400, "text/plain",
-                         "SSID and Board ID are required.");
-      return;
+    statusStrip.setBrightness(gEffectiveBrightness);
+    for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
+        strips[ln].setBrightness(gEffectiveBrightness);
+        strips[ln].clear();
     }
-
-    saveConfigToPrefs(next);
-    gConfigServer.send(200, "text/html",
-                       "<html><body><h2>Saved.</h2>"
-                       "<p>Rebooting...</p></body></html>");
-    delay(500);
-    ESP.restart();
-  });
-  gConfigServer.onNotFound(
-      []() { gConfigServer.sendHeader("Location", "/", true); gConfigServer.send(302, "text/plain", ""); });
-  gConfigServer.begin();
-
-  setStatus(STATUS_SERVER_ACTIVE);
-  for (;;) {
-    gDnsServer.processNextRequest();
-    gConfigServer.handleClient();
-    delay(10);
-  }
+    for (size_t i = 0; i < NB; i++) {
+        bool on = (stateBuf[i] == 3) || (ttlBuf[i] > 0);
+        if (on) strips[B[i].line].setPixelColor(B[i].led, lineColor(B[i].line));
+    }
+    for (uint8_t ln = 0; ln < LINE_COUNT; ln++) strips[ln].show();
+    for (size_t i = 0; i < NB; i++)
+        if (stateBuf[i] != 3 && ttlBuf[i] > 0) ttlBuf[i]--;
 }
 
 // ===== networking & polling =====
-bool wifiConnect(uint32_t timeoutMs = 20000) {
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  setStatus(STATUS_WIFI_CONNECTING);
-  if (gConfig.pass.length() > 0)
-    WiFi.begin(gConfig.ssid.c_str(), gConfig.pass.c_str());
-  else
-    WiFi.begin(gConfig.ssid.c_str());
-  Serial.printf("WiFi: \"%s\"", gConfig.ssid.c_str());
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < timeoutMs) {
-    delay(300);
-    Serial.print('.');
-  }
-  if (WiFi.status() == WL_CONNECTED) {
+void wifiConnect() {
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    Serial.printf("WiFi: \"%s\"", WIFI_SSID);
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(300);
+        Serial.print('.');
+    }
     Serial.printf("\nIP=%s heap=%u\n", WiFi.localIP().toString().c_str(),
                   ESP.getFreeHeap());
-    if (gBoardIdValid) {
-      setStatus(STATUS_WIFI_CONNECTED_VALID);
-    }
-    return true;
-  }
-  Serial.println("\n[WiFi] FAILED to connect.");
-  setStatus(STATUS_WIFI_DISCONNECTED);
-  return false;
+    statusGreen();
 }
 void ensureWifi() {
-  if (WiFi.status() == WL_CONNECTED) {
-    if (gBoardIdValid) {
-      setStatus(STATUS_WIFI_CONNECTED_VALID);
+    if (WiFi.status() == WL_CONNECTED) {
+        statusGreen();
+        return;
     }
-    return;
-  }
 
-  Serial.println("[WiFi] LOST connection. Reconnecting...");
-  setStatus(STATUS_WIFI_CONNECTING);
+    Serial.println("[WiFi] LOST connection. Reconnecting...");
+    statusOrange();
 
-  WiFi.disconnect(true, true);
-  delay(100);
-  if (gConfig.pass.length() > 0)
-    WiFi.begin(gConfig.ssid.c_str(), gConfig.pass.c_str());
-  else
-    WiFi.begin(gConfig.ssid.c_str());
+    WiFi.disconnect(true, true);
+    delay(100);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
 
-  uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
-    Serial.print('.');
-    delay(250);
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("\n[WiFi] Reconnected. IP=%s\n",
-                  WiFi.localIP().toString().c_str());
-    if (gBoardIdValid) {
-      setStatus(STATUS_WIFI_CONNECTED_VALID);
+    uint32_t t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 8000) {
+        Serial.print('.');
+        delay(250);
     }
-  } else {
-    Serial.println("\n[WiFi] FAILED to reconnect.");
-    setStatus(STATUS_WIFI_DISCONNECTED);
-  }
-}
 
-// ===== HTTP OTA =====
-bool performOtaUpdate(const char *firmwareUrl, const char *expectedMd5,
-                      int expectedSize, const char *targetVersion) {
-  if (!firmwareUrl || strlen(firmwareUrl) == 0)
-    return false;
-  if (WiFi.status() != WL_CONNECTED)
-    return false;
-
-  gOtaInProgress = true;
-  setStatus(STATUS_OTA_UPDATING);
-  Serial.printf("[OTA] Starting update to %s\n",
-                targetVersion && strlen(targetVersion) ? targetVersion : "unknown");
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(30000);
-  client.setHandshakeTimeout(30000);
-
-  HTTPClient http;
-  http.setTimeout(30000);
-  http.setReuse(false);
-
-  if (!http.begin(client, firmwareUrl)) {
-    Serial.println("[OTA] Failed to open firmware URL.");
-    http.end();
-    gOtaInProgress = false;
-    setStatus(STATUS_WIFI_CONNECTED_VALID);
-    return false;
-  }
-  http.addHeader("Accept", "application/octet-stream");
-  http.addHeader("Cache-Control", "no-cache");
-  http.addHeader("Connection", "close");
-  http.addHeader("User-Agent", String("ESP32-Metroboard/ota/") + kFirmwareVersion);
-
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    Serial.printf("[OTA] Firmware download HTTP %d\n", code);
-    http.end();
-    gOtaInProgress = false;
-    setStatus(STATUS_WIFI_CONNECTED_VALID);
-    return false;
-  }
-
-  int contentLength = http.getSize();
-  int updateSize = contentLength > 0 ? contentLength : expectedSize;
-  if (expectedSize > 0 && contentLength > 0 && expectedSize != contentLength) {
-    Serial.printf("[OTA] Size mismatch manifest=%d http=%d\n", expectedSize,
-                  contentLength);
-    http.end();
-    gOtaInProgress = false;
-    setStatus(STATUS_WIFI_CONNECTED_VALID);
-    return false;
-  }
-  if (updateSize <= 0) {
-    Serial.println("[OTA] Missing firmware content length.");
-    http.end();
-    gOtaInProgress = false;
-    setStatus(STATUS_WIFI_CONNECTED_VALID);
-    return false;
-  }
-
-  if (!Update.begin((size_t)updateSize)) {
-    Serial.printf("[OTA] Update.begin failed, error=%u\n", Update.getError());
-    http.end();
-    gOtaInProgress = false;
-    setStatus(STATUS_WIFI_CONNECTED_VALID);
-    return false;
-  }
-
-  if (expectedMd5 && strlen(expectedMd5) == 32) {
-    if (!Update.setMD5(expectedMd5)) {
-      Serial.println("[OTA] Invalid MD5 from manifest.");
-      Update.abort();
-      http.end();
-      gOtaInProgress = false;
-      setStatus(STATUS_WIFI_CONNECTED_VALID);
-      return false;
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.printf("\n[WiFi] Reconnected. IP=%s\n",
+                      WiFi.localIP().toString().c_str());
+        statusGreen();
+    } else {
+        Serial.println("\n[WiFi] FAILED to reconnect.");
     }
-  }
-
-  WiFiClient *stream = http.getStreamPtr();
-  size_t written = Update.writeStream(*stream);
-  if (written != (size_t)updateSize) {
-    Serial.printf("[OTA] Written %u/%d bytes\n", (unsigned)written, updateSize);
-    Update.abort();
-    http.end();
-    gOtaInProgress = false;
-    setStatus(STATUS_WIFI_CONNECTED_VALID);
-    return false;
-  }
-
-  if (!Update.end()) {
-    Serial.printf("[OTA] Update.end failed, error=%u\n", Update.getError());
-    http.end();
-    gOtaInProgress = false;
-    setStatus(STATUS_WIFI_CONNECTED_VALID);
-    return false;
-  }
-
-  if (!Update.isFinished()) {
-    Serial.println("[OTA] Update did not finish cleanly.");
-    http.end();
-    gOtaInProgress = false;
-    setStatus(STATUS_WIFI_CONNECTED_VALID);
-    return false;
-  }
-
-  http.end();
-  Serial.println("[OTA] Update complete. Rebooting.");
-  delay(500);
-  ESP.restart();
-  return true;
-}
-
-bool checkForOtaUpdate() {
-  if (gOtaInProgress || WiFi.status() != WL_CONNECTED || !gBoardIdValid)
-    return false;
-
-  String url = serviceBaseUrl();
-  url += "/firmware_manifest?board_id=";
-  url += enc(gConfig.boardId.c_str());
-  url += "&current=";
-  url += enc(kFirmwareVersion);
-
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(20000);
-  client.setHandshakeTimeout(20000);
-
-  HTTPClient http;
-  http.setTimeout(20000);
-  http.setReuse(false);
-
-  Serial.printf("[OTA] Checking %s\n", url.c_str());
-
-  if (!http.begin(client, url)) {
-    http.end();
-    return false;
-  }
-  http.addHeader("Accept", "application/json");
-  http.addHeader("Accept-Encoding", "identity");
-  http.addHeader("Cache-Control", "no-cache");
-  http.addHeader("Connection", "close");
-  http.addHeader("User-Agent", String("ESP32-Metroboard/ota/") + kFirmwareVersion);
-
-  int code = http.GET();
-  if (code != HTTP_CODE_OK) {
-    Serial.printf("[OTA] Manifest HTTP %d\n", code);
-    http.end();
-    return false;
-  }
-
-  String body = http.getString();
-  http.end();
-  body.trim();
-
-  StaticJsonDocument<1536> doc;
-  DeserializationError err = deserializeJson(doc, body);
-  if (err) {
-    Serial.printf("[OTA] Manifest JSON error: %s\n", err.c_str());
-    return false;
-  }
-
-  bool updateAvailable = doc["update_available"] | false;
-  const char *version = doc["version"] | "";
-  if (!updateAvailable) {
-    const char *reason = doc["reason"] | "none";
-    Serial.printf("[OTA] No update. current=%s latest=%s reason=%s\n",
-                  kFirmwareVersion, version, reason);
-    return false;
-  }
-
-  const char *firmwareUrl = doc["url"] | "";
-  const char *md5 = doc["md5"] | "";
-  int size = doc["size"] | 0;
-  return performOtaUpdate(firmwareUrl, md5, size, version);
 }
 
 // ===== Batch tuner =====
-static const size_t URL_CHAR_BUDGET = 1700;
-static const uint8_t MAX_BATCHES_PER_POLL = 6;
+static const size_t URL_CHAR_BUDGET = 1700;  // safe budget for GET URL length
+static const uint8_t MAX_BATCHES_PER_POLL =
+    6;  // fetch more per tick to speed things up
 
 size_t computeBatchEnd(size_t i) {
-  const char *base = kPayloadBase;
-  size_t baseLen = strlen(base) + strlen("?board_id=") +
-                   gConfig.boardId.length() + strlen("&only=");
+    // base: .../board_payload?board_id=ABCDE&only=
+    const char* base = kPayloadBase;
+    size_t baseLen = strlen(base) + strlen("?board_id=") + strlen(kBoardId) +
+                     strlen("&only=");
 
-  size_t used = baseLen;
-  size_t j = i;
+    size_t used = baseLen;
+    size_t j = i;
 
-  while (j < NB) {
-    const char *s = B[j].station;
-    size_t need = (j == i) ? 0 : 1;
-    while (*s) {
-      char c = *s++;
-      if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-          (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
-          c == '~') {
-        need += 1;
-      } else {
-        need += 3;
-      }
+    while (j < NB) {
+        const char* s = B[j].station;
+        size_t need = (j == i) ? 0 : 1;  // comma
+        while (*s) {
+            char c = *s++;
+            if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+                c == '~') {
+                need += 1;
+            } else {
+                need += 3;
+            }
+        }
+        if (used + need > URL_CHAR_BUDGET) break;
+        used += need;
+        j++;
     }
-    if (used + need > URL_CHAR_BUDGET)
-      break;
-    used += need;
-    j++;
-  }
 
-  if (j == i)
-    j++;
-  return j;
+    if (j == i) j++;  // always take at least one
+    return j;
 }
 
 int fetchAllBatchesAndRenderOnce(bool allowRender) {
-  if (NB == 0)
-    return 0;
+    if (NB == 0) return 0;
 
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(20000);
-  client.setHandshakeTimeout(20000);
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(20000);
+    client.setHandshakeTimeout(20000);
 
-  size_t i = 0;
-  int ok = 0;
-  uint8_t fired = 0;
-  bool settingsApplied = false;
+    size_t i = 0;
+    int ok = 0;
+    uint8_t fired = 0;
+    bool settingsApplied = false;
 
-  while (i < NB && fired < MAX_BATCHES_PER_POLL) {
-    size_t end = computeBatchEnd(i);
+    while (i < NB && fired < MAX_BATCHES_PER_POLL) {
+        size_t end = computeBatchEnd(i);
 
-    String url = String(kPayloadBase);
-    url += "?board_id=";
-    url += gConfig.boardId;
-    url += "&only=";
-    for (size_t j = i; j < end; j++) {
-      if (j > i)
-        url += ',';
-      url += enc(B[j].station);
-    }
-
-    HTTPClient http;
-    http.setTimeout(20000);
-    http.setReuse(false);
-    http.useHTTP10(false);
-    http.addHeader("Accept", "application/json");
-    http.addHeader("Accept-Encoding", "identity");
-    http.addHeader("Cache-Control", "no-cache");
-    http.addHeader("Connection", "close");
-    http.addHeader("User-Agent", "ESP32-Metroboard/solid/1.3");
-
-    if (!http.begin(client, url)) {
-      http.end();
-      break;
-    }
-
-    const char *hk[] = {"Content-Type", "Content-Encoding"};
-    http.collectHeaders(hk, 2);
-
-    Serial.printf("[BATCH] GET %s\n", url.c_str());
-
-    int code = http.GET();
-    if (code != HTTP_CODE_OK) {
-      http.end();
-      break;
-    }
-
-    if (http.header("Content-Encoding").indexOf("gzip") >= 0 ||
-        http.header("Content-Type").indexOf("application/json") < 0) {
-      http.end();
-      break;
-    }
-
-    String body = http.getString();
-    http.end();
-    body.trim();
-
-    char c0 = body.length() ? body.charAt(0) : '\0';
-    if (c0 != '{' && c0 != '[')
-      break;
-
-    gDoc.clear();
-    if (deserializeJson(gDoc, body))
-      break;
-
-    JsonObject root = gDoc.as<JsonObject>();
-
-    uint32_t ver = root["settings_version"] | 0;
-    if (!settingsApplied &&
-        (ver == 0 || ver != lastSettingsVersion ||
-         millis() - lastSettingsFetch >= SETTINGS_FETCH_MS)) {
-      lastSettingsVersion = ver;
-      lastSettingsFetch = millis();
-
-      const char *mode = root["mode"] | "live";
-      gMode = String(mode);
-      gMode.toLowerCase();
-
-      int b = root["brightness"] | 16;
-      b = constrain(b, 0, 255);
-      int bEff = root["brightness_effective"] | b;
-      bEff = constrain(bEff, 0, 255);
-      gBaseBrightness = b;
-      gEffectiveBrightness = (uint8_t)bEff;
-
-      JsonObject nm = root["night_mode"];
-      if (!nm.isNull()) {
-        gNightMode.enabled = nm["enabled"] | false;
-        gNightMode.active = root["night_mode_active"] | false;
-        gNightMode.start = nm["start"] | "23:00";
-        gNightMode.end = nm["end"] | "06:00";
-        gNightMode.action = nm["action"] | "off";
-        gNightMode.dimLevel = (uint8_t)(nm["dim_level"] | 20);
-      }
-
-      JsonObject an = root["animation"];
-      if (!an.isNull()) {
-        gAnim.name = an["name"] | "pulse";
-        gAnim.speed = an["speed"] | 120;
-        JsonArray col = an["color"].as<JsonArray>();
-        if (col.size() >= 3) {
-          gAnim.r = uint8_t(col[0]);
-          gAnim.g = uint8_t(col[1]);
-          gAnim.b = uint8_t(col[2]);
+        String url = String(kPayloadBase);
+        url += "?board_id=";
+        url += kBoardId;
+        url += "&only=";
+        for (size_t j = i; j < end; j++) {
+            if (j > i) url += ',';
+            url += enc(B[j].station);
         }
-      }
 
-      settingsApplied = true;
-      Serial.printf(
-          "[CFG] ver=%u mode=%s bright=%u eff=%u night=%d active=%d anim=%s\n",
-          ver, gMode.c_str(), gBaseBrightness, gEffectiveBrightness,
-          gNightMode.enabled, gNightMode.active, gAnim.name.c_str());
+        HTTPClient http;
+        http.setTimeout(20000);
+        http.setReuse(false);
+        http.useHTTP10(false);
+        http.addHeader("Accept", "application/json");
+        http.addHeader("Accept-Encoding", "identity");
+        http.addHeader("Cache-Control", "no-cache");
+        http.addHeader("Connection", "close");
+        http.addHeader("User-Agent", "ESP32-Metroboard/solid/1.3");
+
+        if (!http.begin(client, url)) {
+            http.end();
+            break;
+        }
+
+        const char* hk[] = {"Content-Type", "Content-Encoding"};
+        http.collectHeaders(hk, 2);
+
+        Serial.printf("[BATCH] GET %s\n", url.c_str());
+
+        int code = http.GET();
+        if (code != HTTP_CODE_OK) {
+            http.end();
+            break;
+        }
+
+        if (http.header("Content-Encoding").indexOf("gzip") >= 0 ||
+            http.header("Content-Type").indexOf("application/json") < 0) {
+            http.end();
+            break;
+        }
+
+        String body = http.getString();
+        http.end();
+        body.trim();
+
+        char c0 = body.length() ? body.charAt(0) : '\0';
+        if (c0 != '{' && c0 != '[') break;
+
+        gDoc.clear();
+        if (deserializeJson(gDoc, body)) break;
+
+        JsonObject root = gDoc.as<JsonObject>();
+
+        // ----- Apply settings if version changed or not yet applied -----
+        uint32_t ver = root["settings_version"] | 0;
+        if (!settingsApplied &&
+            (ver == 0 || ver != lastSettingsVersion ||
+             millis() - lastSettingsFetch >= SETTINGS_FETCH_MS)) {
+            lastSettingsVersion = ver;
+            lastSettingsFetch = millis();
+
+            const char* mode = root["mode"] | "live";
+            gMode = String(mode);
+            gMode.toLowerCase();
+
+            int b = root["brightness"] | 16;
+            b = constrain(b, 0, 255);
+            gBaseBrightness = b;
+            gEffectiveBrightness =
+                gBaseBrightness;  // adjust later if you add time-based dimming
+
+            JsonObject nm = root["night_mode"];
+            if (!nm.isNull()) {
+                gNightMode.enabled = nm["enabled"] | false;
+                gNightMode.start = nm["start"] | "23:00";
+                gNightMode.end = nm["end"] | "06:00";
+                gNightMode.action = nm["action"] | "off";
+                gNightMode.dimLevel = (uint8_t)(nm["dim_level"] | 20);
+            }
+
+            JsonObject an = root["animation"];
+            if (!an.isNull()) {
+                gAnim.name = an["name"] | "pulse";
+                gAnim.speed = an["speed"] | 120;
+                JsonArray col = an["color"].as<JsonArray>();
+                if (col.size() >= 3) {
+                    gAnim.r = uint8_t(col[0]);
+                    gAnim.g = uint8_t(col[1]);
+                    gAnim.b = uint8_t(col[2]);
+                }
+            }
+
+            settingsApplied = true;
+            Serial.printf("[CFG] ver=%u mode=%s bright=%u night=%d anim=%s\n",
+                          ver, gMode.c_str(), gBaseBrightness,
+                          gNightMode.enabled, gAnim.name.c_str());
+        }
+
+        // ----- Apply states -----
+        JsonVariantConst states = root["states"];
+        applyBatchToState(states);
+
+        ok++;
+        fired++;
+        i = end;
+
+        Serial.printf("[BATCH] HTTP %d  (%d bytes)\n", code, body.length());
+
+        delay(5);
+        yield();
     }
 
-    JsonVariantConst states = root["states"];
-    applyBatchToState(states);
-
-    ok++;
-    fired++;
-    i = end;
-
-    Serial.printf("[BATCH] HTTP %d  (%d bytes)\n", code, body.length());
-
-    delay(5);
-    yield();
-  }
-
-  if (allowRender) {
-    if (ok > 0) {
-      repaintDirtyLinesAndDecayOnce();
-    } else {
-      renderAll();
+    if (allowRender) {
+        if (ok > 0) {
+            repaintDirtyLinesAndDecayOnce();
+        } else {
+            renderAll();
+        }
     }
-  }
 
-  return ok;
+    return ok;
 }
 
 // ===== setup / loop =====
@@ -1097,121 +718,72 @@ uint32_t lastPoll = 0, pollInterval = POLL_MS_MIN;
 TaskHandle_t gPollTaskHandle = nullptr;
 
 void beginStrips() {
-  for (uint8_t i = 0; i < LINE_COUNT; i++) {
-    strips[i].begin();
-    strips[i].setBrightness(gEffectiveBrightness);
-    strips[i].clear();
-    strips[i].show();
-  }
-}
-
-void initStatusLed() {
-  statusStrip.begin();
-  statusStrip.setBrightness(kStatusBrightness);
-  setStatus(STATUS_POWER_ON);
-}
-
-bool isBoardIdValid() {
-  WiFiClientSecure client;
-  client.setInsecure();
-  client.setTimeout(20000);
-  client.setHandshakeTimeout(20000);
-
-  HTTPClient http;
-  String url = serviceBaseUrl();
-  url += "/board_settings?board_id=";
-  url += enc(gConfig.boardId.c_str());
-
-  if (!http.begin(client, url)) {
-    http.end();
-    return true;
-  }
-
-  int code = http.GET();
-  http.end();
-
-  if (code == HTTP_CODE_OK) {
-    return true;
-  }
-  if (code == HTTP_CODE_BAD_REQUEST || code == HTTP_CODE_NOT_FOUND ||
-      code == HTTP_CODE_FORBIDDEN) {
-    return false;
-  }
-  return true;
+    statusStrip.begin();
+    statusStrip.setBrightness(gEffectiveBrightness);
+    statusOrange();
+    statusStrip.show();
+    for (uint8_t i = 0; i < LINE_COUNT; i++) {
+        strips[i].begin();
+        strips[i].setBrightness(gEffectiveBrightness);
+        strips[i].clear();
+        strips[i].show();
+    }
 }
 
 void setup() {
-  Serial.begin(115200);
-  delay(150);
-  Serial.println("\nMetroboard — Solid Station Mode (TTL, fixed colors, "
-                 "BRIGHTNESS=16, coalesced)");
-  initStatusLed();
-  loadConfigFromPrefs();
-  if (!gConfig.isValid()) {
-    Serial.println("[CFG] Missing settings. Starting setup portal.");
-    startConfigPortal();
-  }
-  if (!wifiConnect(90000)) {
-    Serial.println("[CFG] WiFi failed. Starting setup portal.");
-    setStatus(STATUS_WIFI_DISCONNECTED);
-    startConfigPortal();
-  }
-  gBoardIdValid = isBoardIdValid();
-  if (!gBoardIdValid) {
-    Serial.println("[CFG] Board ID invalid. Starting setup portal.");
-    setStatus(STATUS_BOARD_INVALID);
-    startConfigPortal();
-  }
-  setStatus(STATUS_WIFI_CONNECTED_VALID);
-  beginStrips();
-  buildBindings();
-  renderAll();
+    Serial.begin(115200);
+    delay(150);
+    Serial.println(
+        "\nMetroboard — Solid Station Mode (TTL, fixed colors, BRIGHTNESS=16, "
+        "coalesced)");
+    wifiConnect();
+    beginStrips();
+    buildBindings();
+    renderAll();
 
-  xTaskCreatePinnedToCore(
-      [](void *) {
-        for (;;) {
-          ensureWifi();
+    xTaskCreatePinnedToCore(
+        [](void*) {
+            for (;;) {
+                ensureWifi();
 
-          uint32_t now = millis();
-          if (!gOtaInProgress && now > OTA_STARTUP_DELAY_MS &&
-              (lastOtaCheck == 0 || now - lastOtaCheck >= OTA_CHECK_MS)) {
-            lastOtaCheck = now;
-            checkForOtaUpdate();
-          }
+                uint32_t now = millis();
+                if (gMode != "animation" && now - lastPoll >= pollInterval) {
+                    lastPoll = now;
 
-          if (gMode != "animation" && now - lastPoll >= pollInterval) {
-            lastPoll = now;
+                    statusStrip.setPixelColor(0, statusStrip.Color(0, 80, 0));
+                    statusStrip.show();
 
-            int batches = fetchAllBatchesAndRenderOnce(true);
+                    int batches = fetchAllBatchesAndRenderOnce(true);
 
-            if (batches > 0)
-              pollInterval = POLL_MS_MIN;
-            else {
-              uint32_t next = pollInterval + 1500;
-              if (next > POLL_MS_MAX)
-                next = POLL_MS_MAX;
-              pollInterval = next;
+                    statusStrip.setPixelColor(0, statusStrip.Color(0, 160, 0));
+                    statusStrip.show();
+
+                    if (batches > 0)
+                        pollInterval = POLL_MS_MIN;
+                    else {
+                        uint32_t next = pollInterval + 1500;
+                        if (next > POLL_MS_MAX) next = POLL_MS_MAX;
+                        pollInterval = next;
+                    }
+                } else if (gMode == "animation" &&
+                           now - lastSettingsFetch >= SETTINGS_FETCH_MS) {
+                    fetchAllBatchesAndRenderOnce(
+                        false);  // refresh settings without stalling the
+                                 // animation render loop
+                }
+
+                vTaskDelay(10 / portTICK_PERIOD_MS);
             }
-          } else if (gMode == "animation" &&
-                     now - lastSettingsFetch >= SETTINGS_FETCH_MS) {
-            fetchAllBatchesAndRenderOnce(false);
-          }
-
-          vTaskDelay(10 / portTICK_PERIOD_MS);
-        }
-      },
-      "pollTask", 8192, nullptr, 1, &gPollTaskHandle, 0);
+        },
+        "pollTask", 8192, nullptr, 1, &gPollTaskHandle, 0);
 }
 
 void loop() {
-  if (gOtaInProgress) {
-    delay(50);
-    return;
-  }
-  if (gMode == "animation") {
-    runAnimationStep();
-    delay(20);
-  } else {
-    delay(5);
-  }
+    if (gMode == "animation") {
+        runAnimationStep();
+        delay(20);
+    } else {
+        delay(5);  // LED updates handled by poll task; yield to keep watchdog
+                   // happy
+    }
 }

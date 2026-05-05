@@ -1,0 +1,107 @@
+{
+  "AB12C": {
+    "board_id": "AB12C",
+    "brightness": 16,
+    "mode": "live",
+    "night_mode": {
+      "enabled": false,
+      "start": "23:00",
+      "end": "06:00",
+      "action": "off",
+      "dim_level": 20
+    },
+    "animation": {
+      "name": "pulse",
+      "speed": 120,
+      "color": [
+        255,
+        80,
+        0
+      ]
+    }
+  },
+  "Q7X9M": {
+    "board_id": "Q7X9M",
+    "brightness": 16,
+    "mode": "live",
+    "night_mode": {
+      "enabled": true,
+      "start": "22:30",
+      "end": "06:00",
+      "action": "off",
+      "dim_level": 20
+    },
+    "animation": {
+      "name": "pulse",
+      "speed": 120,
+      "color": [
+        255,
+        80,
+        0
+      ]
+    }
+  },
+  "L2A5T": {
+    "board_id": "L2A5T",
+    "brightness": 16,
+    "mode": "live",
+    "night_mode": {
+      "enabled": false,
+      "start": "23:00",
+      "end": "06:00",
+      "action": "off",
+      "dim_level": 20
+    },
+    "animation": {
+      "name": "pulse",
+      "speed": 120,
+      "color": [
+        255,
+        80,
+        0
+      ]
+    }
+  },
+  "ZP81N": {
+    "board_id": "ZP81N",
+    "brightness": 16,
+    "mode": "live",
+    "night_mode": {
+      "enabled": false,
+      "start": "23:00",
+      "end": "06:00",
+      "action": "off",
+      "dim_level": 20
+    },
+    "animation": {
+      "name": "pulse",
+      "speed": 120,
+      "color": [
+        255,
+        80,
+        0
+      ]
+    }
+  },
+  "W3C6R": {
+    "board_id": "W3C6R",
+    "brightness": 16,
+    "mode": "live",
+    "night_mode": {
+      "enabled": false,
+      "start": "23:00",
+      "end": "06:00",
+      "action": "off",
+      "dim_level": 20
+    },
+    "animation": {
+      "name": "pulse",
+      "speed": 120,
+      "color": [
+        255,
+        80,
+        0
+      ]
+    }
+  }
+}
