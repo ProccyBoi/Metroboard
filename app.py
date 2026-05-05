@@ -843,36 +843,6 @@ def route_nearest_station_names(
         return set()
     return {name for name, d in distances if d <= best_d + MB_ROUTE_NEAREST_MARGIN_M}
 
-def route_nearest_distance_m(
-    route_short: str,
-    lat: T.Optional[float],
-    lon: T.Optional[float],
-) -> float:
-    if lat is None or lon is None:
-        return float("inf")
-    route_short = (route_short or "").upper()
-    best = float("inf")
-    for meta in STATION_INDEX.values():
-        if (meta.get("route_short") or "").upper() != route_short:
-            continue
-        best = min(best, hav_m(meta["lat"], meta["lon"], lat, lon))
-    return best
-
-def route_assignment_is_plausible(
-    route_short: str,
-    parent: T.Optional[str],
-    lat: T.Optional[float],
-    lon: T.Optional[float],
-) -> bool:
-    route_short = (route_short or "").upper()
-    if not route_short:
-        return False
-
-    if parent and parent in STATION_ROUTE_PAIRS:
-        return route_short in STATION_ROUTE_PAIRS[parent]
-
-    return route_nearest_distance_m(route_short, lat, lon) <= D_FAR
-
 # ---------------- GTFS-RT: fetch & parse ----------------
 _FEED_CACHE: T.Optional[rt.FeedMessage] = None
 _FEED_TS = 0.0
@@ -1007,10 +977,12 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
     missing_routes = {}
     route_debug = {}
 
-    # COMPREHENSIVE route prefix mapping - INCLUDING T8!
+    # Route IDs in the realtime feed use short operational prefixes.
+    # Only unambiguous prefixes are mapped directly; ambiguous prefixes must be
+    # resolved against the reported station or left unknown.
     ROUTE_PREFIX_MAP = {
         # Core Sydney Trains lines
-        "BMT": ["T1"],           # Blue Mountains Line
+        "BMT": ["BMT"],          # Blue Mountains Line
         "NTH": ["T1", "T9"],     # North Shore Line
         "WST": ["T1"],           # Western Line  
         "APS": ["T8"],           # Airport & South Line - FIXED! Was wrongly T1/T9
@@ -1021,7 +993,6 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         "T3": ["T3"],            # Bankstown Line
         "ESI": ["T4"],           # Eastern Suburbs & Illawarra
         "CMB": ["T5"],           # Cumberland Line
-        "RTTA": ["T6"],          # Carlingford/Lidcombe
         "T6": ["T6"],            # Lidcombe & Bankstown (new)
         "OLY": ["T7"],           # Olympic Park Line
         "T7": ["T7"],            # Olympic Park
@@ -1047,19 +1018,6 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         "M": ["M1"],      # Catch generic "M" prefixes
         "METRO": ["M1"],
         
-        # Other patterns
-        "MOUNTAINS": ["T1"],
-        "CUMBERLAND": ["T5"],
-        "LIVERPOOL": ["T3"],
-        "SEFTON": ["T3", "T6"],
-        "BLACKTOWN": ["T1"],
-        "LIDCOMBE": ["T1", "T7"],
-        "BANKSTOWN": ["T3"],
-        "EASTERN": ["T4", "T8"],
-        "ILLAWARRA": ["T4"],
-        
-        # Defensive catch
-        "": ["T1"],
     }
 
     for e in feed.entity:
@@ -1151,11 +1109,6 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
         status = int(getattr(v, "current_status", rt.VehiclePosition.IN_TRANSIT_TO))
         lat = getattr(v.position, "latitude", None) if v.HasField("position") else None
         lon = getattr(v.position, "longitude", None) if v.HasField("position") else None
-
-        if rs and not route_assignment_is_plausible(rs, parent, lat, lon):
-            if MB_VERBOSE:
-                vlog(f"Rejected implausible route {rs} for rid={rid} stop={sid} parent={parent} lat={lat} lon={lon}")
-            rs = ""
 
         rs = rs or None
         route_debug[rid] = rs
