@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <HTTPClient.h>
 #include <Preferences.h>
+#include <Update.h>
 #include <WebServer.h>
 #include <DNSServer.h>
 #include <WiFi.h>
@@ -24,8 +25,11 @@
 static const char *kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
 
+static const char *kFirmwareVersion = "1.4.1";
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
 static const uint32_t SETTINGS_FETCH_MS = 30000;
+static const uint32_t OTA_CHECK_MS = 15UL * 60UL * 1000UL;
+static const uint32_t OTA_STARTUP_DELAY_MS = 60UL * 1000UL;
 
 struct DeviceConfig {
   String ssid;
@@ -102,6 +106,8 @@ struct AnimCfg {
 
 uint32_t lastSettingsFetch = 0;
 uint32_t lastSettingsVersion = 0;
+uint32_t lastOtaCheck = 0;
+volatile bool gOtaInProgress = false;
 
 // ===== Binding model =====
 struct LedBinding {
@@ -124,7 +130,8 @@ enum StatusCode : uint8_t {
   STATUS_SERVER_ACTIVE,
   STATUS_WIFI_CONNECTING,
   STATUS_WIFI_DISCONNECTED,
-  STATUS_BOARD_INVALID
+  STATUS_BOARD_INVALID,
+  STATUS_OTA_UPDATING
 };
 
 void setStatus(StatusCode code) {
@@ -159,6 +166,11 @@ void setStatus(StatusCode code) {
     r = 200;
     g = 0;
     b = 120;
+    break;
+  case STATUS_OTA_UPDATING:
+    r = 180;
+    g = 180;
+    b = 40;
     break;
   }
   statusStrip.setBrightness(kStatusBrightness);
@@ -238,6 +250,13 @@ static String enc(const char *s) {
     }
   }
   return o;
+}
+static String serviceBaseUrl() {
+  String url = String(kPayloadBase);
+  int slash = url.lastIndexOf('/');
+  if (slash > 0)
+    return url.substring(0, slash);
+  return url;
 }
 static uint32_t lineColor(Line ln) {
   uint32_t h = LINE_COLOR_HEX[ln];
@@ -715,6 +734,184 @@ void ensureWifi() {
   }
 }
 
+// ===== HTTP OTA =====
+bool performOtaUpdate(const char *firmwareUrl, const char *expectedMd5,
+                      int expectedSize, const char *targetVersion) {
+  if (!firmwareUrl || strlen(firmwareUrl) == 0)
+    return false;
+  if (WiFi.status() != WL_CONNECTED)
+    return false;
+
+  gOtaInProgress = true;
+  setStatus(STATUS_OTA_UPDATING);
+  Serial.printf("[OTA] Starting update to %s\n",
+                targetVersion && strlen(targetVersion) ? targetVersion : "unknown");
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(30000);
+  client.setHandshakeTimeout(30000);
+
+  HTTPClient http;
+  http.setTimeout(30000);
+  http.setReuse(false);
+
+  if (!http.begin(client, firmwareUrl)) {
+    Serial.println("[OTA] Failed to open firmware URL.");
+    http.end();
+    gOtaInProgress = false;
+    setStatus(STATUS_WIFI_CONNECTED_VALID);
+    return false;
+  }
+  http.addHeader("Accept", "application/octet-stream");
+  http.addHeader("Cache-Control", "no-cache");
+  http.addHeader("Connection", "close");
+  http.addHeader("User-Agent", String("ESP32-Metroboard/ota/") + kFirmwareVersion);
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("[OTA] Firmware download HTTP %d\n", code);
+    http.end();
+    gOtaInProgress = false;
+    setStatus(STATUS_WIFI_CONNECTED_VALID);
+    return false;
+  }
+
+  int contentLength = http.getSize();
+  int updateSize = contentLength > 0 ? contentLength : expectedSize;
+  if (expectedSize > 0 && contentLength > 0 && expectedSize != contentLength) {
+    Serial.printf("[OTA] Size mismatch manifest=%d http=%d\n", expectedSize,
+                  contentLength);
+    http.end();
+    gOtaInProgress = false;
+    setStatus(STATUS_WIFI_CONNECTED_VALID);
+    return false;
+  }
+  if (updateSize <= 0) {
+    Serial.println("[OTA] Missing firmware content length.");
+    http.end();
+    gOtaInProgress = false;
+    setStatus(STATUS_WIFI_CONNECTED_VALID);
+    return false;
+  }
+
+  if (!Update.begin((size_t)updateSize)) {
+    Serial.printf("[OTA] Update.begin failed, error=%u\n", Update.getError());
+    http.end();
+    gOtaInProgress = false;
+    setStatus(STATUS_WIFI_CONNECTED_VALID);
+    return false;
+  }
+
+  if (expectedMd5 && strlen(expectedMd5) == 32) {
+    if (!Update.setMD5(expectedMd5)) {
+      Serial.println("[OTA] Invalid MD5 from manifest.");
+      Update.abort();
+      http.end();
+      gOtaInProgress = false;
+      setStatus(STATUS_WIFI_CONNECTED_VALID);
+      return false;
+    }
+  }
+
+  WiFiClient *stream = http.getStreamPtr();
+  size_t written = Update.writeStream(*stream);
+  if (written != (size_t)updateSize) {
+    Serial.printf("[OTA] Written %u/%d bytes\n", (unsigned)written, updateSize);
+    Update.abort();
+    http.end();
+    gOtaInProgress = false;
+    setStatus(STATUS_WIFI_CONNECTED_VALID);
+    return false;
+  }
+
+  if (!Update.end()) {
+    Serial.printf("[OTA] Update.end failed, error=%u\n", Update.getError());
+    http.end();
+    gOtaInProgress = false;
+    setStatus(STATUS_WIFI_CONNECTED_VALID);
+    return false;
+  }
+
+  if (!Update.isFinished()) {
+    Serial.println("[OTA] Update did not finish cleanly.");
+    http.end();
+    gOtaInProgress = false;
+    setStatus(STATUS_WIFI_CONNECTED_VALID);
+    return false;
+  }
+
+  http.end();
+  Serial.println("[OTA] Update complete. Rebooting.");
+  delay(500);
+  ESP.restart();
+  return true;
+}
+
+bool checkForOtaUpdate() {
+  if (gOtaInProgress || WiFi.status() != WL_CONNECTED || !gBoardIdValid)
+    return false;
+
+  String url = serviceBaseUrl();
+  url += "/firmware_manifest?board_id=";
+  url += enc(gConfig.boardId.c_str());
+  url += "&current=";
+  url += enc(kFirmwareVersion);
+
+  WiFiClientSecure client;
+  client.setInsecure();
+  client.setTimeout(20000);
+  client.setHandshakeTimeout(20000);
+
+  HTTPClient http;
+  http.setTimeout(20000);
+  http.setReuse(false);
+
+  Serial.printf("[OTA] Checking %s\n", url.c_str());
+
+  if (!http.begin(client, url)) {
+    http.end();
+    return false;
+  }
+  http.addHeader("Accept", "application/json");
+  http.addHeader("Accept-Encoding", "identity");
+  http.addHeader("Cache-Control", "no-cache");
+  http.addHeader("Connection", "close");
+  http.addHeader("User-Agent", String("ESP32-Metroboard/ota/") + kFirmwareVersion);
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("[OTA] Manifest HTTP %d\n", code);
+    http.end();
+    return false;
+  }
+
+  String body = http.getString();
+  http.end();
+  body.trim();
+
+  StaticJsonDocument<1536> doc;
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) {
+    Serial.printf("[OTA] Manifest JSON error: %s\n", err.c_str());
+    return false;
+  }
+
+  bool updateAvailable = doc["update_available"] | false;
+  const char *version = doc["version"] | "";
+  if (!updateAvailable) {
+    const char *reason = doc["reason"] | "none";
+    Serial.printf("[OTA] No update. current=%s latest=%s reason=%s\n",
+                  kFirmwareVersion, version, reason);
+    return false;
+  }
+
+  const char *firmwareUrl = doc["url"] | "";
+  const char *md5 = doc["md5"] | "";
+  int size = doc["size"] | 0;
+  return performOtaUpdate(firmwareUrl, md5, size, version);
+}
+
 // ===== Batch tuner =====
 static const size_t URL_CHAR_BUDGET = 1700;
 static const uint8_t MAX_BATCHES_PER_POLL = 6;
@@ -921,14 +1118,8 @@ bool isBoardIdValid() {
   client.setHandshakeTimeout(20000);
 
   HTTPClient http;
-  String url = String(kPayloadBase);
-  int slash = url.lastIndexOf('/');
-  if (slash > 0) {
-    url = url.substring(0, slash);
-    url += "/board_settings?board_id=";
-  } else {
-    url += "/board_settings?board_id=";
-  }
+  String url = serviceBaseUrl();
+  url += "/board_settings?board_id=";
   url += enc(gConfig.boardId.c_str());
 
   if (!http.begin(client, url)) {
@@ -982,6 +1173,12 @@ void setup() {
           ensureWifi();
 
           uint32_t now = millis();
+          if (!gOtaInProgress && now > OTA_STARTUP_DELAY_MS &&
+              (lastOtaCheck == 0 || now - lastOtaCheck >= OTA_CHECK_MS)) {
+            lastOtaCheck = now;
+            checkForOtaUpdate();
+          }
+
           if (gMode != "animation" && now - lastPoll >= pollInterval) {
             lastPoll = now;
 
@@ -1007,6 +1204,10 @@ void setup() {
 }
 
 void loop() {
+  if (gOtaInProgress) {
+    delay(50);
+    return;
+  }
   if (gMode == "animation") {
     runAnimationStep();
     delay(20);

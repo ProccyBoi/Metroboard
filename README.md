@@ -45,6 +45,11 @@ Environment variables:
 - `MB_VERBOSE` (logging verbosity; default on).
 - `MB_FORCE_DISTANCE` (force distance-only matching).
 - `MB_TIMEZONE` (IANA timezone for night-mode windows; default `Australia/Sydney`).
+- `FIRMWARE_OTA_ENABLED` (enable Koyeb-hosted firmware OTA; default on).
+- `FIRMWARE_MANIFEST_PATH` (default `firmware/manifest.json`).
+- `FIRMWARE_PATH` (fallback firmware binary path; default `firmware/metroboard_public.bin`).
+- `FIRMWARE_VERSION` (fallback firmware version when no manifest is present).
+- `PUBLIC_BASE_URL` (optional public URL override for OTA download links).
 
 ## Data files
 Place these alongside `app.py` (repository root):
@@ -60,6 +65,21 @@ Place these alongside `app.py` (repository root):
 - `GET /trains` — sampled raw train entries.
 - `GET /board_settings?board_id=...` — board configuration JSON.
 - `GET /board_payload?board_id=...` — firmware-friendly settings plus state map.
+- `GET /firmware_manifest?board_id=...&current=...` — OTA firmware metadata.
+- `GET /firmware.bin?board_id=...&version=...` — OTA firmware binary, when deployed.
+
+## Firmware OTA
+The public ESP32 sketch supports HTTP OTA through Koyeb from firmware version `1.4.1`.
+
+First flash `metroboard_public.ino` over USB once. After that, future firmware updates can be deployed through Koyeb:
+
+1. Build/export the ESP32 binary from `metroboard_public.ino`.
+2. Copy it to `firmware/metroboard_public.bin`.
+3. Bump `kFirmwareVersion` in `metroboard_public.ino`.
+4. Bump `version` in `firmware/manifest.json` to the same value.
+5. Commit and push so Koyeb redeploys.
+
+The board checks `/firmware_manifest` over Wi-Fi, downloads `/firmware.bin` when the version is newer, verifies the MD5 from the manifest, writes the update, and reboots. If the binary is missing, the manifest reports no update.
 
 ## LED status codes
 - `0` — off

@@ -9,6 +9,7 @@ ENV STOP_TIMES_PATH=/app/gtfs/stop_times.txt
 RUN python /app/scripts/ensure_stop_times.py
 COPY station_line_pairs.txt station_line_pairs.csv /app/
 COPY boards.json /app/
+COPY firmware /app/firmware
 COPY app.py .
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8000

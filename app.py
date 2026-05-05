@@ -11,6 +11,7 @@ import os
 import time
 import csv
 import gzip
+import hashlib
 import json
 import shutil
 import re
@@ -20,11 +21,12 @@ import typing as T
 
 import requests
 from fastapi import FastAPI, Query, Request, Form
-from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from google.transit import gtfs_realtime_pb2 as rt
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from urllib.parse import quote
 try:
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover - python <3.9 fallback
@@ -64,6 +66,11 @@ def _env_flag(name: str, default: bool = True) -> bool:
     return value.strip().lower() not in ("0", "false", "no", "off")
 
 PERSIST_USER_SETTINGS = _env_flag("PERSIST_USER_SETTINGS", True)
+FIRMWARE_OTA_ENABLED = _env_flag("FIRMWARE_OTA_ENABLED", True)
+FIRMWARE_MANIFEST_PATH = os.getenv("FIRMWARE_MANIFEST_PATH", os.path.join("firmware", "manifest.json"))
+FIRMWARE_PATH = os.getenv("FIRMWARE_PATH", os.path.join("firmware", "metroboard_public.bin"))
+FIRMWARE_VERSION = os.getenv("FIRMWARE_VERSION", "").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 # board_id -> settings dict
 BOARD_SETTINGS: dict[str, dict] = {}
@@ -297,6 +304,73 @@ def _board_status_snapshot(board_id: str) -> dict:
         "last_payload_age_seconds": None if last is None else max(0.0, now - last),
         "settings_version": BOARD_SETTINGS_VERSION,
         "feed_age_seconds": _feed_age_seconds(),
+    }
+
+def _public_base_url(request: Request) -> str:
+    if PUBLIC_BASE_URL:
+        return PUBLIC_BASE_URL
+    host = (
+        request.headers.get("x-forwarded-host")
+        or request.headers.get("host")
+        or request.url.netloc
+    )
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
+    proto = proto.split(",")[0].strip()
+    host = host.split(",")[0].strip()
+    if host.endswith(".koyeb.app"):
+        proto = "https"
+    return f"{proto}://{host}".rstrip("/")
+
+def _firmware_manifest_config() -> tuple[str, str]:
+    version = FIRMWARE_VERSION
+    path = FIRMWARE_PATH
+    manifest_path = _resolve_local_path(FIRMWARE_MANIFEST_PATH)
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                version = str(data.get("version") or version).strip()
+                filename = data.get("filename") or data.get("path")
+                if filename:
+                    filename = str(filename)
+                    if os.path.isabs(filename):
+                        path = filename
+                    else:
+                        path = os.path.join(os.path.dirname(manifest_path), filename)
+        except Exception as e:
+            vlog(f"WARN: failed to load firmware manifest {manifest_path}: {e}")
+    return version, path
+
+def _firmware_metadata() -> dict:
+    version, path = _firmware_manifest_config()
+    path = _resolve_local_path(path)
+    if not FIRMWARE_OTA_ENABLED:
+        return {"available": False, "reason": "ota_disabled", "version": version}
+    if not version:
+        return {"available": False, "reason": "missing_version", "version": version}
+    if not os.path.exists(path):
+        return {"available": False, "reason": "missing_binary", "version": version, "path": path}
+    size = os.path.getsize(path)
+    if size <= 0:
+        return {"available": False, "reason": "empty_binary", "version": version, "path": path}
+
+    md5 = hashlib.md5()
+    sha256 = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            md5.update(chunk)
+            sha256.update(chunk)
+
+    return {
+        "available": True,
+        "version": version,
+        "path": path,
+        "filename": os.path.basename(path),
+        "size": size,
+        "md5": md5.hexdigest(),
+        "sha256": sha256.hexdigest(),
+        "mtime": os.path.getmtime(path),
     }
 
 def _parse_hhmm(s: str) -> T.Optional[dtime]:
@@ -2206,6 +2280,82 @@ def board_status_api(board_id: str = Query(...)):
     except ValueError:
         return _as_no_store(JSONResponse({"error": "invalid board_id"}, status_code=400))
     return _as_no_store(JSONResponse(_board_status_snapshot(board_id)))
+
+
+@app.get("/firmware_manifest")
+def firmware_manifest_api(
+    request: Request,
+    board_id: str = Query(...),
+    current: T.Optional[str] = Query(None),
+):
+    board_id = _normalize_board_id(board_id)
+    if not board_id:
+        return _as_no_store(JSONResponse({"error": "missing board_id"}, status_code=400))
+    try:
+        _get_or_create_board(board_id)
+    except ValueError:
+        return _as_no_store(JSONResponse({"error": "invalid board_id"}, status_code=400))
+
+    meta = _firmware_metadata()
+    current_version = (current or "").strip()
+    update_available = bool(meta.get("available")) and current_version != meta.get("version")
+
+    payload = {
+        "ota_enabled": FIRMWARE_OTA_ENABLED,
+        "update_available": update_available,
+        "current": current_version,
+        "version": meta.get("version"),
+        "reason": None if meta.get("available") else meta.get("reason"),
+    }
+
+    if meta.get("available"):
+        encoded_board = quote(board_id, safe="")
+        encoded_version = quote(str(meta["version"]), safe="")
+        payload.update({
+            "filename": meta["filename"],
+            "size": meta["size"],
+            "md5": meta["md5"],
+            "sha256": meta["sha256"],
+            "url": (
+                f"{_public_base_url(request)}/firmware.bin"
+                f"?board_id={encoded_board}&version={encoded_version}"
+            ),
+        })
+
+    return _as_no_store(JSONResponse(payload))
+
+
+@app.get("/firmware.bin")
+def firmware_binary_api(
+    board_id: str = Query(...),
+    version: T.Optional[str] = Query(None),
+):
+    board_id = _normalize_board_id(board_id)
+    if not board_id:
+        return JSONResponse({"error": "missing board_id"}, status_code=400)
+    try:
+        _get_or_create_board(board_id)
+    except ValueError:
+        return JSONResponse({"error": "invalid board_id"}, status_code=400)
+
+    meta = _firmware_metadata()
+    if not meta.get("available"):
+        return JSONResponse({"error": "firmware_unavailable", "reason": meta.get("reason")}, status_code=404)
+    if version and version.strip() != meta.get("version"):
+        return JSONResponse({"error": "firmware_version_not_found"}, status_code=404)
+
+    headers = {
+        "Cache-Control": "no-store",
+        "X-Firmware-Version": str(meta["version"]),
+        "X-Firmware-MD5": str(meta["md5"]),
+        "X-Firmware-SHA256": str(meta["sha256"]),
+    }
+    return FileResponse(
+        meta["path"],
+        media_type="application/octet-stream",
+        filename=meta["filename"],
+        headers=headers,
+    )
 
 
 def _station_subset(only: T.Optional[str]) -> dict[str, dict]:
