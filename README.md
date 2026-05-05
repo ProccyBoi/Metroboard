@@ -73,13 +73,23 @@ The public ESP32 sketch supports HTTP OTA through Koyeb from firmware version `1
 
 First flash `metroboard_public.ino` over USB once. After that, future firmware updates can be deployed through Koyeb:
 
-1. Build/export the ESP32 binary from `metroboard_public.ino`.
-2. Copy it to `firmware/metroboard_public.bin`.
-3. Bump `kFirmwareVersion` in `metroboard_public.ino`.
-4. Bump `version` in `firmware/manifest.json` to the same value.
+1. Edit the tracked root sketch `metroboard_public.ino`.
+2. Bump `kFirmwareVersion` in `metroboard_public.ino`.
+3. Bump `version` in `firmware/manifest.json` to the same value.
+4. Build with PlatformIO:
+   ```bash
+   python -m platformio run -e metroboard_public
+   ```
+   The post-build script copies the binary to `firmware/metroboard_public.bin`.
 5. Commit and push so Koyeb redeploys.
 
 The board checks `/firmware_manifest` over Wi-Fi, downloads `/firmware.bin` when the version is newer, verifies the MD5 from the manifest, writes the update, and reboots. If the binary is missing, the manifest reports no update.
+
+To flash the OTA-capable firmware over USB the first time:
+```bash
+python -m platformio run -e metroboard_public -t upload
+```
+The PlatformIO environment is configured for `COM17`.
 
 ## LED status codes
 - `0` — off
