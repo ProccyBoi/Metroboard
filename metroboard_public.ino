@@ -367,7 +367,9 @@ const char *const T1_SEQ[] = {
     "Westmead",      "Wentworthville",   "Pendle Hill", "Toongabbie",
     "Seven Hills",   "Blacktown",        "Doonside",    "Rooty Hill",
     "Mount Druitt",  "St Marys",         "Werrington",  "Kingswood",
-    "Penrith",       "Emu Plains"};
+    "Penrith",       "Emu Plains",       "Marayong",    "Quakers Hill",
+    "Schofields",    "Riverstone",       "Vineyard",    "Mulgrave",
+    "Windsor",       "Clarendon",        "East Richmond", "Richmond"};
 
 // ===== build & render =====
 void runAnimationStep() {
