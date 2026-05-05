@@ -69,6 +69,7 @@ PERSIST_USER_SETTINGS = _env_flag("PERSIST_USER_SETTINGS", True)
 BOARD_SETTINGS: dict[str, dict] = {}
 BOARD_SETTINGS_VERSION: int = 0
 BOARD_SETTINGS_VERSION: int = 0
+BOARD_LAST_PAYLOAD_AT: dict[str, float] = {}
 
 # Caching/CORS/logging
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
@@ -78,9 +79,13 @@ MB_RESOLUTION_VERBOSE = os.getenv("MB_RESOLUTION_VERBOSE", "0") == "1"
 MB_FORCE_DISTANCE = os.getenv("MB_FORCE_DISTANCE", "0") == "1"
 MB_TIMEZONE = os.getenv("MB_TIMEZONE", "Australia/Sydney")
 MB_STRICT_ROUTE_MATCH = _env_flag("MB_STRICT_ROUTE_MATCH", True)
+MB_GUESS_AMBIGUOUS = _env_flag("MB_GUESS_AMBIGUOUS", True)
 MB_ROUTE_NEAREST_MARGIN_M = int(os.getenv("MB_ROUTE_NEAREST_MARGIN_M", "250"))
 
 IGNORED_ROUTE_PREFIXES = {"RTTA"}
+ROUTE_PREFIX_DEFAULTS = {
+    "NTH": "T9",
+}
 
 # BBox guardrail (None disables)
 DEFAULT_SYD_BBOX = (-34.2, 150.5, -33.4, 151.4)
@@ -104,6 +109,15 @@ def vlog(*a):
 
 def route_id_prefix(route_id: str) -> str:
     return (route_id or "").split("_", 1)[0].split(".", 1)[0].upper()
+
+def preferred_route_candidate(prefix: str, candidates: T.Iterable[str]) -> T.Optional[str]:
+    ordered = [c for c in candidates if c]
+    if not ordered:
+        return None
+    preferred = ROUTE_PREFIX_DEFAULTS.get(prefix)
+    if preferred and preferred in ordered:
+        return preferred
+    return ordered[0]
 
 def _resolve_local_path(path: str) -> str:
     if not path:
@@ -251,6 +265,27 @@ def _now_local() -> datetime:
         except Exception:
             pass
     return datetime.utcnow()
+
+def _iso_utc_from_ts(ts: T.Optional[float]) -> T.Optional[str]:
+    if ts is None:
+        return None
+    return datetime.utcfromtimestamp(ts).isoformat() + "Z"
+
+def _feed_age_seconds() -> T.Optional[float]:
+    if _FEED_TS == 0:
+        return None
+    return max(0.0, time.time() - _FEED_TS)
+
+def _board_status_snapshot(board_id: str) -> dict:
+    last = BOARD_LAST_PAYLOAD_AT.get(board_id)
+    now = time.time()
+    return {
+        "board_id": board_id,
+        "last_payload_at": _iso_utc_from_ts(last),
+        "last_payload_age_seconds": None if last is None else max(0.0, now - last),
+        "settings_version": BOARD_SETTINGS_VERSION,
+        "feed_age_seconds": _feed_age_seconds(),
+    }
 
 def _parse_hhmm(s: str) -> T.Optional[dtime]:
     try:
@@ -989,7 +1024,7 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
     ROUTE_PREFIX_MAP = {
         # Core Sydney Trains lines
         "BMT": ["BMT"],          # Blue Mountains Line
-        "NTH": ["T1", "T9"],     # North Shore Line
+        "NTH": ["T1", "T9"],     # Northern/North Shore ambiguous; prefer T9 if forced to guess
         "WST": ["T1"],           # Western Line  
         "APS": ["T8"],           # Airport & South Line - FIXED! Was wrongly T1/T9
         "CTY": ["T2"],           # Inner West & Leppington
@@ -1078,13 +1113,17 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                     elif parent in FORCE_T1_PARENT_STOPS and "T1" in possible:
                         rs = "T1"
                     elif any(x in rid.upper() for x in ["NSN", "NTH"]) and "T9" in possible and "T1" in possible:
-                        rs = None
+                        rs = "T9" if MB_GUESS_AMBIGUOUS else None
+                    elif MB_GUESS_AMBIGUOUS:
+                        rs = preferred_route_candidate(prefix, [c for c in candidates if c in possible])
                     if MB_RESOLUTION_VERBOSE and rs:
                         vlog(f"Multi-route disambiguation {rid} at {parent}: {possible} -> {rs}")
                 else:
-                    rs = None
+                    rs = preferred_route_candidate(prefix, candidates) if MB_GUESS_AMBIGUOUS else None
             elif candidates:
-                rs = candidates[0] if len(candidates) == 1 else None
+                rs = candidates[0] if len(candidates) == 1 else (
+                    preferred_route_candidate(prefix, candidates) if MB_GUESS_AMBIGUOUS else None
+                )
 
         # METHOD 4: Infer from exact platform only when static GTFS says it is unique.
         if not rs and sid and sid in STOP_ROUTE_PAIRS:
@@ -1108,6 +1147,11 @@ def collect_trains(feed: rt.FeedMessage, route_id_to_short: dict[str, str]) -> t
                     rs = "T8"
                     if MB_RESOLUTION_VERBOSE:
                         vlog(f"Inferred route {rs} from stop {parent} (keyword from {possible_routes})")
+                elif rid and route_id_prefix(rid) not in IGNORED_ROUTE_PREFIXES and MB_GUESS_AMBIGUOUS:
+                    prefix = route_id_prefix(rid)
+                    rs = preferred_route_candidate(prefix, sorted(possible_routes))
+                    if MB_RESOLUTION_VERBOSE and rs:
+                        vlog(f"Guessed route {rs} from stop {parent} ({possible_routes})")
 
         if parent in FORCE_T1_PARENT_STOPS and rs == "T9":
             rs = "T1"
@@ -1578,6 +1622,34 @@ def board_settings_page(board_id: str):
             font-size: 13px;
             color: var(--muted);
           }}
+          .status-grid {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+            gap: 10px;
+            margin-top: 12px;
+          }}
+          .status-item {{
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 12px 14px;
+            background: rgba(255,255,255,0.025);
+          }}
+          .status-label {{
+            color: var(--muted);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+          }}
+          .status-value {{
+            margin-top: 6px;
+            font-size: 20px;
+            font-weight: 700;
+          }}
+          .status-sub {{
+            margin-top: 4px;
+            color: var(--muted);
+            font-size: 13px;
+          }}
           .row {{ display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; }}
           label.field {{
             display: flex;
@@ -1732,6 +1804,30 @@ def board_settings_page(board_id: str):
             <span class="line-purple"></span>
           </div>
 
+          <section class="card">
+            <div class="section-head">
+              <h3>Board Status</h3>
+              <span class="tag" id="boardSyncTag">Checking</span>
+            </div>
+            <div class="status-grid">
+              <div class="status-item">
+                <div class="status-label">Last check-in</div>
+                <div class="status-value" id="lastPayloadAge">--</div>
+                <div class="status-sub" id="lastPayloadAt">Waiting for board</div>
+              </div>
+              <div class="status-item">
+                <div class="status-label">Train feed age</div>
+                <div class="status-value" id="feedAge">--</div>
+                <div class="status-sub">TfNSW cache age</div>
+              </div>
+              <div class="status-item">
+                <div class="status-label">Settings version</div>
+                <div class="status-value" id="settingsVersion">{BOARD_SETTINGS_VERSION}</div>
+                <div class="status-sub">Updates after saving</div>
+              </div>
+            </div>
+          </section>
+
           <form id="settingsForm" method="post" action="/board/{board_id}">
             <section class="card">
               <div class="section-head">
@@ -1852,6 +1948,11 @@ def board_settings_page(board_id: str):
             const pulseColorInput = document.getElementById("an_color");
             const pulseColorValue = document.getElementById("pulseColorValue");
             const pulseColorSwatch = document.getElementById("pulseColorSwatch");
+            const boardSyncTag = document.getElementById("boardSyncTag");
+            const lastPayloadAge = document.getElementById("lastPayloadAge");
+            const lastPayloadAt = document.getElementById("lastPayloadAt");
+            const feedAge = document.getElementById("feedAge");
+            const settingsVersion = document.getElementById("settingsVersion");
 
             const syncBrightness = () => brightnessValue.textContent = brightness.value;
             brightness.addEventListener("input", syncBrightness);
@@ -1901,6 +2002,44 @@ def board_settings_page(board_id: str):
             anName.addEventListener("change", syncPulseVisibility);
             syncPulseVisibility();
             syncPulseColorValue();
+
+            const formatAge = (seconds) => {{
+              if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return "--";
+              const s = Math.max(0, Math.round(Number(seconds)));
+              if (s < 60) return s + "s";
+              const m = Math.floor(s / 60);
+              const rem = s % 60;
+              if (m < 60) return rem ? `${{m}}m ${{rem}}s` : `${{m}}m`;
+              const h = Math.floor(m / 60);
+              const mins = m % 60;
+              return mins ? `${{h}}h ${{mins}}m` : `${{h}}h`;
+            }};
+
+            const syncBoardStatus = async () => {{
+              try {{
+                const resp = await fetch("/board_status?board_id={board_id}", {{ cache: "no-store" }});
+                if (!resp.ok) throw new Error("status " + resp.status);
+                const data = await resp.json();
+                const payloadAge = data.last_payload_age_seconds;
+                if (lastPayloadAge) lastPayloadAge.textContent = formatAge(payloadAge);
+                if (lastPayloadAt) {{
+                  lastPayloadAt.textContent = data.last_payload_at
+                    ? new Date(data.last_payload_at).toLocaleString()
+                    : "No board check-in yet";
+                }}
+                if (feedAge) feedAge.textContent = formatAge(data.feed_age_seconds);
+                if (settingsVersion) settingsVersion.textContent = data.settings_version ?? "--";
+                if (boardSyncTag) {{
+                  boardSyncTag.textContent = payloadAge === null || payloadAge === undefined
+                    ? "No check-in"
+                    : "Updated " + formatAge(payloadAge) + " ago";
+                }}
+              }} catch (err) {{
+                if (boardSyncTag) boardSyncTag.textContent = "Status unavailable";
+              }}
+            }};
+            syncBoardStatus();
+            window.setInterval(syncBoardStatus, 5000);
 
           }})();
         </script>
@@ -1969,11 +2108,11 @@ def debug():
         "routes_found": sorted(by_route.keys()),
         "routes_missing": [
             r for r, v in route_debug.items()
-            if v is None and route_id_prefix(r) not in IGNORED_ROUTE_PREFIXES
+            if r and v is None and route_id_prefix(r) not in IGNORED_ROUTE_PREFIXES
         ],
         "routes_ignored": [
             r for r, v in route_debug.items()
-            if v is None and route_id_prefix(r) in IGNORED_ROUTE_PREFIXES
+            if r and v is None and route_id_prefix(r) in IGNORED_ROUTE_PREFIXES
         ],
         "routes_resolved": route_debug,
     }
@@ -2037,6 +2176,17 @@ def board_settings_api(board_id: str = Query(...)):
     payload = dict(cfg)
     payload["settings_version"] = BOARD_SETTINGS_VERSION
     return _as_no_store(JSONResponse(payload))
+
+@app.get("/board_status")
+def board_status_api(board_id: str = Query(...)):
+    board_id = _normalize_board_id(board_id)
+    if not board_id:
+        return _as_no_store(JSONResponse({"error": "missing board_id"}, status_code=400))
+    try:
+        _get_or_create_board(board_id)
+    except ValueError:
+        return _as_no_store(JSONResponse({"error": "invalid board_id"}, status_code=400))
+    return _as_no_store(JSONResponse(_board_status_snapshot(board_id)))
 
 
 def _station_subset(only: T.Optional[str]) -> dict[str, dict]:
@@ -2172,6 +2322,10 @@ def board_payload(
     except ValueError:
         return JSONResponse({"error": "invalid board_id"}, status_code=400)
 
+    now_ts = time.time()
+    previous_seen_at = BOARD_LAST_PAYLOAD_AT.get(board_id)
+    BOARD_LAST_PAYLOAD_AT[board_id] = now_ts
+
     subset = _station_subset(only)
     states_payload = _calculate_states_for_subset(subset)
 
@@ -2190,6 +2344,12 @@ def board_payload(
         "states": states_payload,
         "settings_version": BOARD_SETTINGS_VERSION,
         "generated_at": datetime.utcnow().isoformat() + "Z",
+        "feed_age_seconds": _feed_age_seconds(),
+        "board_seen_at": _iso_utc_from_ts(now_ts),
+        "board_previous_seen_at": _iso_utc_from_ts(previous_seen_at),
+        "board_previous_seen_age_seconds": (
+            None if previous_seen_at is None else max(0.0, now_ts - previous_seen_at)
+        ),
     })
 
 @app.get("/debug_names")
