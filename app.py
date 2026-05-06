@@ -15,7 +15,6 @@ import hashlib
 import html
 import json
 import math
-import mimetypes
 import shutil
 import re
 import random
@@ -75,8 +74,6 @@ FIRMWARE_PATH = os.getenv("FIRMWARE_PATH", os.path.join("firmware", "metroboard_
 FIRMWARE_VERSION = os.getenv("FIRMWARE_VERSION", "").strip()
 FIRMWARE_SKETCH_PATH = os.getenv("FIRMWARE_SKETCH_PATH", "metroboard_public.ino")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
-BOARD_OVERLAY_PATH = os.getenv("BOARD_OVERLAY_PATH", os.path.join("assets", "board_overlay.png")).strip()
-BOARD_OVERLAY_URL = os.getenv("BOARD_OVERLAY_URL", "").strip()
 
 # board_id -> settings dict
 BOARD_SETTINGS: dict[str, dict] = {}
@@ -168,39 +165,6 @@ def _resolve_local_path(path: str) -> str:
         return path
     base_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_dir, path)
-
-def _board_overlay_path() -> str:
-    candidates: list[str] = []
-    if BOARD_OVERLAY_PATH:
-        candidates.append(BOARD_OVERLAY_PATH)
-    candidates.extend([
-        os.path.join("assets", "board_overlay.png"),
-        os.path.join("assets", "board_overlay.jpg"),
-        os.path.join("assets", "board_overlay.jpeg"),
-        os.path.join("assets", "board_overlay.webp"),
-    ])
-    seen: set[str] = set()
-    for candidate in candidates:
-        resolved = _resolve_local_path(candidate)
-        key = os.path.normcase(os.path.abspath(resolved))
-        if key in seen:
-            continue
-        seen.add(key)
-        if os.path.isfile(resolved):
-            return resolved
-    return ""
-
-def _board_overlay_url() -> str:
-    if BOARD_OVERLAY_URL:
-        return BOARD_OVERLAY_URL
-    path = _board_overlay_path()
-    if not path:
-        return ""
-    try:
-        version = int(os.path.getmtime(path))
-    except Exception:
-        version = int(time.time())
-    return f"/board_overlay?v={version}"
 
 GTFS_DIR = os.getenv("GTFS_DIR", "").strip()
 
@@ -702,11 +666,11 @@ BOARD_LINE_SPECS = [
                 "end": "Richmond",
                 "label_side": 1,
                 "path": [
-                    [128, 289], [125, 280], [123, 87],
+                    [132, 289], [132, 280], [132, 87],
                 ],
                 "anchors": {
-                    "Marayong": [128, 289],
-                    "Richmond": [123, 87],
+                    "Marayong": [132, 289],
+                    "Richmond": [132, 87],
                 },
             },
         ],
@@ -1201,7 +1165,6 @@ def _board_layout_model() -> dict:
     return {
         "viewBox": BOARD_LAYOUT_VIEWBOX,
         "title": "Sydney Rail Network",
-        "backgroundImage": _board_overlay_url(),
         "lines": lines,
     }
 
@@ -2439,12 +2402,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
       .status-sub { margin-top:4px; color:var(--muted); font-size:13px; }
       .layout-grid { display:grid; grid-template-columns:minmax(0,1fr) 270px; gap:14px; }
       .board-shell { background:#07090d; border:1px solid #303946; border-radius:8px; overflow:hidden; min-height:520px; }
-      .board-shell.has-artwork .network-title { display:none; }
-      .board-shell.has-artwork .line-path { opacity:.14; }
-      .board-shell.has-artwork .line-badge,.board-shell.has-artwork .line-badge-text { display:none; }
       #boardSvg { display:block; width:100%; aspect-ratio:861/850; min-height:520px; }
-      .board-artwork { pointer-events:none; opacity:.88; }
-      body.artwork-off .board-artwork { display:none; }
       .network-title { fill:#d7dee7; font-size:46px; font-weight:750; letter-spacing:0; }
       .line-path { fill:none; stroke-width:5; stroke-linecap:round; stroke-linejoin:round; opacity:.42; }
       .station-node { fill:#2a2f38; stroke:#a9b4c1; stroke-width:2; cursor:default; transition:opacity 120ms ease, fill 120ms ease, r 120ms ease; }
@@ -2517,7 +2475,6 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
               <h4>Test Lights</h4>
               <p class="muted">Select Test lights mode, then click stations or use line controls. Save settings to apply to the physical board.</p>
               <label class="option" style="margin-top:12px;"><input id="labelToggle" type="checkbox" checked /><div><strong>Station labels</strong><p class="muted">Show station names on the simulator.</p></div></label>
-              <label class="option" style="margin-top:10px;"><input id="artworkToggle" type="checkbox" checked /><div><strong>Board artwork</strong><p class="muted" id="artworkStatus">No overlay image configured.</p></div></label>
               <div class="sim-controls" id="testControls">
                 <button class="control" type="button" data-action="all-off">All off</button>
                 <button class="control" type="button" data-action="all-on">All on</button>
@@ -2612,8 +2569,6 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         const testControls = document.getElementById("testControls");
         const testStatesInput = document.getElementById("test_states_json");
         const labelToggle = document.getElementById("labelToggle");
-        const artworkToggle = document.getElementById("artworkToggle");
-        const artworkStatus = document.getElementById("artworkStatus");
         const customColorAnimations = new Set(__AN_CUSTOM_COLOR_NAMES__);
 
         const currentMode = () => document.querySelector('input[name="mode"]:checked')?.value || "live";
@@ -2706,19 +2661,6 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           stationKeys = [];
           const viewBox = model.viewBox || [0, 0, 861, 850];
           svg.style.aspectRatio = `${viewBox[2]} / ${viewBox[3]}`;
-          const shell = svg.closest(".board-shell");
-          const hasArtwork = Boolean(model.backgroundImage);
-          shell?.classList.toggle("has-artwork", hasArtwork);
-          if (artworkToggle) {
-            artworkToggle.disabled = !hasArtwork;
-            artworkToggle.checked = hasArtwork;
-            document.body.classList.toggle("artwork-off", !hasArtwork);
-          }
-          if (labelToggle && hasArtwork) {
-            labelToggle.checked = false;
-            document.body.classList.add("labels-off");
-          }
-          if (artworkStatus) artworkStatus.textContent = hasArtwork ? "Using configured overlay image." : "No overlay image configured.";
           svg.setAttribute("viewBox", viewBox.join(" "));
           const bg = document.createElementNS(ns, "rect");
           bg.setAttribute("x", viewBox[0]);
@@ -2727,18 +2669,6 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           bg.setAttribute("height", viewBox[3]);
           bg.setAttribute("fill", "#07090d");
           svg.appendChild(bg);
-          if (hasArtwork) {
-            const image = document.createElementNS(ns, "image");
-            image.setAttribute("class", "board-artwork");
-            image.setAttribute("x", viewBox[0]);
-            image.setAttribute("y", viewBox[1]);
-            image.setAttribute("width", viewBox[2]);
-            image.setAttribute("height", viewBox[3]);
-            image.setAttribute("preserveAspectRatio", "none");
-            image.setAttribute("href", model.backgroundImage);
-            image.setAttributeNS("http://www.w3.org/1999/xlink", "href", model.backgroundImage);
-            svg.appendChild(image);
-          }
           const title = document.createElementNS(ns, "text");
           title.setAttribute("x", "44");
           title.setAttribute("y", "66");
@@ -2854,9 +2784,6 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         document.querySelectorAll('input[name="mode"]').forEach(el => el.addEventListener("change", syncModeUi));
         labelToggle.addEventListener("change", () => {
           document.body.classList.toggle("labels-off", !labelToggle.checked);
-        });
-        artworkToggle.addEventListener("change", () => {
-          document.body.classList.toggle("artwork-off", !artworkToggle.checked);
         });
 
         const loadLayout = async () => {
@@ -3107,15 +3034,6 @@ def board_status_api(board_id: str = Query(...)):
 @app.get("/board_layout")
 def board_layout_api():
     return _as_no_store(JSONResponse(_board_layout_model()))
-
-
-@app.get("/board_overlay")
-def board_overlay_api():
-    path = _board_overlay_path()
-    if not path:
-        return JSONResponse({"error": "board_overlay_not_configured"}, status_code=404)
-    media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
-    return FileResponse(path, media_type=media_type, filename=os.path.basename(path))
 
 
 @app.get("/firmware_options")
