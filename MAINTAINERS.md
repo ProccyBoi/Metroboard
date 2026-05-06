@@ -84,6 +84,14 @@ writes the update, and reboots.
 - `stations_whitelist.txt`
   - Restricts station loading to the intended board/network scope.
 
+- `assets/`
+  - Optional web UI assets.
+  - `assets/board_overlay.png`/`.jpg`/`.webp` can be used as the board
+    simulator background. The simulator then draws station hit targets over the
+    artwork.
+  - Lesson learned: an artwork overlay is only as accurate as the crop and
+    perspective correction. Use a straight-on image cropped to the board edges.
+
 ### Firmware Source
 
 - `metroboard_public.ino`
@@ -95,7 +103,7 @@ writes the update, and reboots.
     - LED strip pin/length config
     - station-to-LED binding sequences
     - `/board_payload` polling
-    - live/animation mode
+    - live/test/animation mode
     - HTTP OTA client
   - Lesson learned: firmware station sequences must match physical LEDs. Do not
     add missing stations unless the physical board has LEDs for them.

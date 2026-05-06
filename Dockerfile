@@ -10,6 +10,7 @@ RUN python /app/scripts/ensure_stop_times.py
 COPY station_line_pairs.txt station_line_pairs.csv /app/
 COPY boards.json /app/
 COPY firmware /app/firmware
+COPY assets /app/assets
 COPY metroboard_public.ino /app/metroboard_public.ino
 COPY app.py .
 ENV PYTHONUNBUFFERED=1

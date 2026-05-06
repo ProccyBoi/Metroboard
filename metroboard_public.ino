@@ -25,7 +25,7 @@
 static const char* kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
 
-static const char* kFirmwareVersion = "1.4.2";
+static const char* kFirmwareVersion = "1.4.3";
 static const char* kBuildLabel = "public";
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
 static const uint32_t SETTINGS_FETCH_MS = 30000;
@@ -259,6 +259,19 @@ static uint32_t lineColor(Line ln) {
     uint8_t r = (h >> 16) & 0xFF, g = (h >> 8) & 0xFF, b = h & 0xFF;
     return strips[ln].Color(r, g, b);
 }
+static uint32_t lineColorScaled(Line ln, uint8_t level) {
+    uint32_t h = LINE_COLOR_HEX[ln];
+    uint8_t r = (uint8_t)(((h >> 16) & 0xFF) * level / 255);
+    uint8_t g = (uint8_t)(((h >> 8) & 0xFF) * level / 255);
+    uint8_t b = (uint8_t)((h & 0xFF) * level / 255);
+    return strips[ln].Color(r, g, b);
+}
+static uint32_t customColorFor(Line ln, uint8_t level = 255) {
+    uint8_t r = (uint8_t)(gAnim.r * level / 255);
+    uint8_t g = (uint8_t)(gAnim.g * level / 255);
+    uint8_t b = (uint8_t)(gAnim.b * level / 255);
+    return strips[ln].Color(r, g, b);
+}
 static uint32_t wheel(uint8_t pos) {
     pos = 255 - pos;
     if (pos < 85) return strips[0].Color(255 - pos * 3, 0, pos * 3);
@@ -404,6 +417,7 @@ void runAnimationStep() {
     anim.toLowerCase();
 
     uint32_t speed = (gAnim.speed <= 0) ? 100 : (uint32_t)gAnim.speed;
+    if (speed < 20) speed = 20;
 
     if (anim == "rainbow") {
         uint32_t shift = now / speed;
@@ -419,7 +433,18 @@ void runAnimationStep() {
         return;
     }
 
-    if (anim == "bounce" || anim == "chase") {
+    if (anim == "solid") {
+        for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
+            strips[ln].setBrightness(gEffectiveBrightness);
+            for (uint16_t i = 0; i < STRIP_LEN[ln]; i++) {
+                strips[ln].setPixelColor(i, customColorFor((Line)ln));
+            }
+            strips[ln].show();
+        }
+        return;
+    }
+
+    if (anim == "bounce" || anim == "chase" || anim == "comet") {
         if (!chaseInit) {
             for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
                 chasePos[ln] = 0;
@@ -433,9 +458,13 @@ void runAnimationStep() {
             lastChaseStep = now;
             for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
                 uint16_t len = STRIP_LEN[ln];
-                chasePos[ln] = uint16_t(int16_t(chasePos[ln]) + chaseDir[ln]);
-                if (chasePos[ln] == 0 || chasePos[ln] + 1 >= len) {
-                    chaseDir[ln] = -chaseDir[ln];
+                if (anim == "comet") {
+                    chasePos[ln] = (uint16_t)((chasePos[ln] + 1) % len);
+                } else {
+                    chasePos[ln] = uint16_t(int16_t(chasePos[ln]) + chaseDir[ln]);
+                    if (chasePos[ln] == 0 || chasePos[ln] + 1 >= len) {
+                        chaseDir[ln] = -chaseDir[ln];
+                    }
                 }
             }
         }
@@ -443,13 +472,70 @@ void runAnimationStep() {
         for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
             strips[ln].setBrightness(gEffectiveBrightness);
             strips[ln].clear();
-            uint32_t col = lineColor((Line)ln);
             int16_t center = chasePos[ln];
-            for (int k = -1; k <= 1; k++) {
-                int16_t idx = center + k;
-                if (idx >= 0 && idx < (int16_t)STRIP_LEN[ln]) {
-                    strips[ln].setPixelColor((uint16_t)idx, col);
+            if (anim == "comet") {
+                for (int tail = 0; tail < 6; tail++) {
+                    int16_t idx = center - tail;
+                    if (idx < 0) idx += STRIP_LEN[ln];
+                    uint8_t level = (uint8_t)(255 - tail * 38);
+                    strips[ln].setPixelColor((uint16_t)idx, lineColorScaled((Line)ln, level));
                 }
+            } else {
+                uint32_t col = lineColor((Line)ln);
+                for (int k = -1; k <= 1; k++) {
+                    int16_t idx = center + k;
+                    if (idx >= 0 && idx < (int16_t)STRIP_LEN[ln]) {
+                        strips[ln].setPixelColor((uint16_t)idx, col);
+                    }
+                }
+            }
+            strips[ln].show();
+        }
+        return;
+    }
+
+    if (anim == "sparkle") {
+        if (now - lastChaseStep < speed) return;
+        lastChaseStep = now;
+        for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
+            strips[ln].setBrightness(gEffectiveBrightness);
+            strips[ln].clear();
+            uint8_t count = (uint8_t)(STRIP_LEN[ln] / 8);
+            if (count < 1) count = 1;
+            for (uint8_t n = 0; n < count; n++) {
+                uint16_t idx = (uint16_t)random(STRIP_LEN[ln]);
+                uint8_t level = (uint8_t)random(90, 256);
+                strips[ln].setPixelColor(idx, customColorFor((Line)ln, level));
+            }
+            strips[ln].show();
+        }
+        return;
+    }
+
+    if (anim == "theater") {
+        uint8_t offset = (uint8_t)((now / speed) % 3);
+        for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
+            strips[ln].setBrightness(gEffectiveBrightness);
+            strips[ln].clear();
+            for (uint16_t i = offset; i < STRIP_LEN[ln]; i += 3) {
+                strips[ln].setPixelColor(i, customColorFor((Line)ln));
+            }
+            strips[ln].show();
+        }
+        return;
+    }
+
+    if (anim == "wipe") {
+        uint32_t phase = (now / speed);
+        for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
+            uint16_t len = STRIP_LEN[ln];
+            uint16_t span = len * 2;
+            uint16_t step = (uint16_t)((phase + ln * 3) % span);
+            uint16_t lit = step < len ? step + 1 : span - step;
+            strips[ln].setBrightness(gEffectiveBrightness);
+            strips[ln].clear();
+            for (uint16_t i = 0; i < lit && i < len; i++) {
+                strips[ln].setPixelColor(i, lineColor((Line)ln));
             }
             strips[ln].show();
         }
@@ -463,9 +549,11 @@ void runAnimationStep() {
     uint8_t br = (uint8_t)(gEffectiveBrightness * intensity);
     for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
         strips[ln].setBrightness(br);
+        uint32_t color = anim == "line-pulse"
+                             ? lineColor((Line)ln)
+                             : strips[ln].Color(gAnim.r, gAnim.g, gAnim.b);
         for (uint16_t i = 0; i < STRIP_LEN[ln]; i++) {
-            strips[ln].setPixelColor(
-                i, strips[ln].Color(gAnim.r, gAnim.g, gAnim.b));
+            strips[ln].setPixelColor(i, color);
         }
         strips[ln].show();
     }
@@ -1147,6 +1235,7 @@ bool isBoardIdValid() {
 void setup() {
     Serial.begin(115200);
     delay(150);
+    randomSeed((uint32_t)micros());
     Serial.println(
         "\nMetroboard — Solid Station Mode (TTL, fixed colors, "
         "BRIGHTNESS=16, coalesced)");

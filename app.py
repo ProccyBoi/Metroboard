@@ -15,6 +15,7 @@ import hashlib
 import html
 import json
 import math
+import mimetypes
 import shutil
 import re
 import random
@@ -74,12 +75,28 @@ FIRMWARE_PATH = os.getenv("FIRMWARE_PATH", os.path.join("firmware", "metroboard_
 FIRMWARE_VERSION = os.getenv("FIRMWARE_VERSION", "").strip()
 FIRMWARE_SKETCH_PATH = os.getenv("FIRMWARE_SKETCH_PATH", "metroboard_public.ino")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+BOARD_OVERLAY_PATH = os.getenv("BOARD_OVERLAY_PATH", os.path.join("assets", "board_overlay.png")).strip()
+BOARD_OVERLAY_URL = os.getenv("BOARD_OVERLAY_URL", "").strip()
 
 # board_id -> settings dict
 BOARD_SETTINGS: dict[str, dict] = {}
 BOARD_SETTINGS_VERSION: int = 0
 BOARD_LAST_PAYLOAD_AT: dict[str, float] = {}
 BOARD_FIRMWARE_STATUS: dict[str, dict] = {}
+
+ANIMATION_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("pulse", "Pulse"),
+    ("line-pulse", "Line pulse"),
+    ("bounce", "Bounce"),
+    ("rainbow", "Rainbow"),
+    ("comet", "Comet"),
+    ("sparkle", "Sparkle"),
+    ("theater", "Theater chase"),
+    ("wipe", "Line wipe"),
+    ("solid", "Solid colour"),
+)
+ANIMATION_NAMES = {name for name, _label in ANIMATION_OPTIONS}
+ANIMATION_CUSTOM_COLOR_NAMES = {"pulse", "sparkle", "theater", "solid"}
 
 # Caching/CORS/logging
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
@@ -150,6 +167,39 @@ def _resolve_local_path(path: str) -> str:
         return path
     base_dir = os.path.dirname(os.path.abspath(__file__))
     return os.path.join(base_dir, path)
+
+def _board_overlay_path() -> str:
+    candidates: list[str] = []
+    if BOARD_OVERLAY_PATH:
+        candidates.append(BOARD_OVERLAY_PATH)
+    candidates.extend([
+        os.path.join("assets", "board_overlay.png"),
+        os.path.join("assets", "board_overlay.jpg"),
+        os.path.join("assets", "board_overlay.jpeg"),
+        os.path.join("assets", "board_overlay.webp"),
+    ])
+    seen: set[str] = set()
+    for candidate in candidates:
+        resolved = _resolve_local_path(candidate)
+        key = os.path.normcase(os.path.abspath(resolved))
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.isfile(resolved):
+            return resolved
+    return ""
+
+def _board_overlay_url() -> str:
+    if BOARD_OVERLAY_URL:
+        return BOARD_OVERLAY_URL
+    path = _board_overlay_path()
+    if not path:
+        return ""
+    try:
+        version = int(os.path.getmtime(path))
+    except Exception:
+        version = int(time.time())
+    return f"/board_overlay?v={version}"
 
 GTFS_DIR = os.getenv("GTFS_DIR", "").strip()
 
@@ -552,6 +602,14 @@ def _normalize_board_config(board_id: str, cfg: T.Optional[dict]) -> dict:
     base["board_id"] = board_id
     if base.get("mode") not in ("live", "animation", "test"):
         base["mode"] = "live"
+    animation = base.get("animation")
+    if not isinstance(animation, dict):
+        animation = {}
+    name = str(animation.get("name", "pulse")).strip().lower()
+    if name not in ANIMATION_NAMES:
+        name = "pulse"
+    animation["name"] = name
+    base["animation"] = animation
     try:
         base["brightness"] = max(0, min(150, int(base.get("brightness", 16))))
     except Exception:
@@ -1143,6 +1201,7 @@ def _board_layout_model() -> dict:
     return {
         "viewBox": [0, 0, 1120, 1040],
         "title": "Sydney Rail Network",
+        "backgroundImage": _board_overlay_url(),
         "lines": lines,
     }
 
@@ -2340,6 +2399,14 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         if active_fw.get("available")
         else f"Unavailable: {active_fw.get('reason')}"
     )
+    anim_name = str(an.get("name", "pulse")).strip().lower()
+    if anim_name not in ANIMATION_NAMES:
+        anim_name = "pulse"
+    animation_options = []
+    for name, label in ANIMATION_OPTIONS:
+        selected = " selected" if name == anim_name else ""
+        animation_options.append(f'<option value="{name}"{selected}>{html.escape(label)}</option>')
+    custom_color_names_json = json.dumps(sorted(ANIMATION_CUSTOM_COLOR_NAMES), separators=(",", ":"))
 
     page = """
 <!doctype html>
@@ -2372,7 +2439,11 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
       .status-sub { margin-top:4px; color:var(--muted); font-size:13px; }
       .layout-grid { display:grid; grid-template-columns:minmax(0,1fr) 270px; gap:14px; }
       .board-shell { background:#07090d; border:1px solid #303946; border-radius:8px; overflow:hidden; min-height:520px; }
+      .board-shell.has-artwork .network-title { display:none; }
+      .board-shell.has-artwork .line-path { opacity:.14; }
       #boardSvg { display:block; width:100%; aspect-ratio:1120/1040; min-height:520px; }
+      .board-artwork { pointer-events:none; opacity:.88; }
+      body.artwork-off .board-artwork { display:none; }
       .network-title { fill:#d7dee7; font-size:46px; font-weight:750; letter-spacing:0; }
       .line-path { fill:none; stroke-width:5; stroke-linecap:round; stroke-linejoin:round; opacity:.42; }
       .station-node { fill:#2a2f38; stroke:#a9b4c1; stroke-width:2; cursor:default; transition:opacity 120ms ease, fill 120ms ease, r 120ms ease; }
@@ -2445,6 +2516,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
               <h4>Test Lights</h4>
               <p class="muted">Select Test lights mode, then click stations or use line controls. Save settings to apply to the physical board.</p>
               <label class="option" style="margin-top:12px;"><input id="labelToggle" type="checkbox" checked /><div><strong>Station labels</strong><p class="muted">Show station names on the simulator.</p></div></label>
+              <label class="option" style="margin-top:10px;"><input id="artworkToggle" type="checkbox" checked /><div><strong>Board artwork</strong><p class="muted" id="artworkStatus">No overlay image configured.</p></div></label>
               <div class="sim-controls" id="testControls">
                 <button class="control" type="button" data-action="all-off">All off</button>
                 <button class="control" type="button" data-action="all-on">All on</button>
@@ -2485,11 +2557,11 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         <section class="card">
           <div class="section-head"><h3>Animation</h3><span class="tag" id="animationTag">Mode: __AN_NAME_TITLE__</span></div>
           <div class="row">
-            <label class="field">Name<select name="an_name" id="an_name"><option value="pulse" __AN_PULSE_SELECTED__>Pulse</option><option value="bounce" __AN_BOUNCE_SELECTED__>Bounce</option><option value="rainbow" __AN_RAINBOW_SELECTED__>Rainbow</option></select></label>
+            <label class="field">Name<select name="an_name" id="an_name">__ANIMATION_OPTIONS__</select></label>
             <label class="field">Speed<input type="number" name="an_speed" value="__AN_SPEED__" min="20" max="5000" /></label>
-            <label class="field" id="pulseColorField">Pulse colour<div class="color-picker"><input class="color-picker__input" type="color" id="an_color" name="an_color" value="__AN_COLOR_HEX__" /><span class="color-picker__value"><span class="color-picker__swatch" id="pulseColorSwatch" style="background:__AN_COLOR_HEX__;"></span><span id="pulseColorValue">__AN_COLOR_HEX__</span></span><span class="color-picker__cta">Change</span></div></label>
+            <label class="field" id="pulseColorField">Effect colour<div class="color-picker"><input class="color-picker__input" type="color" id="an_color" name="an_color" value="__AN_COLOR_HEX__" /><span class="color-picker__value"><span class="color-picker__swatch" id="pulseColorSwatch" style="background:__AN_COLOR_HEX__;"></span><span id="pulseColorValue">__AN_COLOR_HEX__</span></span><span class="color-picker__cta">Change</span></div></label>
           </div>
-          <p class="note" id="pulseColorNote">Pulse is the only animation that uses the custom colour.</p>
+          <p class="note" id="pulseColorNote"></p>
         </section>
 
         <section class="card">
@@ -2497,7 +2569,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           <label class="option"><input id="ota_enabled" type="checkbox" name="ota_enabled" __OTA_ENABLED__ /><div><strong>Allow OTA updates for this board</strong><p class="muted">Disable this to hold a board on its current firmware.</p></div></label>
           <div class="two-col" style="margin-top:12px;">
             <label class="field">Firmware binary<select name="ota_filename" id="ota_filename">__FIRMWARE_OPTIONS__</select></label>
-            <label class="field">Target version<input type="text" name="ota_target_version" value="__OTA_TARGET_VERSION__" placeholder="1.4.2" maxlength="40" /></label>
+            <label class="field">Target version<input type="text" name="ota_target_version" value="__OTA_TARGET_VERSION__" placeholder="1.4.3" maxlength="40" /></label>
           </div>
           <p class="note">Global manifest: __GLOBAL_FW_TEXT__. Active target for this board: __ACTIVE_FW_TEXT__.</p>
         </section>
@@ -2539,6 +2611,9 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         const testControls = document.getElementById("testControls");
         const testStatesInput = document.getElementById("test_states_json");
         const labelToggle = document.getElementById("labelToggle");
+        const artworkToggle = document.getElementById("artworkToggle");
+        const artworkStatus = document.getElementById("artworkStatus");
+        const customColorAnimations = new Set(__AN_CUSTOM_COLOR_NAMES__);
 
         const currentMode = () => document.querySelector('input[name="mode"]:checked')?.value || "live";
         const syncBrightness = () => brightnessValue.textContent = brightness.value;
@@ -2569,9 +2644,9 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           const value = (pulseColorInput.value || "").toUpperCase();
           pulseColorValue.textContent = value;
           pulseColorSwatch.style.background = value;
-          const isPulse = anName.value === "pulse";
-          pulseColorField.classList.toggle("hidden", !isPulse);
-          pulseColorNote.classList.toggle("hidden", !isPulse);
+          const usesCustomColor = customColorAnimations.has(anName.value);
+          pulseColorField.classList.toggle("hidden", !usesCustomColor);
+          pulseColorNote.textContent = usesCustomColor ? "This animation uses the selected effect colour." : "This animation uses line colours or generated rainbow colours.";
           document.getElementById("animationTag").textContent = "Mode: " + (anName.options[anName.selectedIndex]?.textContent || anName.value);
         };
         pulseColorInput.addEventListener("input", syncPulse);
@@ -2629,6 +2704,15 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           nodeByKey.clear();
           stationKeys = [];
           const viewBox = model.viewBox || [0, 0, 1120, 1040];
+          const shell = svg.closest(".board-shell");
+          const hasArtwork = Boolean(model.backgroundImage);
+          shell?.classList.toggle("has-artwork", hasArtwork);
+          if (artworkToggle) {
+            artworkToggle.disabled = !hasArtwork;
+            artworkToggle.checked = hasArtwork;
+            document.body.classList.toggle("artwork-off", !hasArtwork);
+          }
+          if (artworkStatus) artworkStatus.textContent = hasArtwork ? "Using configured overlay image." : "No overlay image configured.";
           svg.setAttribute("viewBox", viewBox.join(" "));
           const bg = document.createElementNS(ns, "rect");
           bg.setAttribute("x", viewBox[0]);
@@ -2637,6 +2721,18 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           bg.setAttribute("height", viewBox[3]);
           bg.setAttribute("fill", "#07090d");
           svg.appendChild(bg);
+          if (hasArtwork) {
+            const image = document.createElementNS(ns, "image");
+            image.setAttribute("class", "board-artwork");
+            image.setAttribute("x", viewBox[0]);
+            image.setAttribute("y", viewBox[1]);
+            image.setAttribute("width", viewBox[2]);
+            image.setAttribute("height", viewBox[3]);
+            image.setAttribute("preserveAspectRatio", "none");
+            image.setAttribute("href", model.backgroundImage);
+            image.setAttributeNS("http://www.w3.org/1999/xlink", "href", model.backgroundImage);
+            svg.appendChild(image);
+          }
           const title = document.createElementNS(ns, "text");
           title.setAttribute("x", "44");
           title.setAttribute("y", "66");
@@ -2753,6 +2849,9 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         labelToggle.addEventListener("change", () => {
           document.body.classList.toggle("labels-off", !labelToggle.checked);
         });
+        artworkToggle.addEventListener("change", () => {
+          document.body.classList.toggle("artwork-off", !artworkToggle.checked);
+        });
 
         const loadLayout = async () => {
           try {
@@ -2812,10 +2911,9 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         "__NM_ACTION_OFF_SELECTED__": "selected" if nm.get("action", "off") == "off" else "",
         "__NM_ACTION_DIM_SELECTED__": "selected" if nm.get("action") == "dim" else "",
         "__NM_DIM__": str(max(0, min(255, int(nm.get("dim_level", 20))))),
-        "__AN_NAME_TITLE__": html.escape(str(an.get("name", "pulse")).title()),
-        "__AN_PULSE_SELECTED__": "selected" if an.get("name", "pulse") == "pulse" else "",
-        "__AN_BOUNCE_SELECTED__": "selected" if an.get("name") == "bounce" else "",
-        "__AN_RAINBOW_SELECTED__": "selected" if an.get("name") == "rainbow" else "",
+        "__AN_NAME_TITLE__": html.escape(dict(ANIMATION_OPTIONS).get(anim_name, anim_name.title())),
+        "__ANIMATION_OPTIONS__": "\n".join(animation_options),
+        "__AN_CUSTOM_COLOR_NAMES__": custom_color_names_json,
         "__AN_SPEED__": str(max(20, min(5000, int(an.get("speed", 120))))),
         "__AN_COLOR_HEX__": an_color_hex,
         "__OTA_ENABLED__": "checked" if ota.get("enabled", True) else "",
@@ -2877,6 +2975,9 @@ async def board_settings_save(
         "action": nm_action,
         "dim_level": nm_dim,
     }
+    an_name = str(an_name or "pulse").strip().lower()
+    if an_name not in ANIMATION_NAMES:
+        an_name = "pulse"
     cfg["animation"] = {
         "name": an_name,
         "speed": max(20, min(5000, int(an_speed))),
@@ -3000,6 +3101,15 @@ def board_status_api(board_id: str = Query(...)):
 @app.get("/board_layout")
 def board_layout_api():
     return _as_no_store(JSONResponse(_board_layout_model()))
+
+
+@app.get("/board_overlay")
+def board_overlay_api():
+    path = _board_overlay_path()
+    if not path:
+        return JSONResponse({"error": "board_overlay_not_configured"}, status_code=404)
+    media_type = mimetypes.guess_type(path)[0] or "application/octet-stream"
+    return FileResponse(path, media_type=media_type, filename=os.path.basename(path))
 
 
 @app.get("/firmware_options")

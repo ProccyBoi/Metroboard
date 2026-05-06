@@ -50,6 +50,8 @@ Environment variables:
 - `FIRMWARE_PATH` (fallback firmware binary path; default `firmware/metroboard_public.bin`).
 - `FIRMWARE_VERSION` (fallback firmware version when no manifest is present).
 - `PUBLIC_BASE_URL` (optional public URL override for OTA download links).
+- `BOARD_OVERLAY_PATH` (optional local board artwork image; default `assets/board_overlay.png`).
+- `BOARD_OVERLAY_URL` (optional externally hosted board artwork image URL).
 
 ## Data files
 Place these alongside `app.py` (repository root):
@@ -67,6 +69,8 @@ Place these alongside `app.py` (repository root):
 - `GET /board_payload?board_id=...` — firmware-friendly settings plus state map.
 - `GET /firmware_manifest?board_id=...&current=...` — OTA firmware metadata.
 - `GET /firmware.bin?board_id=...&version=...` — OTA firmware binary, when deployed.
+- `GET /board_layout` — simulator geometry and optional board artwork URL.
+- `GET /board_overlay` — configured local board artwork image, if present.
 
 ## Firmware OTA
 The public ESP32 sketch supports HTTP OTA through Koyeb from firmware version `1.4.1`.
@@ -113,8 +117,14 @@ The PlatformIO environment is configured for `COM17`.
 
 ## Board settings UI
 The minimal HTML UI at `/login` and `/board/{board_id}` lets you:
-- Set brightness and mode (`live` vs `animation`).
+- Set brightness and mode (`live`, `test`, or `animation`).
 - Configure night-mode windows and effective brightness.
-- Adjust animation color and speed.
+- Select manual test LEDs from the simulator.
+- Adjust animation effect, color, and speed.
+- Configure per-board OTA firmware targets.
 
 Settings are stored in `boards.json` and included in the firmware payload.
+
+To use a photo/print as the simulator background, add a straight-on cropped
+image at `assets/board_overlay.png` or set `BOARD_OVERLAY_URL`. The UI draws the
+interactive station hit targets over that artwork.
