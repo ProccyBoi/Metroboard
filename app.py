@@ -578,97 +578,159 @@ BOARD_LINE_SPECS = [
     {
         "line": "T1",
         "suffix": "1",
-        "array_names": ["T1_SEQ"],
         "color": "#F39C12",
-        "path": [
-            [1000, 30], [1000, 105], [930, 185], [870, 270], [870, 355],
-            [830, 405], [705, 430], [580, 430], [490, 345], [380, 330],
-            [260, 330], [105, 330], [260, 330], [250, 260], [190, 95],
+        "segments": [
+            {
+                "array_names": ["T1_SEQ"],
+                "start": "Berowra",
+                "end": "Emu Plains",
+                "path": [
+                    [700, 90], [700, 145], [760, 210], [820, 315],
+                    [850, 400], [790, 515], [610, 520], [500, 520],
+                    [370, 470], [265, 385], [95, 385],
+                ],
+            },
+            {
+                "array_names": ["T1_SEQ"],
+                "start": "Marayong",
+                "end": "Richmond",
+                "path": [
+                    [255, 345], [195, 310], [115, 300], [115, 140],
+                ],
+            },
         ],
     },
     {
         "line": "T5",
         "suffix": "5",
-        "array_names": ["T5_SEQ"],
         "color": "#D81B60",
-        "path": [
-            [185, 95], [185, 260], [255, 330], [315, 430], [315, 600],
-            [185, 670], [70, 670],
+        "segments": [
+            {
+                "array_names": ["T5_SEQ"],
+                "path": [
+                    [105, 140], [105, 300], [240, 360], [360, 470],
+                    [315, 590], [255, 690], [75, 750],
+                ],
+            },
         ],
     },
     {
         "line": "T2",
         "suffix": "2",
-        "array_names": ["T2_SEG1", "T2_SEG2"],
         "color": "#00ACC1",
-        "path": [
-            [70, 670], [185, 670], [315, 600], [315, 500], [410, 430],
-            [490, 345], [580, 430], [705, 430], [830, 410], [895, 360],
+        "segments": [
+            {
+                "array_names": ["T2_SEG1", "T2_SEG2"],
+                "path": [
+                    [75, 750], [255, 690], [315, 590], [360, 520],
+                    [430, 485], [500, 520], [610, 520], [735, 520],
+                    [815, 500], [865, 450],
+                ],
+            },
         ],
     },
     {
         "line": "T3",
         "suffix": "3",
-        "array_names": ["T3_SEQ"],
         "color": "#FB8C00",
-        "path": [
-            [315, 600], [390, 535], [505, 520], [550, 470], [575, 430],
-            [705, 430], [830, 410], [895, 360],
+        "segments": [
+            {
+                "array_names": ["T3_SEQ"],
+                "path": [
+                    [315, 590], [415, 610], [545, 650], [565, 600],
+                    [520, 545], [500, 520], [610, 520], [735, 520],
+                    [815, 500], [865, 450],
+                ],
+            },
         ],
     },
     {
         "line": "T4",
         "suffix": "4",
-        "array_names": ["T4_SEQ"],
         "color": "#0D47A1",
-        "path": [
-            [805, 865], [805, 770], [910, 770], [805, 690], [805, 570],
-            [825, 485], [875, 405], [915, 360], [1030, 360],
+        "segments": [
+            {
+                "array_names": ["T4_SEQ"],
+                "start": "Waterfall",
+                "end": "Loftus",
+                "path": [[795, 855], [795, 760], [795, 705]],
+            },
+            {
+                "array_names": ["T4_SEQ"],
+                "start": "Cronulla",
+                "end": "Bondi Junction",
+                "path": [
+                    [1030, 760], [915, 760], [795, 700], [795, 610],
+                    [750, 560], [785, 520], [835, 485], [1005, 455],
+                ],
+            },
         ],
     },
     {
         "line": "T6",
         "suffix": "6",
-        "array_names": ["T6_SEQ"],
         "color": "#A0522D",
-        "path": [[510, 525], [505, 500], [495, 475], [525, 450], [555, 430]],
+        "segments": [
+            {
+                "array_names": ["T6_SEQ"],
+                "path": [[565, 650], [545, 615], [520, 570], [500, 520]],
+            },
+        ],
     },
     {
         "line": "T7",
         "suffix": "7",
-        "array_names": ["T7_SEQ"],
         "color": "#9E9E9E",
-        "path": [[555, 430], [555, 300]],
+        "segments": [
+            {
+                "array_names": ["T7_SEQ"],
+                "path": [[500, 520], [500, 420]],
+            },
+        ],
     },
     {
         "line": "T8",
         "suffix": "8",
-        "array_names": ["T8_SEQ"],
         "color": "#006400",
-        "path": [
-            [325, 830], [325, 675], [430, 660], [555, 620], [675, 545],
-            [790, 470], [860, 405], [895, 360],
+        "segments": [
+            {
+                "array_names": ["T8_SEQ"],
+                "path": [
+                    [320, 835], [320, 710], [430, 710], [560, 680],
+                    [700, 600], [765, 555], [785, 520], [835, 485],
+                    [865, 450],
+                ],
+            },
         ],
     },
     {
         "line": "T9",
         "suffix": "9",
-        "array_names": ["T9_SEQ"],
         "color": "#E53935",
-        "path": [
-            [1000, 105], [930, 185], [870, 270], [870, 355], [830, 405],
-            [705, 430], [605, 430], [605, 285], [605, 115], [870, 115],
-            [1000, 105],
+        "segments": [
+            {
+                "array_names": ["T9_SEQ"],
+                "path": [
+                    [650, 145], [580, 280], [590, 420], [610, 520],
+                    [735, 520], [820, 480], [855, 390], [800, 300],
+                    [720, 230],
+                ],
+            },
         ],
     },
     {
         "line": "M1",
         "suffix": "M",
-        "array_names": ["M1_SEQ"],
         "color": "#26C6DA",
-        "path": [
-            [150, 210], [330, 210], [520, 210], [565, 275], [605, 285],
-            [675, 500], [740, 520], [830, 455], [895, 360],
+        "segments": [
+            {
+                "array_names": ["M1_SEQ"],
+                "path": [
+                    [170, 260], [450, 260], [560, 280], [650, 310],
+                    [735, 470], [760, 520], [720, 570], [600, 650],
+                    [565, 650],
+                ],
+            },
         ],
     },
 ]
@@ -735,27 +797,50 @@ def _layout_points_for_names(names: list[str], path: list[list[float]]) -> list[
         return [_point_at_distance(path, 0.0) for _ in names]
     return [_point_at_distance(path, total * idx / (len(names) - 1)) for idx in range(len(names))]
 
+def _segment_names(sequences: dict[str, list[str]], segment: dict) -> list[str]:
+    names: list[str] = []
+    for array_name in segment.get("array_names", []):
+        names.extend(sequences.get(array_name, []))
+    if not names:
+        return []
+
+    start_name = segment.get("start")
+    end_name = segment.get("end")
+    start = 0
+    end = len(names) - 1
+    if start_name in names:
+        start = names.index(start_name)
+    if end_name in names:
+        end = names.index(end_name)
+    if start > end:
+        return []
+    return names[start : end + 1]
+
 def _board_layout_model() -> dict:
     sequences = _load_firmware_sequences()
     lines = []
     for spec in BOARD_LINE_SPECS:
-        names: list[str] = []
-        for array_name in spec["array_names"]:
-            names.extend(sequences.get(array_name, []))
-        points = _layout_points_for_names(names, spec["path"])
         stations = []
-        for name, point in zip(names, points):
-            stations.append({
-                "name": name,
-                "key": f"{name}{spec['suffix']}",
-                "x": round(point[0], 2),
-                "y": round(point[1], 2),
-            })
+        paths = []
+        for segment in spec.get("segments", []):
+            names = _segment_names(sequences, segment)
+            path = segment.get("path", [])
+            if not names or not path:
+                continue
+            paths.append(path)
+            points = _layout_points_for_names(names, path)
+            for name, point in zip(names, points):
+                stations.append({
+                    "name": name,
+                    "key": f"{name}{spec['suffix']}",
+                    "x": round(point[0], 2),
+                    "y": round(point[1], 2),
+                })
         lines.append({
             "line": spec["line"],
             "suffix": spec["suffix"],
             "color": spec["color"],
-            "path": spec["path"],
+            "paths": paths,
             "stations": stations,
         })
     return {
@@ -2253,11 +2338,13 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           title.textContent = model.title || "Sydney Rail Network";
           svg.appendChild(title);
           model.lines.forEach(line => {
-            const poly = document.createElementNS(ns, "polyline");
-            poly.setAttribute("class", "line-path");
-            poly.setAttribute("points", line.path.map(p => p.join(",")).join(" "));
-            poly.setAttribute("stroke", line.color);
-            svg.appendChild(poly);
+            (line.paths || [line.path]).filter(Boolean).forEach(path => {
+              const poly = document.createElementNS(ns, "polyline");
+              poly.setAttribute("class", "line-path");
+              poly.setAttribute("points", path.map(p => p.join(",")).join(" "));
+              poly.setAttribute("stroke", line.color);
+              svg.appendChild(poly);
+            });
           });
           model.lines.forEach(line => {
             if (!line.stations.length) return;
