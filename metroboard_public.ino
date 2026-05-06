@@ -25,7 +25,8 @@
 static const char* kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
 
-static const char* kFirmwareVersion = "1.4.1";
+static const char* kFirmwareVersion = "1.4.2";
+static const char* kBuildLabel = "public";
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
 static const uint32_t SETTINGS_FETCH_MS = 30000;
 static const uint32_t OTA_CHECK_MS = 15UL * 60UL * 1000UL;
@@ -856,6 +857,8 @@ bool checkForOtaUpdate() {
     url += enc(gConfig.boardId.c_str());
     url += "&current=";
     url += enc(kFirmwareVersion);
+    url += "&build=";
+    url += enc(kBuildLabel);
 
     WiFiClientSecure client;
     client.setInsecure();
@@ -919,7 +922,9 @@ static const uint8_t MAX_BATCHES_PER_POLL = 6;
 size_t computeBatchEnd(size_t i) {
     const char* base = kPayloadBase;
     size_t baseLen = strlen(base) + strlen("?board_id=") +
-                     gConfig.boardId.length() + strlen("&only=");
+                     gConfig.boardId.length() + strlen("&fw=") +
+                     strlen(kFirmwareVersion) + strlen("&build=") +
+                     strlen(kBuildLabel) + strlen("&only=");
 
     size_t used = baseLen;
     size_t j = i;
@@ -965,6 +970,10 @@ int fetchAllBatchesAndRenderOnce(bool allowRender) {
         String url = String(kPayloadBase);
         url += "?board_id=";
         url += gConfig.boardId;
+        url += "&fw=";
+        url += enc(kFirmwareVersion);
+        url += "&build=";
+        url += enc(kBuildLabel);
         url += "&only=";
         for (size_t j = i; j < end; j++) {
             if (j > i) url += ',';

@@ -12,7 +12,9 @@ import time
 import csv
 import gzip
 import hashlib
+import html
 import json
+import math
 import shutil
 import re
 import random
@@ -70,13 +72,14 @@ FIRMWARE_OTA_ENABLED = _env_flag("FIRMWARE_OTA_ENABLED", True)
 FIRMWARE_MANIFEST_PATH = os.getenv("FIRMWARE_MANIFEST_PATH", os.path.join("firmware", "manifest.json"))
 FIRMWARE_PATH = os.getenv("FIRMWARE_PATH", os.path.join("firmware", "metroboard_public.bin"))
 FIRMWARE_VERSION = os.getenv("FIRMWARE_VERSION", "").strip()
+FIRMWARE_SKETCH_PATH = os.getenv("FIRMWARE_SKETCH_PATH", "metroboard_public.ino")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
 # board_id -> settings dict
 BOARD_SETTINGS: dict[str, dict] = {}
 BOARD_SETTINGS_VERSION: int = 0
-BOARD_SETTINGS_VERSION: int = 0
 BOARD_LAST_PAYLOAD_AT: dict[str, float] = {}
+BOARD_FIRMWARE_STATUS: dict[str, dict] = {}
 
 # Caching/CORS/logging
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
@@ -252,7 +255,7 @@ def _load_board_settings() -> dict[str, dict]:
                 if not normalized_id:
                     continue
                 cfg["board_id"] = normalized_id
-                normalized[normalized_id] = cfg
+                normalized[normalized_id] = _normalize_board_config(normalized_id, cfg)
             vlog(f"boards.json loaded: {len(normalized)} boards from {settings_path}")
             return normalized
     except Exception as e:
@@ -297,6 +300,9 @@ def _feed_age_seconds() -> T.Optional[float]:
 
 def _board_status_snapshot(board_id: str) -> dict:
     last = BOARD_LAST_PAYLOAD_AT.get(board_id)
+    fw = BOARD_FIRMWARE_STATUS.get(board_id, {})
+    cfg = BOARD_SETTINGS.get(board_id, {}) or {}
+    ota = cfg.get("ota", {}) or {}
     now = time.time()
     return {
         "board_id": board_id,
@@ -304,7 +310,39 @@ def _board_status_snapshot(board_id: str) -> dict:
         "last_payload_age_seconds": None if last is None else max(0.0, now - last),
         "settings_version": BOARD_SETTINGS_VERSION,
         "feed_age_seconds": _feed_age_seconds(),
+        "firmware": {
+            "current": fw.get("current"),
+            "build": fw.get("build"),
+            "seen_at": _iso_utc_from_ts(fw.get("seen_at")),
+            "seen_age_seconds": None if fw.get("seen_at") is None else max(0.0, now - fw.get("seen_at")),
+            "last_manifest_at": _iso_utc_from_ts(fw.get("last_manifest_at")),
+            "last_manifest_age_seconds": None if fw.get("last_manifest_at") is None else max(0.0, now - fw.get("last_manifest_at")),
+        },
+        "ota": {
+            "enabled": bool(ota.get("enabled", True)),
+            "target_version": ota.get("target_version") or "",
+            "filename": ota.get("filename") or "",
+        },
     }
+
+def _record_board_firmware_status(
+    board_id: str,
+    current: T.Optional[str] = None,
+    build: T.Optional[str] = None,
+    manifest_check: bool = False,
+) -> None:
+    if not board_id:
+        return
+    status = BOARD_FIRMWARE_STATUS.setdefault(board_id, {})
+    now = time.time()
+    if current:
+        status["current"] = str(current).strip()
+        status["seen_at"] = now
+    if build:
+        status["build"] = str(build).strip()[:80]
+        status["seen_at"] = now
+    if manifest_check:
+        status["last_manifest_at"] = now
 
 def _public_base_url(request: Request) -> str:
     if PUBLIC_BASE_URL:
@@ -342,8 +380,21 @@ def _firmware_manifest_config() -> tuple[str, str]:
             vlog(f"WARN: failed to load firmware manifest {manifest_path}: {e}")
     return version, path
 
-def _firmware_metadata() -> dict:
-    version, path = _firmware_manifest_config()
+def _firmware_dir() -> str:
+    manifest_path = _resolve_local_path(FIRMWARE_MANIFEST_PATH)
+    directory = os.path.dirname(manifest_path)
+    return directory or _resolve_local_path("firmware")
+
+def _safe_firmware_filename(filename: T.Optional[str]) -> str:
+    filename = (filename or "").strip()
+    if not filename or "/" in filename or "\\" in filename:
+        return ""
+    base = os.path.basename(filename)
+    if base != filename or not base.lower().endswith(".bin"):
+        return ""
+    return base
+
+def _firmware_metadata_for_path(version: str, path: str) -> dict:
     path = _resolve_local_path(path)
     if not FIRMWARE_OTA_ENABLED:
         return {"available": False, "reason": "ota_disabled", "version": version}
@@ -372,6 +423,53 @@ def _firmware_metadata() -> dict:
         "sha256": sha256.hexdigest(),
         "mtime": os.path.getmtime(path),
     }
+
+def _firmware_metadata_for_filename(filename: str, version: str = "") -> dict:
+    filename = _safe_firmware_filename(filename)
+    if not filename:
+        return {"available": False, "reason": "invalid_filename", "version": version}
+    path = os.path.join(_firmware_dir(), filename)
+    return _firmware_metadata_for_path(version, path)
+
+def _firmware_metadata() -> dict:
+    version, path = _firmware_manifest_config()
+    return _firmware_metadata_for_path(version, path)
+
+def _available_firmware_files() -> list[dict]:
+    directory = _firmware_dir()
+    if not os.path.isdir(directory):
+        return []
+    out: list[dict] = []
+    for name in sorted(os.listdir(directory)):
+        filename = _safe_firmware_filename(name)
+        if not filename:
+            continue
+        path = os.path.join(directory, filename)
+        meta = _firmware_metadata_for_path("file", path)
+        out.append({
+            "filename": filename,
+            "available": bool(meta.get("available")),
+            "size": meta.get("size"),
+            "md5": meta.get("md5"),
+            "sha256": meta.get("sha256"),
+            "mtime": meta.get("mtime"),
+        })
+    return out
+
+def _active_firmware_metadata_for_board(cfg: dict) -> dict:
+    ota = cfg.get("ota", {}) or {}
+    if not ota.get("enabled", True):
+        return {"available": False, "reason": "board_ota_disabled", "version": ota.get("target_version", "")}
+
+    filename = _safe_firmware_filename(ota.get("filename"))
+    target_version = str(ota.get("target_version") or "").strip()
+    if filename:
+        meta = _firmware_metadata_for_filename(filename, target_version)
+        if meta.get("available"):
+            return meta
+        return meta
+
+    return _firmware_metadata()
 
 def _parse_hhmm(s: str) -> T.Optional[dtime]:
     try:
@@ -414,7 +512,7 @@ def _default_board_settings(board_id: str) -> dict:
     return {
         "board_id": board_id,
         "brightness": 16,
-        "mode": "live",  # "live" or "animation"
+        "mode": "live",  # "live", "animation", or "test"
         "night_mode": {
             "enabled": False,
             "start": "23:00",
@@ -427,7 +525,38 @@ def _default_board_settings(board_id: str) -> dict:
             "speed": 120,
             "color": [255, 80, 0]
         },
+        "test_mode": {
+            "states": {},
+            "updated_at": None,
+        },
+        "ota": {
+            "enabled": True,
+            "target_version": "",
+            "filename": "",
+        },
     }
+
+def _normalize_board_config(board_id: str, cfg: T.Optional[dict]) -> dict:
+    base = _default_board_settings(board_id)
+    if not isinstance(cfg, dict):
+        return base
+
+    for key, value in cfg.items():
+        if key in ("night_mode", "animation", "test_mode", "ota") and isinstance(value, dict):
+            merged = dict(base.get(key, {}))
+            merged.update(value)
+            base[key] = merged
+        else:
+            base[key] = value
+
+    base["board_id"] = board_id
+    if base.get("mode") not in ("live", "animation", "test"):
+        base["mode"] = "live"
+    try:
+        base["brightness"] = max(0, min(150, int(base.get("brightness", 16))))
+    except Exception:
+        base["brightness"] = 16
+    return base
 
 def _normalize_board_id(board_id: T.Optional[str]) -> str:
     return (board_id or "").strip().upper()
@@ -440,7 +569,207 @@ def _get_or_create_board(board_id: str) -> dict:
     if board_id not in BOARD_SETTINGS:
         vlog(f"invalid board_id: {board_id} not in BOARD_SETTINGS")
         raise ValueError("unknown board_id")
+    BOARD_SETTINGS[board_id] = _normalize_board_config(board_id, BOARD_SETTINGS[board_id])
     return BOARD_SETTINGS[board_id]
+
+_SKETCH_SEQUENCE_CACHE: T.Optional[dict[str, list[str]]] = None
+
+BOARD_LINE_SPECS = [
+    {
+        "line": "T1",
+        "suffix": "1",
+        "array_names": ["T1_SEQ"],
+        "color": "#F39C12",
+        "path": [
+            [1000, 30], [1000, 105], [930, 185], [870, 270], [870, 355],
+            [830, 405], [705, 430], [580, 430], [490, 345], [380, 330],
+            [260, 330], [105, 330], [260, 330], [250, 260], [190, 95],
+        ],
+    },
+    {
+        "line": "T5",
+        "suffix": "5",
+        "array_names": ["T5_SEQ"],
+        "color": "#D81B60",
+        "path": [
+            [185, 95], [185, 260], [255, 330], [315, 430], [315, 600],
+            [185, 670], [70, 670],
+        ],
+    },
+    {
+        "line": "T2",
+        "suffix": "2",
+        "array_names": ["T2_SEG1", "T2_SEG2"],
+        "color": "#00ACC1",
+        "path": [
+            [70, 670], [185, 670], [315, 600], [315, 500], [410, 430],
+            [490, 345], [580, 430], [705, 430], [830, 410], [895, 360],
+        ],
+    },
+    {
+        "line": "T3",
+        "suffix": "3",
+        "array_names": ["T3_SEQ"],
+        "color": "#FB8C00",
+        "path": [
+            [315, 600], [390, 535], [505, 520], [550, 470], [575, 430],
+            [705, 430], [830, 410], [895, 360],
+        ],
+    },
+    {
+        "line": "T4",
+        "suffix": "4",
+        "array_names": ["T4_SEQ"],
+        "color": "#0D47A1",
+        "path": [
+            [805, 865], [805, 770], [910, 770], [805, 690], [805, 570],
+            [825, 485], [875, 405], [915, 360], [1030, 360],
+        ],
+    },
+    {
+        "line": "T6",
+        "suffix": "6",
+        "array_names": ["T6_SEQ"],
+        "color": "#A0522D",
+        "path": [[510, 525], [505, 500], [495, 475], [525, 450], [555, 430]],
+    },
+    {
+        "line": "T7",
+        "suffix": "7",
+        "array_names": ["T7_SEQ"],
+        "color": "#9E9E9E",
+        "path": [[555, 430], [555, 300]],
+    },
+    {
+        "line": "T8",
+        "suffix": "8",
+        "array_names": ["T8_SEQ"],
+        "color": "#006400",
+        "path": [
+            [325, 830], [325, 675], [430, 660], [555, 620], [675, 545],
+            [790, 470], [860, 405], [895, 360],
+        ],
+    },
+    {
+        "line": "T9",
+        "suffix": "9",
+        "array_names": ["T9_SEQ"],
+        "color": "#E53935",
+        "path": [
+            [1000, 105], [930, 185], [870, 270], [870, 355], [830, 405],
+            [705, 430], [605, 430], [605, 285], [605, 115], [870, 115],
+            [1000, 105],
+        ],
+    },
+    {
+        "line": "M1",
+        "suffix": "M",
+        "array_names": ["M1_SEQ"],
+        "color": "#26C6DA",
+        "path": [
+            [150, 210], [330, 210], [520, 210], [565, 275], [605, 285],
+            [675, 500], [740, 520], [830, 455], [895, 360],
+        ],
+    },
+]
+
+def _load_firmware_sequences() -> dict[str, list[str]]:
+    global _SKETCH_SEQUENCE_CACHE
+    if _SKETCH_SEQUENCE_CACHE is not None:
+        return _SKETCH_SEQUENCE_CACHE
+
+    path = _resolve_local_path(FIRMWARE_SKETCH_PATH)
+    sequences: dict[str, list[str]] = {}
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                body = f.read()
+            pattern = re.compile(
+                r"const\s+char\s*\*\s*const\s+(\w+)\s*\[\]\s*=\s*\{(.*?)\};",
+                re.S,
+            )
+            for name, block in pattern.findall(body):
+                sequences[name] = [
+                    bytes(value, "utf-8").decode("unicode_escape")
+                    for value in re.findall(r'"((?:\\.|[^"\\])*)"', block)
+                ]
+        except Exception as e:
+            vlog(f"WARN: failed to load firmware station sequences from {path}: {e}")
+    else:
+        vlog(f"WARN: firmware sketch not found for board layout: {path}")
+
+    _SKETCH_SEQUENCE_CACHE = sequences
+    return sequences
+
+def _point_at_distance(points: list[list[float]], target: float) -> list[float]:
+    if not points:
+        return [0.0, 0.0]
+    if len(points) == 1:
+        return [float(points[0][0]), float(points[0][1])]
+
+    walked = 0.0
+    for a, b in zip(points, points[1:]):
+        ax, ay = float(a[0]), float(a[1])
+        bx, by = float(b[0]), float(b[1])
+        seg = math.hypot(bx - ax, by - ay)
+        if seg <= 0:
+            continue
+        if walked + seg >= target:
+            t = (target - walked) / seg
+            return [ax + (bx - ax) * t, ay + (by - ay) * t]
+        walked += seg
+    last = points[-1]
+    return [float(last[0]), float(last[1])]
+
+def _layout_points_for_names(names: list[str], path: list[list[float]]) -> list[list[float]]:
+    if not names:
+        return []
+    if len(names) == 1:
+        return [_point_at_distance(path, 0.0)]
+    distances = [
+        math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))
+        for a, b in zip(path, path[1:])
+    ]
+    total = sum(distances)
+    if total <= 0:
+        return [_point_at_distance(path, 0.0) for _ in names]
+    return [_point_at_distance(path, total * idx / (len(names) - 1)) for idx in range(len(names))]
+
+def _board_layout_model() -> dict:
+    sequences = _load_firmware_sequences()
+    lines = []
+    for spec in BOARD_LINE_SPECS:
+        names: list[str] = []
+        for array_name in spec["array_names"]:
+            names.extend(sequences.get(array_name, []))
+        points = _layout_points_for_names(names, spec["path"])
+        stations = []
+        for name, point in zip(names, points):
+            stations.append({
+                "name": name,
+                "key": f"{name}{spec['suffix']}",
+                "x": round(point[0], 2),
+                "y": round(point[1], 2),
+            })
+        lines.append({
+            "line": spec["line"],
+            "suffix": spec["suffix"],
+            "color": spec["color"],
+            "path": spec["path"],
+            "stations": stations,
+        })
+    return {
+        "viewBox": [0, 0, 1120, 900],
+        "title": "Sydney Rail Network",
+        "lines": lines,
+    }
+
+def _board_layout_keys() -> set[str]:
+    keys: set[str] = set()
+    for line in _board_layout_model()["lines"]:
+        for station in line["stations"]:
+            keys.add(station["key"])
+    return keys
 
 EXCLUDE_SUB = ("wharf", "light rail", "b-line", "interchange", "motorway", " m2")
 SHORT_RE = re.compile(r"\b([TM]\d{1,2})\b", re.I)
@@ -1574,6 +1903,523 @@ async def login_post(board_id: str = Form(...)):
     return RedirectResponse(f"/board/{board_id}", status_code=303)
 
 
+def _render_board_settings_console(board_id: str, cfg: dict) -> str:
+    b = min(150, int(cfg.get("brightness", 16)))
+    mode = cfg.get("mode", "live")
+    nm = cfg.get("night_mode", {}) or {}
+    an = cfg.get("animation", {}) or {}
+    test_mode = cfg.get("test_mode", {}) or {}
+    ota = cfg.get("ota", {}) or {}
+
+    an_color = an.get("color", [255, 80, 0])
+    if not isinstance(an_color, list) or len(an_color) < 3:
+        an_color = [255, 80, 0]
+    an_color_hex = "#%02X%02X%02X" % (
+        max(0, min(255, int(an_color[0]))),
+        max(0, min(255, int(an_color[1]))),
+        max(0, min(255, int(an_color[2]))),
+    )
+
+    def _firmware_size_label(size: T.Any) -> str:
+        try:
+            n = int(size)
+        except Exception:
+            return ""
+        if n >= 1024 * 1024:
+            return f"{n / (1024 * 1024):.1f} MB"
+        if n >= 1024:
+            return f"{n / 1024:.0f} KB"
+        return f"{n} B"
+
+    ota_filename = _safe_firmware_filename(ota.get("filename"))
+    firmware_options = ['<option value="">Use global manifest</option>']
+    for item in _available_firmware_files():
+        filename = item.get("filename") or ""
+        selected = " selected" if filename == ota_filename else ""
+        size_label = _firmware_size_label(item.get("size"))
+        label = f"{filename} ({size_label})" if size_label else filename
+        firmware_options.append(
+            f'<option value="{html.escape(filename)}"{selected}>{html.escape(label)}</option>'
+        )
+
+    test_states_json = json.dumps(
+        _sanitize_test_states(test_mode.get("states", {})),
+        separators=(",", ":"),
+    )
+    global_fw = _firmware_metadata()
+    active_fw = _active_firmware_metadata_for_board(cfg)
+    global_fw_text = (
+        f"{global_fw.get('version')} / {global_fw.get('filename')}"
+        if global_fw.get("available")
+        else f"Unavailable: {global_fw.get('reason')}"
+    )
+    active_fw_text = (
+        f"{active_fw.get('version')} / {active_fw.get('filename')}"
+        if active_fw.get("available")
+        else f"Unavailable: {active_fw.get('reason')}"
+    )
+
+    page = """
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Metroboard __BOARD_ID__</title>
+    <style>
+      :root { color-scheme: dark; --bg:#0d1117; --panel:#151b24; --panel2:#101720; --border:#2a3442; --text:#edf2f7; --muted:#93a4b8; --accent:#f59e0b; }
+      * { box-sizing: border-box; }
+      body { margin:0; background:var(--bg); color:var(--text); font-family:Inter,Segoe UI,system-ui,-apple-system,sans-serif; }
+      main { max-width:1180px; margin:0 auto; padding:24px 18px 56px; }
+      a { color:var(--accent); }
+      .topbar { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:14px; }
+      h1 { margin:0; font-size:24px; letter-spacing:0; }
+      h3 { margin:0; font-size:17px; }
+      h4 { margin:0 0 8px; font-size:14px; }
+      code { padding:2px 6px; border:1px solid var(--border); border-radius:6px; background:rgba(255,255,255,.05); }
+      .sub,.muted,.note { color:var(--muted); }
+      .sub { margin-top:5px; font-size:14px; }
+      .note { font-size:13px; margin-top:8px; }
+      .card { background:var(--panel); border:1px solid var(--border); border-radius:8px; padding:20px; margin-top:14px; }
+      .section-head { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
+      .tag { background:rgba(255,255,255,.06); border:1px solid var(--border); border-radius:8px; padding:6px 10px; color:var(--muted); font-size:13px; }
+      .status-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:10px; }
+      .status-item { border:1px solid var(--border); border-radius:8px; padding:12px 14px; background:rgba(255,255,255,.025); }
+      .status-label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
+      .status-value { margin-top:6px; font-size:19px; font-weight:750; }
+      .status-sub { margin-top:4px; color:var(--muted); font-size:13px; }
+      .layout-grid { display:grid; grid-template-columns:minmax(0,1fr) 270px; gap:14px; }
+      .board-shell { background:#07090d; border:1px solid #303946; border-radius:8px; overflow:hidden; min-height:420px; }
+      #boardSvg { display:block; width:100%; aspect-ratio:1120/900; min-height:420px; }
+      .network-title { fill:#d7dee7; font-size:46px; font-weight:750; letter-spacing:0; }
+      .line-path { fill:none; stroke-width:5; stroke-linecap:round; stroke-linejoin:round; opacity:.42; }
+      .station-node { fill:#2a2f38; stroke:#a9b4c1; stroke-width:2; cursor:default; transition:opacity 120ms ease, fill 120ms ease, r 120ms ease; }
+      body[data-mode="test"] .station-node { cursor:pointer; }
+      .station-node.state-1 { fill:var(--line-color); opacity:.34; }
+      .station-node.state-2 { fill:var(--line-color); opacity:.68; }
+      .station-node.state-3 { fill:var(--line-color); opacity:1; r:6; filter:drop-shadow(0 0 7px var(--line-color)); }
+      .line-badge { fill:#111820; stroke:#c6d2df; stroke-width:1.5; }
+      .line-badge-text { fill:#f4f7fb; font-size:14px; font-weight:800; text-anchor:middle; dominant-baseline:central; }
+      .sim-side { border:1px solid var(--border); border-radius:8px; padding:12px; background:var(--panel2); }
+      .sim-controls { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:12px; }
+      button.control { border:1px solid var(--border); border-radius:8px; background:rgba(255,255,255,.05); color:var(--text); padding:9px 10px; font-weight:650; cursor:pointer; }
+      button.control:hover { border-color:var(--accent); }
+      .sim-controls.is-disabled button { opacity:.55; cursor:not-allowed; }
+      .mode-options { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px; margin-top:12px; }
+      .option { border:1px solid var(--border); border-radius:8px; padding:12px 14px; display:flex; gap:10px; align-items:center; background:rgba(255,255,255,.02); }
+      .two-col { display:grid; grid-template-columns:repeat(auto-fit,minmax(240px,1fr)); gap:12px; }
+      .row { display:flex; flex-wrap:wrap; gap:14px; margin-top:10px; }
+      label.field { display:flex; flex-direction:column; gap:6px; min-width:220px; flex:1 1 220px; color:var(--muted); font-size:14px; }
+      label.field input,label.field select { background:rgba(255,255,255,.04); color:var(--text); border:1px solid var(--border); border-radius:8px; padding:10px 12px; font-size:15px; outline:none; color-scheme:dark; }
+      label.field select option { background:#0f1420; color:var(--text); }
+      .slider-row { display:flex; align-items:center; gap:12px; margin-top:12px; }
+      input[type=range] { flex:1; accent-color:var(--accent); }
+      .pill { display:inline-flex; background:rgba(245,158,11,.15); color:var(--accent); padding:6px 10px; border-radius:999px; font-weight:700; font-size:13px; }
+      .color-picker { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 12px; border-radius:8px; border:1px solid var(--border); background:rgba(255,255,255,.04); cursor:pointer; }
+      .color-picker__input { width:44px; height:36px; padding:0; border:none; background:transparent; cursor:pointer; }
+      .color-picker__value { display:inline-flex; align-items:center; gap:8px; font-size:14px; color:var(--text); font-weight:650; }
+      .color-picker__swatch { width:18px; height:18px; border-radius:5px; border:1px solid rgba(255,255,255,.2); box-shadow:0 0 8px rgba(0,0,0,.4); }
+      .color-picker__cta { font-size:12px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; }
+      .hidden { display:none; }
+      .actions { display:flex; justify-content:flex-end; margin-top:16px; }
+      button.primary { background:var(--accent); color:#111; border:none; border-radius:8px; padding:12px 18px; font-weight:800; cursor:pointer; }
+      button.primary:hover { filter:brightness(1.08); }
+      @media (max-width:880px) { .layout-grid{grid-template-columns:1fr;} .topbar{align-items:flex-start; flex-direction:column;} }
+      @media (max-width:640px) { main{padding:18px 10px 42px;} .card{padding:14px;} .sim-controls{grid-template-columns:1fr;} }
+    </style>
+  </head>
+  <body data-mode="__MODE__">
+    <main>
+      <div class="topbar">
+        <div>
+          <h1>Metroboard Control</h1>
+          <div class="sub">Board <code>__BOARD_ID__</code> - live, test, animation and OTA deployment controls</div>
+        </div>
+        <div><span class="tag" id="boardSyncTag">Checking</span> <a href="/login">Switch board</a></div>
+      </div>
+
+      <section class="card">
+        <div class="section-head"><h3>Board Status</h3><span class="tag">Heartbeat</span></div>
+        <div class="status-grid">
+          <div class="status-item"><div class="status-label">Last check-in</div><div class="status-value" id="lastPayloadAge">--</div><div class="status-sub" id="lastPayloadAt">Waiting for board</div></div>
+          <div class="status-item"><div class="status-label">Train feed age</div><div class="status-value" id="feedAge">--</div><div class="status-sub">TfNSW cache age</div></div>
+          <div class="status-item"><div class="status-label">Settings version</div><div class="status-value" id="settingsVersion">__SETTINGS_VERSION__</div><div class="status-sub">Updates after saving</div></div>
+          <div class="status-item"><div class="status-label">Firmware</div><div class="status-value" id="firmwareCurrent">--</div><div class="status-sub" id="firmwareSub">Waiting for board</div></div>
+          <div class="status-item"><div class="status-label">OTA target</div><div class="status-value" id="otaTarget">__ACTIVE_FW_TEXT__</div><div class="status-sub">Per-board deployment</div></div>
+        </div>
+      </section>
+
+      <form id="settingsForm" method="post" action="/board/__BOARD_ID__">
+        <input type="hidden" id="test_states_json" name="test_states_json" value="__TEST_STATES_ATTR__" />
+
+        <section class="card">
+          <div class="section-head"><h3>Board Simulator</h3><span class="tag" id="simStateTag">Loading layout</span></div>
+          <div class="layout-grid">
+            <div class="board-shell"><svg id="boardSvg" viewBox="0 0 1120 900" role="img" aria-label="Metroboard simulator"></svg></div>
+            <div class="sim-side">
+              <h4>Test Lights</h4>
+              <p class="muted">Select Test lights mode, then click stations or use line controls. Save settings to apply to the physical board.</p>
+              <div class="sim-controls" id="testControls">
+                <button class="control" type="button" data-action="all-off">All off</button>
+                <button class="control" type="button" data-action="all-on">All on</button>
+              </div>
+              <p class="note" id="testModeHint">Station clicks edit test lights only while Test lights mode is selected.</p>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="section-head"><h3>Display Mode</h3><span class="tag">Live, Test, Animation</span></div>
+          <div class="mode-options">
+            <label class="option"><input type="radio" name="mode" value="live" __MODE_LIVE_CHECKED__ /><div><strong>Live trains</strong><p class="muted">Use the network feed to light up stations.</p></div></label>
+            <label class="option"><input type="radio" name="mode" value="test" __MODE_TEST_CHECKED__ /><div><strong>Test lights</strong><p class="muted">Display manually selected LEDs from the simulator.</p></div></label>
+            <label class="option"><input type="radio" name="mode" value="animation" __MODE_ANIMATION_CHECKED__ /><div><strong>Animation</strong><p class="muted">Ignore live trains and play the configured effect.</p></div></label>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="section-head"><h3>Brightness</h3><span class="tag">0-150</span></div>
+          <div class="slider-row"><input id="brightness" type="range" min="0" max="150" name="brightness" value="__BRIGHTNESS__" /><div class="pill" id="brightnessValue">__BRIGHTNESS__</div></div>
+          <p class="note">Applies to the entire board; night mode can override this later.</p>
+        </section>
+
+        <section class="card">
+          <div class="section-head"><h3>Night Mode</h3><span class="tag">Schedule</span></div>
+          <label class="option"><input id="nm_enabled" type="checkbox" name="nm_enabled" __NM_ENABLED__ /><div><strong>Enable night mode</strong><p class="muted" id="nightStatus">Disabled</p></div></label>
+          <div class="two-col" style="margin-top:12px;">
+            <label class="field">Start time<input data-night-field type="time" name="nm_start" value="__NM_START__" /></label>
+            <label class="field">End time<input data-night-field type="time" name="nm_end" value="__NM_END__" /></label>
+          </div>
+          <div class="two-col" style="margin-top:10px;">
+            <label class="field">Action<select data-night-field name="nm_action" id="nm_action"><option value="off" __NM_ACTION_OFF_SELECTED__>Turn off</option><option value="dim" __NM_ACTION_DIM_SELECTED__>Dim</option></select></label>
+            <label class="field">Night brightness<input data-night-field type="number" name="nm_dim" min="0" max="255" value="__NM_DIM__" /></label>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="section-head"><h3>Animation</h3><span class="tag" id="animationTag">Mode: __AN_NAME_TITLE__</span></div>
+          <div class="row">
+            <label class="field">Name<select name="an_name" id="an_name"><option value="pulse" __AN_PULSE_SELECTED__>Pulse</option><option value="bounce" __AN_BOUNCE_SELECTED__>Bounce</option><option value="rainbow" __AN_RAINBOW_SELECTED__>Rainbow</option></select></label>
+            <label class="field">Speed<input type="number" name="an_speed" value="__AN_SPEED__" min="20" max="5000" /></label>
+            <label class="field" id="pulseColorField">Pulse colour<div class="color-picker"><input class="color-picker__input" type="color" id="an_color" name="an_color" value="__AN_COLOR_HEX__" /><span class="color-picker__value"><span class="color-picker__swatch" id="pulseColorSwatch" style="background:__AN_COLOR_HEX__;"></span><span id="pulseColorValue">__AN_COLOR_HEX__</span></span><span class="color-picker__cta">Change</span></div></label>
+          </div>
+          <p class="note" id="pulseColorNote">Pulse is the only animation that uses the custom colour.</p>
+        </section>
+
+        <section class="card">
+          <div class="section-head"><h3>OTA Deployment</h3><span class="tag">Per-board target</span></div>
+          <label class="option"><input id="ota_enabled" type="checkbox" name="ota_enabled" __OTA_ENABLED__ /><div><strong>Allow OTA updates for this board</strong><p class="muted">Disable this to hold a board on its current firmware.</p></div></label>
+          <div class="two-col" style="margin-top:12px;">
+            <label class="field">Firmware binary<select name="ota_filename" id="ota_filename">__FIRMWARE_OPTIONS__</select></label>
+            <label class="field">Target version<input type="text" name="ota_target_version" value="__OTA_TARGET_VERSION__" placeholder="1.4.2" maxlength="40" /></label>
+          </div>
+          <p class="note">Global manifest: __GLOBAL_FW_TEXT__. Active target for this board: __ACTIVE_FW_TEXT__.</p>
+        </section>
+
+        <div class="actions"><button class="primary" type="submit">Save settings</button></div>
+      </form>
+    </main>
+    <script>
+      (function() {
+        const boardId = "__BOARD_ID__";
+        let testStates = __TEST_STATES_JSON__;
+        let layoutModel = null;
+        let stationKeys = [];
+        const nodeByKey = new Map();
+        const brightness = document.getElementById("brightness");
+        const brightnessValue = document.getElementById("brightnessValue");
+        const nmToggle = document.getElementById("nm_enabled");
+        const nightFields = document.querySelectorAll("[data-night-field]");
+        const nightStatus = document.getElementById("nightStatus");
+        const nmAction = document.getElementById("nm_action");
+        const startEl = document.querySelector('input[name="nm_start"]');
+        const endEl = document.querySelector('input[name="nm_end"]');
+        const anName = document.getElementById("an_name");
+        const pulseColorField = document.getElementById("pulseColorField");
+        const pulseColorNote = document.getElementById("pulseColorNote");
+        const pulseColorInput = document.getElementById("an_color");
+        const pulseColorValue = document.getElementById("pulseColorValue");
+        const pulseColorSwatch = document.getElementById("pulseColorSwatch");
+        const boardSyncTag = document.getElementById("boardSyncTag");
+        const lastPayloadAge = document.getElementById("lastPayloadAge");
+        const lastPayloadAt = document.getElementById("lastPayloadAt");
+        const feedAge = document.getElementById("feedAge");
+        const settingsVersion = document.getElementById("settingsVersion");
+        const firmwareCurrent = document.getElementById("firmwareCurrent");
+        const firmwareSub = document.getElementById("firmwareSub");
+        const otaTarget = document.getElementById("otaTarget");
+        const svg = document.getElementById("boardSvg");
+        const simStateTag = document.getElementById("simStateTag");
+        const testControls = document.getElementById("testControls");
+        const testStatesInput = document.getElementById("test_states_json");
+
+        const currentMode = () => document.querySelector('input[name="mode"]:checked')?.value || "live";
+        const syncBrightness = () => brightnessValue.textContent = brightness.value;
+        const syncTestStateInput = () => { testStatesInput.value = JSON.stringify(testStates); };
+        brightness.addEventListener("input", syncBrightness);
+        syncBrightness();
+        syncTestStateInput();
+
+        const formatTime = (v) => {
+          if (!v || !v.includes(":")) return v || "-";
+          const [h, m] = v.split(":");
+          const hr = parseInt(h, 10);
+          const suffix = hr >= 12 ? "PM" : "AM";
+          const hour12 = ((hr + 11) % 12) + 1;
+          return `${hour12}:${m} ${suffix}`;
+        };
+        const syncNight = () => {
+          const on = nmToggle.checked;
+          nightFields.forEach(el => el.disabled = !on);
+          const action = nmAction.value === "off" ? "Turn off" : "Dim to " + (document.querySelector('input[name="nm_dim"]').value || "20");
+          nightStatus.textContent = on ? `${formatTime(startEl.value)} to ${formatTime(endEl.value)} - ${action}` : "Disabled";
+        };
+        nmToggle.addEventListener("change", syncNight);
+        nightFields.forEach(el => el.addEventListener("input", syncNight));
+        syncNight();
+
+        const syncPulse = () => {
+          const value = (pulseColorInput.value || "").toUpperCase();
+          pulseColorValue.textContent = value;
+          pulseColorSwatch.style.background = value;
+          const isPulse = anName.value === "pulse";
+          pulseColorField.classList.toggle("hidden", !isPulse);
+          pulseColorNote.classList.toggle("hidden", !isPulse);
+          document.getElementById("animationTag").textContent = "Mode: " + (anName.options[anName.selectedIndex]?.textContent || anName.value);
+        };
+        pulseColorInput.addEventListener("input", syncPulse);
+        anName.addEventListener("change", syncPulse);
+        syncPulse();
+
+        const formatAge = (seconds) => {
+          if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return "--";
+          const s = Math.max(0, Math.round(Number(seconds)));
+          if (s < 60) return s + "s";
+          const m = Math.floor(s / 60);
+          const rem = s % 60;
+          if (m < 60) return rem ? `${m}m ${rem}s` : `${m}m`;
+          const h = Math.floor(m / 60);
+          const mins = m % 60;
+          return mins ? `${h}h ${mins}m` : `${h}h`;
+        };
+
+        const setNodeState = (key, state) => {
+          const node = nodeByKey.get(key);
+          if (!node) return;
+          const normalized = Math.max(0, Math.min(3, Number(state || 0)));
+          node.classList.remove("state-0", "state-1", "state-2", "state-3");
+          node.classList.add("state-" + normalized);
+        };
+        const applyStates = (states) => {
+          stationKeys.forEach(key => setNodeState(key, states[key] || 0));
+          if (simStateTag) simStateTag.textContent = currentMode() === "test" ? "Test states" : "Live states";
+        };
+
+        const buildTestControls = (model) => {
+          testControls.querySelectorAll("[data-line]").forEach(btn => btn.remove());
+          model.lines.forEach(line => {
+            const btn = document.createElement("button");
+            btn.className = "control";
+            btn.type = "button";
+            btn.dataset.action = "line-toggle";
+            btn.dataset.line = line.line;
+            btn.textContent = line.line;
+            btn.addEventListener("click", () => {
+              if (currentMode() !== "test") return;
+              const keys = line.stations.map(st => st.key);
+              const anyOff = keys.some(key => Number(testStates[key] || 0) < 3);
+              keys.forEach(key => testStates[key] = anyOff ? 3 : 0);
+              syncTestStateInput();
+              applyStates(testStates);
+            });
+            testControls.appendChild(btn);
+          });
+        };
+
+        const renderLayout = (model) => {
+          const ns = "http://www.w3.org/2000/svg";
+          svg.innerHTML = "";
+          nodeByKey.clear();
+          stationKeys = [];
+          const bg = document.createElementNS(ns, "rect");
+          bg.setAttribute("width", "1120");
+          bg.setAttribute("height", "900");
+          bg.setAttribute("fill", "#07090d");
+          svg.appendChild(bg);
+          const title = document.createElementNS(ns, "text");
+          title.setAttribute("x", "44");
+          title.setAttribute("y", "66");
+          title.setAttribute("class", "network-title");
+          title.textContent = model.title || "Sydney Rail Network";
+          svg.appendChild(title);
+          model.lines.forEach(line => {
+            const poly = document.createElementNS(ns, "polyline");
+            poly.setAttribute("class", "line-path");
+            poly.setAttribute("points", line.path.map(p => p.join(",")).join(" "));
+            poly.setAttribute("stroke", line.color);
+            svg.appendChild(poly);
+          });
+          model.lines.forEach(line => {
+            if (!line.stations.length) return;
+            const first = line.stations[0];
+            const badge = document.createElementNS(ns, "rect");
+            badge.setAttribute("x", first.x - 15);
+            badge.setAttribute("y", first.y - 22);
+            badge.setAttribute("width", "30");
+            badge.setAttribute("height", "22");
+            badge.setAttribute("rx", "3");
+            badge.setAttribute("class", "line-badge");
+            svg.appendChild(badge);
+            const badgeText = document.createElementNS(ns, "text");
+            badgeText.setAttribute("x", first.x);
+            badgeText.setAttribute("y", first.y - 11);
+            badgeText.setAttribute("class", "line-badge-text");
+            badgeText.textContent = line.line;
+            svg.appendChild(badgeText);
+            line.stations.forEach(station => {
+              stationKeys.push(station.key);
+              const circle = document.createElementNS(ns, "circle");
+              circle.setAttribute("cx", station.x);
+              circle.setAttribute("cy", station.y);
+              circle.setAttribute("r", "5");
+              circle.setAttribute("class", "station-node state-0");
+              circle.dataset.key = station.key;
+              circle.dataset.line = line.line;
+              circle.style.setProperty("--line-color", line.color);
+              const titleEl = document.createElementNS(ns, "title");
+              titleEl.textContent = `${station.name} ${line.line}`;
+              circle.appendChild(titleEl);
+              circle.addEventListener("click", () => {
+                if (currentMode() !== "test") return;
+                const current = Number(testStates[station.key] || 0);
+                testStates[station.key] = current >= 3 ? 0 : 3;
+                syncTestStateInput();
+                applyStates(testStates);
+              });
+              nodeByKey.set(station.key, circle);
+              svg.appendChild(circle);
+            });
+          });
+          buildTestControls(model);
+        };
+
+        testControls.addEventListener("click", (event) => {
+          const btn = event.target.closest("button[data-action]");
+          if (!btn || currentMode() !== "test") return;
+          const action = btn.dataset.action;
+          if (action === "all-off" || action === "all-on") {
+            stationKeys.forEach(key => testStates[key] = action === "all-on" ? 3 : 0);
+            syncTestStateInput();
+            applyStates(testStates);
+          }
+        });
+
+        const fetchStatesInBatches = async () => {
+          const merged = {};
+          for (let i = 0; i < stationKeys.length; i += 90) {
+            const keys = stationKeys.slice(i, i + 90);
+            const qs = keys.map(encodeURIComponent).join(",");
+            const resp = await fetch(`/board_payload?board_id=${encodeURIComponent(boardId)}&only=${qs}`, { cache: "no-store" });
+            if (!resp.ok) throw new Error("status " + resp.status);
+            const data = await resp.json();
+            Object.assign(merged, data.states || {});
+          }
+          return merged;
+        };
+        const refreshSimulatorStates = async () => {
+          if (!layoutModel || currentMode() === "test") {
+            applyStates(testStates);
+            return;
+          }
+          if (!stationKeys.length) return;
+          try {
+            applyStates(await fetchStatesInBatches());
+          } catch (err) {
+            if (simStateTag) simStateTag.textContent = "Simulator unavailable";
+          }
+        };
+        const syncModeUi = () => {
+          const isTest = currentMode() === "test";
+          document.body.dataset.mode = currentMode();
+          testControls.classList.toggle("is-disabled", !isTest);
+          applyStates(isTest ? testStates : {});
+          if (!isTest) refreshSimulatorStates();
+        };
+        document.querySelectorAll('input[name="mode"]').forEach(el => el.addEventListener("change", syncModeUi));
+
+        const loadLayout = async () => {
+          try {
+            const resp = await fetch("/board_layout", { cache: "no-store" });
+            if (!resp.ok) throw new Error("status " + resp.status);
+            layoutModel = await resp.json();
+            renderLayout(layoutModel);
+            syncModeUi();
+            refreshSimulatorStates();
+          } catch (err) {
+            if (simStateTag) simStateTag.textContent = "Layout unavailable";
+          }
+        };
+        const syncBoardStatus = async () => {
+          try {
+            const resp = await fetch(`/board_status?board_id=${encodeURIComponent(boardId)}`, { cache: "no-store" });
+            if (!resp.ok) throw new Error("status " + resp.status);
+            const data = await resp.json();
+            const payloadAge = data.last_payload_age_seconds;
+            lastPayloadAge.textContent = formatAge(payloadAge);
+            lastPayloadAt.textContent = data.last_payload_at ? new Date(data.last_payload_at).toLocaleString() : "No board check-in yet";
+            feedAge.textContent = formatAge(data.feed_age_seconds);
+            settingsVersion.textContent = data.settings_version ?? "--";
+            firmwareCurrent.textContent = data.firmware?.current || "--";
+            const build = data.firmware?.build ? ` - ${data.firmware.build}` : "";
+            firmwareSub.textContent = data.firmware?.seen_age_seconds == null ? "No firmware report yet" : `Seen ${formatAge(data.firmware.seen_age_seconds)} ago${build}`;
+            otaTarget.textContent = data.ota?.enabled ? (data.ota?.target_version || "Global") : "Held";
+            boardSyncTag.textContent = payloadAge === null || payloadAge === undefined ? "No check-in" : "Updated " + formatAge(payloadAge) + " ago";
+          } catch (err) {
+            boardSyncTag.textContent = "Status unavailable";
+          }
+        };
+        loadLayout();
+        syncBoardStatus();
+        window.setInterval(syncBoardStatus, 5000);
+        window.setInterval(refreshSimulatorStates, 4000);
+      })();
+    </script>
+  </body>
+</html>
+"""
+    replacements = {
+        "__BOARD_ID__": html.escape(board_id),
+        "__MODE__": html.escape(str(mode)),
+        "__SETTINGS_VERSION__": str(BOARD_SETTINGS_VERSION),
+        "__ACTIVE_FW_TEXT__": html.escape(active_fw_text),
+        "__GLOBAL_FW_TEXT__": html.escape(global_fw_text),
+        "__TEST_STATES_JSON__": test_states_json,
+        "__TEST_STATES_ATTR__": html.escape(test_states_json, quote=True),
+        "__MODE_LIVE_CHECKED__": "checked" if mode == "live" else "",
+        "__MODE_TEST_CHECKED__": "checked" if mode == "test" else "",
+        "__MODE_ANIMATION_CHECKED__": "checked" if mode == "animation" else "",
+        "__BRIGHTNESS__": str(b),
+        "__NM_ENABLED__": "checked" if nm.get("enabled") else "",
+        "__NM_START__": html.escape(str(nm.get("start", "23:00"))),
+        "__NM_END__": html.escape(str(nm.get("end", "06:00"))),
+        "__NM_ACTION_OFF_SELECTED__": "selected" if nm.get("action", "off") == "off" else "",
+        "__NM_ACTION_DIM_SELECTED__": "selected" if nm.get("action") == "dim" else "",
+        "__NM_DIM__": str(max(0, min(255, int(nm.get("dim_level", 20))))),
+        "__AN_NAME_TITLE__": html.escape(str(an.get("name", "pulse")).title()),
+        "__AN_PULSE_SELECTED__": "selected" if an.get("name", "pulse") == "pulse" else "",
+        "__AN_BOUNCE_SELECTED__": "selected" if an.get("name") == "bounce" else "",
+        "__AN_RAINBOW_SELECTED__": "selected" if an.get("name") == "rainbow" else "",
+        "__AN_SPEED__": str(max(20, min(5000, int(an.get("speed", 120))))),
+        "__AN_COLOR_HEX__": an_color_hex,
+        "__OTA_ENABLED__": "checked" if ota.get("enabled", True) else "",
+        "__FIRMWARE_OPTIONS__": "\n".join(firmware_options),
+        "__OTA_TARGET_VERSION__": html.escape(str(ota.get("target_version") or "")),
+    }
+    for key, value in replacements.items():
+        page = page.replace(key, value)
+    return page
+
+
 @app.get("/board/{board_id}", response_class=HTMLResponse)
 def board_settings_page(board_id: str):
     board_id = _normalize_board_id(board_id)
@@ -1582,564 +2428,7 @@ def board_settings_page(board_id: str):
     except ValueError:
         return HTMLResponse("Invalid board_id", status_code=400)
 
-    b = min(150, int(cfg.get("brightness", 16)))
-    mode = cfg.get("mode", "live")
-    nm = cfg.get("night_mode", {}) or {}
-    an = cfg.get("animation", {}) or {}
-
-    nm_enabled = "checked" if nm.get("enabled") else ""
-    nm_start = nm.get("start", "23:00")
-    nm_end = nm.get("end", "06:00")
-    nm_action = nm.get("action", "off")
-    nm_dim = nm.get("dim_level", 20)
-
-    an_name = an.get("name", "pulse")
-    an_speed = an.get("speed", 120)
-    an_color = an.get("color", [255, 80, 0])
-    an_color_hex = "#%02X%02X%02X" % (an_color[0], an_color[1], an_color[2])
-
-    return f"""
-    <!DOCTYPE html>
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <title>Metroboard {board_id} Settings</title>
-        <style>
-          :root {{
-            color-scheme: light dark;
-            --bg: #0b0e14;
-            --panel: #131923;
-            --border: #263042;
-            --accent: #ff6b3d;
-            --muted: #8a96a8;
-            --text: #edf2f7;
-            --shadow: 0 18px 40px rgba(4, 8, 16, 0.45);
-            --line-blue: #2f80ed;
-            --line-green: #27ae60;
-            --line-red: #eb5757;
-            --line-yellow: #f2c94c;
-            --line-purple: #9b51e0;
-          }}
-          * {{ box-sizing: border-box; }}
-          body {{
-            margin: 0;
-            font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
-            background:
-              radial-gradient(circle at top, rgba(47,128,237,0.18), transparent 50%),
-              radial-gradient(circle at 20% 20%, rgba(155,81,224,0.16), transparent 55%),
-              linear-gradient(145deg, #0a0e16 0%, #131a29 100%);
-            color: var(--text);
-            min-height: 100vh;
-          }}
-          body::before {{
-            content: "";
-            position: fixed;
-            inset: 0;
-            pointer-events: none;
-            background-image:
-              linear-gradient(rgba(255,255,255,0.04) 1px, transparent 1px),
-              linear-gradient(90deg, rgba(255,255,255,0.04) 1px, transparent 1px);
-            background-size: 24px 24px;
-            opacity: 0.4;
-          }}
-          a {{ color: var(--accent); }}
-          main.page {{
-            max-width: 900px;
-            margin: 0 auto;
-            padding: 32px 20px 60px;
-          }}
-          .hero {{
-            display: flex;
-            align-items: flex-start;
-            justify-content: space-between;
-            gap: 12px;
-            margin-bottom: 16px;
-          }}
-          .hero__title {{
-            font-size: 32px;
-            font-weight: 700;
-            letter-spacing: 0.4px;
-          }}
-          .hero__subtitle {{ color: var(--muted); margin-top: 4px; }}
-          .hero__hint {{ margin: 8px 0 0; color: var(--muted); }}
-          .hero__badge {{
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            margin-top: 10px;
-            padding: 6px 12px;
-            border-radius: 999px;
-            background: rgba(47,128,237,0.2);
-            border: 1px solid rgba(47,128,237,0.35);
-            color: #b9d7ff;
-            font-size: 13px;
-            font-weight: 600;
-          }}
-          .metro-strip {{
-            display: flex;
-            gap: 8px;
-            margin: 18px 0 6px;
-          }}
-          .metro-strip span {{
-            flex: 1;
-            height: 6px;
-            border-radius: 999px;
-            box-shadow: 0 0 12px rgba(255,255,255,0.12);
-          }}
-          .metro-strip .line-blue {{ background: linear-gradient(90deg, rgba(47,128,237,0.6), var(--line-blue)); }}
-          .metro-strip .line-green {{ background: linear-gradient(90deg, rgba(39,174,96,0.5), var(--line-green)); }}
-          .metro-strip .line-red {{ background: linear-gradient(90deg, rgba(235,87,87,0.5), var(--line-red)); }}
-          .metro-strip .line-yellow {{ background: linear-gradient(90deg, rgba(242,201,76,0.5), var(--line-yellow)); }}
-          .metro-strip .line-purple {{ background: linear-gradient(90deg, rgba(155,81,224,0.5), var(--line-purple)); }}
-          .card {{
-            background: var(--panel);
-            border: 1px solid var(--border);
-            border-radius: 14px;
-            padding: 20px;
-            margin-top: 18px;
-            box-shadow: var(--shadow);
-          }}
-          .section-head {{
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            margin-bottom: 8px;
-          }}
-          .section-head h3 {{ margin: 0; font-size: 18px; }}
-          .section-head .tag {{
-            background: rgba(255,255,255,0.06);
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 6px 10px;
-            font-size: 13px;
-            color: var(--muted);
-          }}
-          .status-grid {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-            gap: 10px;
-            margin-top: 12px;
-          }}
-          .status-item {{
-            border: 1px solid var(--border);
-            border-radius: 12px;
-            padding: 12px 14px;
-            background: rgba(255,255,255,0.025);
-          }}
-          .status-label {{
-            color: var(--muted);
-            font-size: 12px;
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-          }}
-          .status-value {{
-            margin-top: 6px;
-            font-size: 20px;
-            font-weight: 700;
-          }}
-          .status-sub {{
-            margin-top: 4px;
-            color: var(--muted);
-            font-size: 13px;
-          }}
-          .row {{ display: flex; flex-wrap: wrap; gap: 14px; margin-top: 10px; }}
-          label.field {{
-            display: flex;
-            flex-direction: column;
-            gap: 6px;
-            min-width: 220px;
-            flex: 1 1 220px;
-            color: var(--muted);
-            font-size: 14px;
-          }}
-          label.field input,
-          label.field select {{
-            background: rgba(255,255,255,0.04);
-            color: var(--text);
-            border: 1px solid var(--border);
-            border-radius: 10px;
-            padding: 10px 12px;
-            font-size: 15px;
-            outline: none;
-            color-scheme: dark;
-          }}
-          label.field select option {{
-            background: #0f1420;
-            color: var(--text);
-          }}
-          .color-picker {{
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            padding: 8px 12px;
-            border-radius: 12px;
-            border: 1px solid var(--border);
-            background: rgba(255,255,255,0.04);
-            cursor: pointer;
-          }}
-          .color-picker__input {{
-            width: 44px;
-            height: 36px;
-            padding: 0;
-            border: none;
-            background: transparent;
-            cursor: pointer;
-          }}
-          .color-picker__input::-webkit-color-swatch-wrapper {{
-            padding: 0;
-          }}
-          .color-picker__input::-webkit-color-swatch {{
-            border: 1px solid rgba(255,255,255,0.18);
-            border-radius: 10px;
-          }}
-          .color-picker__value {{
-            display: inline-flex;
-            align-items: center;
-            gap: 8px;
-            font-size: 14px;
-            color: var(--text);
-            font-weight: 600;
-          }}
-          .color-picker__swatch {{
-            width: 18px;
-            height: 18px;
-            border-radius: 6px;
-            border: 1px solid rgba(255,255,255,0.2);
-            box-shadow: 0 0 8px rgba(0,0,0,0.4);
-          }}
-          .color-picker__cta {{
-            font-size: 12px;
-            font-weight: 600;
-            color: var(--muted);
-            text-transform: uppercase;
-            letter-spacing: 0.08em;
-          }}
-          .mode-options {{
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 10px;
-            margin-top: 12px;
-          }}
-          .option {{
-            border: 1px solid var(--border);
-            padding: 12px 14px;
-            border-radius: 12px;
-            display: flex;
-            gap: 10px;
-            align-items: center;
-            background: rgba(255,255,255,0.02);
-          }}
-          .pill {{
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            background: rgba(255,107,61,0.14);
-            color: var(--accent);
-            padding: 6px 10px;
-            border-radius: 999px;
-            font-weight: 600;
-            font-size: 13px;
-          }}
-          .muted {{ color: var(--muted); font-size: 14px; margin: 0; }}
-          .hidden {{ display: none; }}
-          .slider-row {{
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-top: 12px;
-          }}
-          input[type="range"] {{
-            flex: 1;
-            accent-color: var(--accent);
-          }}
-          .note {{ color: var(--muted); font-size: 13px; margin-top: 8px; }}
-          button.primary {{
-            margin-top: 18px;
-            background: var(--accent);
-            color: #0d0f14;
-            border: none;
-            border-radius: 12px;
-            padding: 12px 18px;
-            font-weight: 700;
-            cursor: pointer;
-            box-shadow: 0 12px 30px rgba(255,107,61,0.35);
-          }}
-          button.primary:hover {{
-            transform: translateY(-1px);
-            box-shadow: 0 16px 32px rgba(255,107,61,0.4);
-          }}
-          .two-col {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }}
-          .status {{ color: #a8ffce; font-weight: 600; font-size: 14px; }}
-          .api-card code {{ background: rgba(255,255,255,0.06); padding: 3px 6px; border-radius: 6px; }}
-          @media (max-width: 640px) {{
-            .hero {{ flex-direction: column; }}
-          }}
-        </style>
-      </head>
-      <body>
-        <main class="page">
-          <div class="hero">
-            <div>
-              <div class="hero__title">Metroboard</div>
-              <div class="hero__subtitle">Board <code>{board_id}</code></div>
-              <p class="hero__hint">Change how your lights behave and save updates to the board.</p>
-              <div class="hero__badge">Train + Metro network · Live sync</div>
-            </div>
-            <div class="hero__links"><a href="/login">Switch board</a></div>
-          </div>
-          <div class="metro-strip" aria-hidden="true">
-            <span class="line-blue"></span>
-            <span class="line-green"></span>
-            <span class="line-red"></span>
-            <span class="line-yellow"></span>
-            <span class="line-purple"></span>
-          </div>
-
-          <section class="card">
-            <div class="section-head">
-              <h3>Board Status</h3>
-              <span class="tag" id="boardSyncTag">Checking</span>
-            </div>
-            <div class="status-grid">
-              <div class="status-item">
-                <div class="status-label">Last check-in</div>
-                <div class="status-value" id="lastPayloadAge">--</div>
-                <div class="status-sub" id="lastPayloadAt">Waiting for board</div>
-              </div>
-              <div class="status-item">
-                <div class="status-label">Train feed age</div>
-                <div class="status-value" id="feedAge">--</div>
-                <div class="status-sub">TfNSW cache age</div>
-              </div>
-              <div class="status-item">
-                <div class="status-label">Settings version</div>
-                <div class="status-value" id="settingsVersion">{BOARD_SETTINGS_VERSION}</div>
-                <div class="status-sub">Updates after saving</div>
-              </div>
-            </div>
-          </section>
-
-          <form id="settingsForm" method="post" action="/board/{board_id}">
-            <section class="card">
-              <div class="section-head">
-                <h3>Display Mode</h3>
-                <span class="tag">Live vs Animation</span>
-              </div>
-              <div class="mode-options">
-                <label class="option">
-                  <input type="radio" name="mode" value="live" {'checked' if mode=='live' else ''} />
-                  <div>
-                    <div><strong>Live trains</strong></div>
-                    <p class="muted">Use the network feed to light up stations.</p>
-                  </div>
-                </label>
-                <label class="option">
-                  <input type="radio" name="mode" value="animation" {'checked' if mode=='animation' else ''} />
-                  <div>
-                    <div><strong>Animation</strong></div>
-                    <p class="muted">Ignore live trains and play the configured effect.</p>
-                  </div>
-                </label>
-              </div>
-            </section>
-
-            <section class="card">
-              <div class="section-head">
-                <h3>Brightness</h3>
-                <span class="tag">0–150</span>
-              </div>
-              <div class="slider-row">
-                <input id="brightness" type="range" min="0" max="150" name="brightness" value="{b}" />
-                <div class="pill" id="brightnessValue">{b}</div>
-              </div>
-              <p class="note">Applies to the entire board; night mode can override this later.</p>
-            </section>
-
-            <section class="card">
-              <div class="section-head">
-                <h3>Night Mode</h3>
-                <span class="tag">Schedule</span>
-              </div>
-              <label class="option" style="margin-top: 6px;">
-                <input id="nm_enabled" type="checkbox" name="nm_enabled" {nm_enabled} />
-                <div>
-                  <div><strong>Enable night mode</strong></div>
-                  <p class="muted" id="nightStatus">11:00 PM → 06:00 AM · Turn off</p>
-                </div>
-              </label>
-              <div class="two-col" style="margin-top: 12px;">
-                <label class="field">Start time (e.g., 11:00 PM)
-                  <input data-night-field type="time" name="nm_start" value="{nm_start}" />
-                </label>
-                <label class="field">End time (e.g., 06:00 AM)
-                  <input data-night-field type="time" name="nm_end" value="{nm_end}" />
-                </label>
-              </div>
-              <div class="two-col" style="margin-top: 10px;">
-                <label class="field">Action
-                  <select data-night-field name="nm_action" id="nm_action">
-                    <option value="off" {"selected" if nm_action=="off" else ""}>Turn off</option>
-                    <option value="dim" {"selected" if nm_action=="dim" else ""}>Dim</option>
-                  </select>
-                </label>
-                <label class="field">Night brightness
-                  <input data-night-field type="number" name="nm_dim" min="0" max="255" value="{nm_dim}" />
-                </label>
-              </div>
-            </section>
-
-            <section class="card">
-              <div class="section-head">
-                <h3>Animation</h3>
-                <span class="tag" id="animationTag">Mode: {an_name.title()}</span>
-              </div>
-              <div class="row">
-                <label class="field">Name
-                  <select name="an_name" id="an_name">
-                    <option value="pulse" {"selected" if an_name=="pulse" else ""}>Pulse</option>
-                    <option value="bounce" {"selected" if an_name=="bounce" else ""}>Bounce</option>
-                    <option value="rainbow" {"selected" if an_name=="rainbow" else ""}>Rainbow</option>
-                  </select>
-                </label>
-                <label class="field">Speed
-                  <input type="number" name="an_speed" value="{an_speed}" />
-                </label>
-                <label class="field" id="pulseColorField">Pulse colour
-                  <div class="color-picker">
-                    <input class="color-picker__input" type="color" id="an_color" name="an_color" value="{an_color_hex}" />
-                    <span class="color-picker__value">
-                      <span class="color-picker__swatch" id="pulseColorSwatch" style="background: {an_color_hex};"></span>
-                      <span id="pulseColorValue">{an_color_hex}</span>
-                    </span>
-                    <span class="color-picker__cta">Change</span>
-                  </div>
-                </label>
-              </div>
-              <p class="note" id="pulseColorNote">Pulse is the only animation that uses the custom colour.</p>
-              <p class="note">Animation settings are used when the board is in Animation mode.</p>
-            </section>
-
-            <button class="primary" type="submit">Save settings</button>
-          </form>
-        </main>
-
-        <script>
-          (function() {{
-            const brightness = document.getElementById("brightness");
-            const brightnessValue = document.getElementById("brightnessValue");
-            const nmToggle = document.getElementById("nm_enabled");
-            const nightFields = document.querySelectorAll("[data-night-field]");
-            const nightStatus = document.getElementById("nightStatus");
-            const nmAction = document.getElementById("nm_action");
-            const startEl = document.querySelector('input[name="nm_start"]');
-            const endEl = document.querySelector('input[name="nm_end"]');
-            const anName = document.getElementById("an_name");
-            const pulseColorField = document.getElementById("pulseColorField");
-            const pulseColorNote = document.getElementById("pulseColorNote");
-            const pulseColorInput = document.getElementById("an_color");
-            const pulseColorValue = document.getElementById("pulseColorValue");
-            const pulseColorSwatch = document.getElementById("pulseColorSwatch");
-            const boardSyncTag = document.getElementById("boardSyncTag");
-            const lastPayloadAge = document.getElementById("lastPayloadAge");
-            const lastPayloadAt = document.getElementById("lastPayloadAt");
-            const feedAge = document.getElementById("feedAge");
-            const settingsVersion = document.getElementById("settingsVersion");
-
-            const syncBrightness = () => brightnessValue.textContent = brightness.value;
-            brightness.addEventListener("input", syncBrightness);
-            syncBrightness();
-
-            const formatTime = (v) => {{
-              if (!v || !v.includes(":")) return v || "—";
-              const [h, m] = v.split(":");
-              const hr = parseInt(h, 10);
-              const suffix = hr >= 12 ? "PM" : "AM";
-              const hour12 = ((hr + 11) % 12) + 1;
-              return `${{hour12}}:${{m}} ${{suffix}}`;
-            }};
-
-            const syncNight = () => {{
-              const on = nmToggle.checked;
-              nightFields.forEach(el => el.disabled = !on);
-              const action = nmAction.value === "off" ? "Turn off" : "Dim to " + (document.querySelector('input[name="nm_dim"]').value || "20");
-              nightStatus.textContent = on
-                ? `${{formatTime(startEl.value)}} → ${{formatTime(endEl.value)}} · ${{action}}`
-                : "Disabled";
-            }};
-
-            const syncPulseColorValue = () => {{
-              if (!pulseColorInput) return;
-              const value = (pulseColorInput.value || "").toUpperCase();
-              if (pulseColorValue) pulseColorValue.textContent = value;
-              if (pulseColorSwatch) pulseColorSwatch.style.background = value;
-            }};
-            if (pulseColorInput) pulseColorInput.addEventListener("input", syncPulseColorValue);
-            nmToggle.addEventListener("change", syncNight);
-            nightFields.forEach(el => el.addEventListener("input", syncNight));
-            syncNight();
-
-            const animationTag = document.getElementById("animationTag");
-            const syncAnimationTag = () => {{
-              if (animationTag) animationTag.textContent = "Mode: " + (anName.options[anName.selectedIndex]?.textContent || anName.value);
-            }};
-            anName.addEventListener("change", syncAnimationTag);
-            syncAnimationTag();
-
-            const syncPulseVisibility = () => {{
-              const isPulse = anName.value === "pulse";
-              if (pulseColorField) pulseColorField.classList.toggle("hidden", !isPulse);
-              if (pulseColorNote) pulseColorNote.classList.toggle("hidden", !isPulse);
-            }};
-            anName.addEventListener("change", syncPulseVisibility);
-            syncPulseVisibility();
-            syncPulseColorValue();
-
-            const formatAge = (seconds) => {{
-              if (seconds === null || seconds === undefined || Number.isNaN(Number(seconds))) return "--";
-              const s = Math.max(0, Math.round(Number(seconds)));
-              if (s < 60) return s + "s";
-              const m = Math.floor(s / 60);
-              const rem = s % 60;
-              if (m < 60) return rem ? `${{m}}m ${{rem}}s` : `${{m}}m`;
-              const h = Math.floor(m / 60);
-              const mins = m % 60;
-              return mins ? `${{h}}h ${{mins}}m` : `${{h}}h`;
-            }};
-
-            const syncBoardStatus = async () => {{
-              try {{
-                const resp = await fetch("/board_status?board_id={board_id}", {{ cache: "no-store" }});
-                if (!resp.ok) throw new Error("status " + resp.status);
-                const data = await resp.json();
-                const payloadAge = data.last_payload_age_seconds;
-                if (lastPayloadAge) lastPayloadAge.textContent = formatAge(payloadAge);
-                if (lastPayloadAt) {{
-                  lastPayloadAt.textContent = data.last_payload_at
-                    ? new Date(data.last_payload_at).toLocaleString()
-                    : "No board check-in yet";
-                }}
-                if (feedAge) feedAge.textContent = formatAge(data.feed_age_seconds);
-                if (settingsVersion) settingsVersion.textContent = data.settings_version ?? "--";
-                if (boardSyncTag) {{
-                  boardSyncTag.textContent = payloadAge === null || payloadAge === undefined
-                    ? "No check-in"
-                    : "Updated " + formatAge(payloadAge) + " ago";
-                }}
-              }} catch (err) {{
-                if (boardSyncTag) boardSyncTag.textContent = "Status unavailable";
-              }}
-            }};
-            syncBoardStatus();
-            window.setInterval(syncBoardStatus, 5000);
-
-          }})();
-        </script>
-      </body>
-    </html>
-    """
-
+    return _render_board_settings_console(board_id, cfg)
 
 @app.post("/board/{board_id}")
 async def board_settings_save(
@@ -2154,11 +2443,15 @@ async def board_settings_save(
     an_name: str = Form("pulse"),
     an_speed: int = Form(120),
     an_color: str = Form("#FF5000"),
+    test_states_json: str = Form("{}"),
+    ota_enabled: T.Optional[str] = Form(None),
+    ota_target_version: str = Form(""),
+    ota_filename: str = Form(""),
 ):
     board_id = _normalize_board_id(board_id)
     cfg = _get_or_create_board(board_id)
 
-    mode = mode if mode in ("live", "animation") else "live"
+    mode = mode if mode in ("live", "animation", "test") else "live"
     brightness = max(0, min(150, brightness))
     nm_dim = max(0, min(255, nm_dim))
 
@@ -2179,8 +2472,23 @@ async def board_settings_save(
     }
     cfg["animation"] = {
         "name": an_name,
-        "speed": an_speed,
+        "speed": max(20, min(5000, int(an_speed))),
         "color": _parse_hex_color(an_color),
+    }
+    cfg["test_mode"] = {
+        "states": _sanitize_test_states(test_states_json),
+        "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    safe_ota_filename = _safe_firmware_filename(ota_filename)
+    if ota_filename and not safe_ota_filename:
+        safe_ota_filename = ""
+    target_version = str(ota_target_version or "").strip()[:40]
+    if safe_ota_filename and not target_version:
+        target_version = _firmware_manifest_config()[0]
+    cfg["ota"] = {
+        "enabled": bool(ota_enabled),
+        "target_version": target_version,
+        "filename": safe_ota_filename,
     }
 
     BOARD_SETTINGS[board_id] = cfg
@@ -2282,35 +2590,67 @@ def board_status_api(board_id: str = Query(...)):
     return _as_no_store(JSONResponse(_board_status_snapshot(board_id)))
 
 
+@app.get("/board_layout")
+def board_layout_api():
+    return _as_no_store(JSONResponse(_board_layout_model()))
+
+
+@app.get("/firmware_options")
+def firmware_options_api(board_id: str = Query(...)):
+    board_id = _normalize_board_id(board_id)
+    if not board_id:
+        return _as_no_store(JSONResponse({"error": "missing board_id"}, status_code=400))
+    try:
+        cfg = _get_or_create_board(board_id)
+    except ValueError:
+        return _as_no_store(JSONResponse({"error": "invalid board_id"}, status_code=400))
+    global_manifest = dict(_firmware_metadata())
+    global_manifest.pop("path", None)
+    return _as_no_store(JSONResponse({
+        "files": _available_firmware_files(),
+        "current_target": cfg.get("ota", {}) or {},
+        "global_manifest": global_manifest,
+    }))
+
+
 @app.get("/firmware_manifest")
 def firmware_manifest_api(
     request: Request,
     board_id: str = Query(...),
     current: T.Optional[str] = Query(None),
+    build: T.Optional[str] = Query(None),
 ):
     board_id = _normalize_board_id(board_id)
     if not board_id:
         return _as_no_store(JSONResponse({"error": "missing board_id"}, status_code=400))
     try:
-        _get_or_create_board(board_id)
+        cfg = _get_or_create_board(board_id)
     except ValueError:
         return _as_no_store(JSONResponse({"error": "invalid board_id"}, status_code=400))
 
-    meta = _firmware_metadata()
+    _record_board_firmware_status(board_id, current=current, build=build, manifest_check=True)
+
+    meta = _active_firmware_metadata_for_board(cfg)
     current_version = (current or "").strip()
     update_available = bool(meta.get("available")) and current_version != meta.get("version")
+    ota_cfg = cfg.get("ota", {}) or {}
 
     payload = {
-        "ota_enabled": FIRMWARE_OTA_ENABLED,
+        "ota_enabled": FIRMWARE_OTA_ENABLED and bool(ota_cfg.get("enabled", True)),
         "update_available": update_available,
         "current": current_version,
         "version": meta.get("version"),
         "reason": None if meta.get("available") else meta.get("reason"),
+        "deployment": {
+            "filename": ota_cfg.get("filename") or "",
+            "target_version": ota_cfg.get("target_version") or "",
+        },
     }
 
     if meta.get("available"):
         encoded_board = quote(board_id, safe="")
         encoded_version = quote(str(meta["version"]), safe="")
+        encoded_filename = quote(str(meta["filename"]), safe="")
         payload.update({
             "filename": meta["filename"],
             "size": meta["size"],
@@ -2319,6 +2659,7 @@ def firmware_manifest_api(
             "url": (
                 f"{_public_base_url(request)}/firmware.bin"
                 f"?board_id={encoded_board}&version={encoded_version}"
+                f"&filename={encoded_filename}"
             ),
         })
 
@@ -2329,16 +2670,20 @@ def firmware_manifest_api(
 def firmware_binary_api(
     board_id: str = Query(...),
     version: T.Optional[str] = Query(None),
+    filename: T.Optional[str] = Query(None),
 ):
     board_id = _normalize_board_id(board_id)
     if not board_id:
         return JSONResponse({"error": "missing board_id"}, status_code=400)
     try:
-        _get_or_create_board(board_id)
+        cfg = _get_or_create_board(board_id)
     except ValueError:
         return JSONResponse({"error": "invalid board_id"}, status_code=400)
 
-    meta = _firmware_metadata()
+    if filename:
+        meta = _firmware_metadata_for_filename(filename, version or "")
+    else:
+        meta = _active_firmware_metadata_for_board(cfg)
     if not meta.get("available"):
         return JSONResponse({"error": "firmware_unavailable", "reason": meta.get("reason")}, status_code=404)
     if version and version.strip() != meta.get("version"):
@@ -2358,11 +2703,54 @@ def firmware_binary_api(
     )
 
 
+def _sanitize_test_states(raw: T.Any) -> dict[str, int]:
+    if isinstance(raw, str):
+        if len(raw) > 20000:
+            return {}
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return {}
+    if not isinstance(raw, dict):
+        return {}
+
+    valid_keys = set(STATION_INDEX.keys()) | _board_layout_keys()
+    out: dict[str, int] = {}
+    for key, value in raw.items():
+        if len(out) >= 600:
+            break
+        key = str(key).strip()
+        if key not in valid_keys:
+            continue
+        try:
+            state = int(value)
+        except Exception:
+            continue
+        out[key] = max(0, min(3, state))
+    return out
+
+def _calculate_test_states_for_subset(cfg: dict, subset: dict[str, dict]) -> dict[str, int]:
+    states = ((cfg.get("test_mode") or {}).get("states") or {})
+    return {key: max(0, min(3, int(states.get(key, 0) or 0))) for key in subset.keys()}
+
 def _station_subset(only: T.Optional[str]) -> dict[str, dict]:
     subset = STATION_INDEX
     if only:
         wanted = [x.strip() for x in only.split(",") if x.strip()]
-        subset = {n: STATION_INDEX[n] for n in wanted if n in STATION_INDEX}
+        layout_keys = _board_layout_keys()
+        subset = {}
+        for n in wanted:
+            if n in STATION_INDEX:
+                subset[n] = STATION_INDEX[n]
+            elif n in layout_keys:
+                route_short = "M" if n.endswith("M") else n[-1:]
+                subset[n] = {
+                    "name": n,
+                    "stop_id": None,
+                    "lat": 0.0,
+                    "lon": 0.0,
+                    "route_short": route_short,
+                }
     return subset
 
 
@@ -2465,15 +2853,19 @@ def states(
     Returns status for each station.
     If board_id is provided, we require that board to exist in boards.json.
     """
+    cfg = None
     if board_id is not None:
         board_id = _normalize_board_id(board_id)
         if not board_id or board_id not in BOARD_SETTINGS:
             return JSONResponse({"error": "unknown board_id"}, status_code=403)
-        # You *could* read mode here and e.g. short-circuit if mode=="animation".
+        cfg = _get_or_create_board(board_id)
 
     subset = _station_subset(only)
     if only and not subset:
         return JSONResponse({})
+
+    if cfg and cfg.get("mode") == "test":
+        return JSONResponse(_calculate_test_states_for_subset(cfg, subset))
 
     return JSONResponse(_calculate_states_for_subset(subset))
 
@@ -2482,6 +2874,8 @@ def states(
 def board_payload(
     board_id: str = Query(..., description="Board ID (5-char code)"),
     only: T.Optional[str] = Query(None, description="Comma-separated station names"),
+    fw: T.Optional[str] = Query(None, description="Firmware version reported by the board"),
+    build: T.Optional[str] = Query(None, description="Firmware build label reported by the board"),
 ):
     board_id = _normalize_board_id(board_id)
     if not board_id:
@@ -2494,9 +2888,14 @@ def board_payload(
     now_ts = time.time()
     previous_seen_at = BOARD_LAST_PAYLOAD_AT.get(board_id)
     BOARD_LAST_PAYLOAD_AT[board_id] = now_ts
+    _record_board_firmware_status(board_id, current=fw, build=build)
 
     subset = _station_subset(only)
-    states_payload = _calculate_states_for_subset(subset)
+    mode = cfg.get("mode", "live")
+    if mode == "test":
+        states_payload = _calculate_test_states_for_subset(cfg, subset)
+    else:
+        states_payload = _calculate_states_for_subset(subset)
 
     base_brightness = int(cfg.get("brightness", 16))
     nm_cfg = cfg.get("night_mode", {}) or {}
@@ -2504,7 +2903,7 @@ def board_payload(
 
     return JSONResponse({
         "board_id": board_id,
-        "mode": cfg.get("mode", "live"),
+        "mode": mode,
         "brightness": base_brightness,
         "brightness_effective": effective_brightness,
         "night_mode": nm_cfg,
