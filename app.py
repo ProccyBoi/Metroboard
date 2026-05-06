@@ -97,6 +97,7 @@ ANIMATION_OPTIONS: tuple[tuple[str, str], ...] = (
 )
 ANIMATION_NAMES = {name for name, _label in ANIMATION_OPTIONS}
 ANIMATION_CUSTOM_COLOR_NAMES = {"pulse", "sparkle", "theater", "solid"}
+BOARD_LAYOUT_VIEWBOX = [0, 0, 861, 850]
 
 # Caching/CORS/logging
 FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
@@ -674,25 +675,25 @@ BOARD_LINE_SPECS = [
                 "end": "Emu Plains",
                 "label_side": -1,
                 "path": [
-                    [595, 55], [595, 135], [650, 190], [725, 275],
-                    [800, 365], [830, 420], [805, 505], [770, 560],
-                    [600, 560], [520, 560], [430, 520], [315, 420],
-                    [245, 395], [80, 395],
+                    [433, 10], [433, 95], [497, 160], [582, 250],
+                    [634, 314], [650, 350], [646, 398], [618, 428],
+                    [585, 425], [435, 425], [371, 435], [268, 337],
+                    [215, 327], [73, 337],
                 ],
                 "anchors": {
-                    "Berowra": [595, 55],
-                    "Hornsby": [595, 135],
-                    "Chatswood": [725, 275],
-                    "North Sydney": [800, 365],
-                    "Wynyard": [825, 430],
-                    "Town Hall": [815, 500],
-                    "Central": [790, 540],
-                    "Redfern": [770, 560],
-                    "Strathfield": [600, 560],
-                    "Lidcombe": [520, 560],
-                    "Parramatta": [430, 520],
-                    "Blacktown": [245, 395],
-                    "Emu Plains": [80, 395],
+                    "Berowra": [433, 10],
+                    "Hornsby": [433, 95],
+                    "Chatswood": [582, 250],
+                    "North Sydney": [634, 314],
+                    "Wynyard": [650, 350],
+                    "Town Hall": [642, 394],
+                    "Central": [618, 420],
+                    "Redfern": [585, 425],
+                    "Strathfield": [435, 425],
+                    "Lidcombe": [371, 435],
+                    "Parramatta": [268, 337],
+                    "Blacktown": [215, 327],
+                    "Emu Plains": [73, 337],
                 },
             },
             {
@@ -701,11 +702,11 @@ BOARD_LINE_SPECS = [
                 "end": "Richmond",
                 "label_side": 1,
                 "path": [
-                    [225, 350], [180, 325], [150, 315], [150, 140],
+                    [128, 289], [125, 280], [123, 87],
                 ],
                 "anchors": {
-                    "Marayong": [225, 350],
-                    "Richmond": [150, 140],
+                    "Marayong": [128, 289],
+                    "Richmond": [123, 87],
                 },
             },
         ],
@@ -719,17 +720,17 @@ BOARD_LINE_SPECS = [
                 "array_names": ["T5_SEQ"],
                 "label_side": -1,
                 "path": [
-                    [150, 140], [150, 315], [245, 395], [430, 520],
-                    [370, 560], [330, 620], [330, 735], [80, 770],
+                    [121, 87], [121, 282], [215, 327], [268, 337],
+                    [243, 424], [238, 563], [238, 663], [34, 665],
                 ],
                 "anchors": {
-                    "Richmond": [150, 140],
-                    "Blacktown": [245, 395],
-                    "Parramatta": [430, 520],
-                    "Cabramatta": [330, 590],
-                    "Liverpool": [330, 635],
-                    "Glenfield": [330, 735],
-                    "Leppington": [80, 770],
+                    "Richmond": [121, 87],
+                    "Blacktown": [215, 327],
+                    "Parramatta": [268, 337],
+                    "Cabramatta": [238, 506],
+                    "Liverpool": [238, 563],
+                    "Glenfield": [238, 663],
+                    "Leppington": [34, 665],
                 },
             },
         ],
@@ -743,26 +744,26 @@ BOARD_LINE_SPECS = [
                 "array_names": ["T2_SEG1", "T2_SEG2"],
                 "label_side": 1,
                 "path": [
-                    [80, 770], [330, 735], [330, 635], [330, 590],
-                    [380, 545], [430, 520], [520, 548], [600, 548],
-                    [735, 548], [780, 560], [810, 520], [820, 465],
-                    [865, 430], [900, 500], [860, 565],
+                    [34, 675], [238, 675], [238, 663], [238, 563],
+                    [238, 506], [243, 424], [268, 337], [371, 435],
+                    [435, 435], [585, 425], [615, 412], [640, 392],
+                    [650, 350], [685, 374], [650, 430],
                 ],
                 "anchors": {
-                    "Leppington": [80, 770],
-                    "Glenfield": [330, 735],
-                    "Liverpool": [330, 635],
-                    "Cabramatta": [330, 590],
-                    "Parramatta": [430, 520],
-                    "Lidcombe": [520, 548],
-                    "Strathfield": [600, 548],
-                    "Redfern": [780, 560],
-                    "Central": [800, 535],
-                    "Town Hall": [810, 505],
-                    "Wynyard": [820, 465],
-                    "Circular Quay": [865, 430],
-                    "St James": [900, 500],
-                    "Museum": [860, 565],
+                    "Leppington": [34, 675],
+                    "Glenfield": [238, 663],
+                    "Liverpool": [238, 563],
+                    "Cabramatta": [238, 506],
+                    "Parramatta": [268, 337],
+                    "Lidcombe": [371, 435],
+                    "Strathfield": [435, 435],
+                    "Redfern": [585, 425],
+                    "Central": [615, 412],
+                    "Town Hall": [640, 392],
+                    "Wynyard": [650, 350],
+                    "Circular Quay": [675, 330],
+                    "St James": [685, 374],
+                    "Museum": [650, 430],
                 },
             },
         ],
@@ -776,24 +777,23 @@ BOARD_LINE_SPECS = [
                 "array_names": ["T3_SEQ"],
                 "label_side": -1,
                 "path": [
-                    [330, 635], [330, 590], [435, 600], [490, 595],
-                    [520, 570], [520, 565], [600, 572], [735, 572],
-                    [775, 560], [808, 520], [820, 465], [865, 430],
-                    [900, 500], [860, 565],
+                    [238, 563], [238, 506], [325, 506], [371, 435],
+                    [435, 445], [585, 425], [615, 412], [640, 392],
+                    [650, 350], [675, 330], [685, 374], [650, 430],
                 ],
                 "anchors": {
-                    "Liverpool": [330, 635],
-                    "Cabramatta": [330, 590],
-                    "Regents Park": [490, 595],
-                    "Lidcombe": [520, 565],
-                    "Strathfield": [600, 572],
-                    "Redfern": [775, 560],
-                    "Central": [795, 540],
-                    "Town Hall": [810, 505],
-                    "Wynyard": [820, 465],
-                    "Circular Quay": [865, 430],
-                    "St James": [900, 500],
-                    "Museum": [860, 565],
+                    "Liverpool": [238, 563],
+                    "Cabramatta": [238, 506],
+                    "Regents Park": [325, 506],
+                    "Lidcombe": [371, 435],
+                    "Strathfield": [435, 445],
+                    "Redfern": [585, 425],
+                    "Central": [615, 412],
+                    "Town Hall": [640, 392],
+                    "Wynyard": [650, 350],
+                    "Circular Quay": [675, 330],
+                    "St James": [685, 374],
+                    "Museum": [650, 430],
                 },
             },
         ],
@@ -808,10 +808,10 @@ BOARD_LINE_SPECS = [
                 "start": "Waterfall",
                 "end": "Loftus",
                 "label_side": 1,
-                "path": [[780, 970], [780, 890]],
+                "path": [[583, 842], [583, 782]],
                 "anchors": {
-                    "Waterfall": [780, 970],
-                    "Loftus": [780, 890],
+                    "Waterfall": [583, 842],
+                    "Loftus": [583, 782],
                 },
             },
             {
@@ -820,21 +820,21 @@ BOARD_LINE_SPECS = [
                 "end": "Bondi Junction",
                 "label_side": -1,
                 "path": [
-                    [1010, 850], [900, 850], [780, 835], [780, 675],
-                    [760, 610], [775, 575], [805, 540], [835, 510],
-                    [1010, 485],
+                    [743, 773], [640, 773], [583, 766], [583, 625],
+                    [583, 500], [585, 425], [615, 412], [650, 390],
+                    [770, 354],
                 ],
                 "anchors": {
-                    "Cronulla": [1010, 850],
-                    "Sutherland": [780, 835],
-                    "Hurstville": [780, 675],
-                    "Wolli Creek": [760, 610],
-                    "Sydenham": [775, 585],
-                    "Redfern": [775, 565],
-                    "Central": [805, 540],
-                    "Town Hall": [830, 515],
-                    "Martin Place": [865, 500],
-                    "Bondi Junction": [1010, 485],
+                    "Cronulla": [743, 773],
+                    "Sutherland": [583, 766],
+                    "Hurstville": [583, 625],
+                    "Wolli Creek": [583, 500],
+                    "Sydenham": [583, 475],
+                    "Redfern": [585, 425],
+                    "Central": [615, 412],
+                    "Town Hall": [642, 392],
+                    "Martin Place": [670, 385],
+                    "Bondi Junction": [770, 354],
                 },
             },
         ],
@@ -847,11 +847,11 @@ BOARD_LINE_SPECS = [
             {
                 "array_names": ["T6_SEQ"],
                 "label_side": 1,
-                "path": [[575, 705], [490, 595], [520, 565]],
+                "path": [[382, 556], [325, 506], [371, 435]],
                 "anchors": {
-                    "Bankstown": [575, 705],
-                    "Regents Park": [490, 595],
-                    "Lidcombe": [520, 565],
+                    "Bankstown": [382, 556],
+                    "Regents Park": [325, 506],
+                    "Lidcombe": [371, 435],
                 },
             },
         ],
@@ -864,10 +864,10 @@ BOARD_LINE_SPECS = [
             {
                 "array_names": ["T7_SEQ"],
                 "label_side": -1,
-                "path": [[520, 565], [520, 430]],
+                "path": [[371, 435], [371, 354]],
                 "anchors": {
-                    "Lidcombe": [520, 565],
-                    "Olympic Park": [520, 430],
+                    "Lidcombe": [371, 435],
+                    "Olympic Park": [371, 354],
                 },
             },
         ],
@@ -881,27 +881,27 @@ BOARD_LINE_SPECS = [
                 "array_names": ["T8_SEQ"],
                 "label_side": 1,
                 "path": [
-                    [330, 970], [330, 735], [500, 735], [640, 700],
-                    [735, 620], [770, 590], [750, 565], [785, 630],
-                    [850, 615], [875, 550], [835, 515], [820, 465],
-                    [865, 430], [900, 500], [860, 565],
+                    [258, 805], [258, 742], [238, 663], [455, 624],
+                    [582, 500], [582, 475], [600, 430], [610, 500],
+                    [653, 515], [652, 456], [630, 410], [650, 350],
+                    [675, 330], [685, 374], [650, 430],
                 ],
                 "anchors": {
-                    "Macarthur": [330, 970],
-                    "Campbelltown": [330, 900],
-                    "Glenfield": [330, 735],
-                    "Revesby": [585, 715],
-                    "Sydenham": [770, 590],
-                    "Redfern": [750, 565],
-                    "Wolli Creek": [785, 630],
-                    "Domestic Airport": [850, 615],
-                    "Green Square": [875, 550],
-                    "Central": [835, 515],
-                    "Town Hall": [820, 490],
-                    "Wynyard": [820, 465],
-                    "Circular Quay": [865, 430],
-                    "St James": [900, 500],
-                    "Museum": [860, 565],
+                    "Macarthur": [258, 805],
+                    "Campbelltown": [258, 742],
+                    "Glenfield": [238, 663],
+                    "Revesby": [455, 624],
+                    "Sydenham": [582, 475],
+                    "Redfern": [600, 430],
+                    "Wolli Creek": [610, 500],
+                    "Domestic Airport": [653, 515],
+                    "Green Square": [652, 456],
+                    "Central": [630, 410],
+                    "Town Hall": [640, 392],
+                    "Wynyard": [650, 350],
+                    "Circular Quay": [675, 330],
+                    "St James": [685, 374],
+                    "Museum": [650, 430],
                 },
             },
         ],
@@ -915,21 +915,21 @@ BOARD_LINE_SPECS = [
                 "array_names": ["T9_SEQ"],
                 "label_side": 1,
                 "path": [
-                    [590, 135], [590, 285], [590, 545], [600, 548],
-                    [735, 548], [790, 530], [820, 470], [830, 420],
-                    [800, 365], [725, 285], [660, 220], [610, 170],
+                    [433, 95], [433, 205], [433, 385], [435, 425],
+                    [585, 425], [615, 412], [640, 392], [650, 350],
+                    [634, 314], [582, 250], [520, 178],
                 ],
                 "anchors": {
-                    "Hornsby": [590, 135],
-                    "Epping": [590, 285],
-                    "Strathfield": [590, 545],
-                    "Redfern": [790, 530],
-                    "Central": [805, 510],
-                    "Town Hall": [815, 485],
-                    "Wynyard": [820, 465],
-                    "North Sydney": [800, 365],
-                    "Chatswood": [725, 285],
-                    "Gordon": [610, 170],
+                    "Hornsby": [433, 95],
+                    "Epping": [433, 205],
+                    "Strathfield": [433, 385],
+                    "Redfern": [585, 425],
+                    "Central": [615, 412],
+                    "Town Hall": [640, 392],
+                    "Wynyard": [650, 350],
+                    "North Sydney": [634, 314],
+                    "Chatswood": [582, 250],
+                    "Gordon": [520, 178],
                 },
             },
         ],
@@ -943,20 +943,20 @@ BOARD_LINE_SPECS = [
                 "array_names": ["M1_SEQ"],
                 "label_side": -1,
                 "path": [
-                    [190, 250], [430, 250], [590, 285], [650, 330],
-                    [725, 360], [800, 420], [850, 490], [810, 540],
-                    [760, 590], [700, 635], [575, 705],
+                    [178, 210], [433, 210], [520, 238], [582, 250],
+                    [615, 314], [625, 365], [675, 390], [665, 410],
+                    [615, 412], [640, 456], [583, 475], [382, 556],
                 ],
                 "anchors": {
-                    "Tallawong": [190, 250],
-                    "Epping": [590, 285],
-                    "Chatswood": [725, 360],
-                    "Barangaroo": [815, 430],
-                    "Martin Place": [850, 490],
-                    "Gadigal": [835, 515],
-                    "Central": [810, 540],
-                    "Sydenham": [760, 590],
-                    "Bankstown": [575, 705],
+                    "Tallawong": [178, 210],
+                    "Epping": [433, 210],
+                    "Chatswood": [582, 250],
+                    "Barangaroo": [625, 365],
+                    "Martin Place": [675, 390],
+                    "Gadigal": [665, 410],
+                    "Central": [615, 412],
+                    "Sydenham": [583, 475],
+                    "Bankstown": [382, 556],
                 },
             },
         ],
@@ -1199,7 +1199,7 @@ def _board_layout_model() -> dict:
             "stations": stations,
         })
     return {
-        "viewBox": [0, 0, 1120, 1040],
+        "viewBox": BOARD_LAYOUT_VIEWBOX,
         "title": "Sydney Rail Network",
         "backgroundImage": _board_overlay_url(),
         "lines": lines,
@@ -2441,7 +2441,8 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
       .board-shell { background:#07090d; border:1px solid #303946; border-radius:8px; overflow:hidden; min-height:520px; }
       .board-shell.has-artwork .network-title { display:none; }
       .board-shell.has-artwork .line-path { opacity:.14; }
-      #boardSvg { display:block; width:100%; aspect-ratio:1120/1040; min-height:520px; }
+      .board-shell.has-artwork .line-badge,.board-shell.has-artwork .line-badge-text { display:none; }
+      #boardSvg { display:block; width:100%; aspect-ratio:861/850; min-height:520px; }
       .board-artwork { pointer-events:none; opacity:.88; }
       body.artwork-off .board-artwork { display:none; }
       .network-title { fill:#d7dee7; font-size:46px; font-weight:750; letter-spacing:0; }
@@ -2511,7 +2512,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         <section class="card">
           <div class="section-head"><h3>Board Simulator</h3><span class="tag" id="simStateTag">Loading layout</span></div>
           <div class="layout-grid">
-            <div class="board-shell"><svg id="boardSvg" viewBox="0 0 1120 1040" role="img" aria-label="Metroboard simulator"></svg></div>
+            <div class="board-shell"><svg id="boardSvg" viewBox="0 0 861 850" role="img" aria-label="Metroboard simulator"></svg></div>
             <div class="sim-side">
               <h4>Test Lights</h4>
               <p class="muted">Select Test lights mode, then click stations or use line controls. Save settings to apply to the physical board.</p>
@@ -2703,7 +2704,8 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           svg.innerHTML = "";
           nodeByKey.clear();
           stationKeys = [];
-          const viewBox = model.viewBox || [0, 0, 1120, 1040];
+          const viewBox = model.viewBox || [0, 0, 861, 850];
+          svg.style.aspectRatio = `${viewBox[2]} / ${viewBox[3]}`;
           const shell = svg.closest(".board-shell");
           const hasArtwork = Boolean(model.backgroundImage);
           shell?.classList.toggle("has-artwork", hasArtwork);
@@ -2711,6 +2713,10 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
             artworkToggle.disabled = !hasArtwork;
             artworkToggle.checked = hasArtwork;
             document.body.classList.toggle("artwork-off", !hasArtwork);
+          }
+          if (labelToggle && hasArtwork) {
+            labelToggle.checked = false;
+            document.body.classList.add("labels-off");
           }
           if (artworkStatus) artworkStatus.textContent = hasArtwork ? "Using configured overlay image." : "No overlay image configured.";
           svg.setAttribute("viewBox", viewBox.join(" "));
