@@ -614,19 +614,41 @@ BOARD_LINE_SPECS = [
                 "array_names": ["T1_SEQ"],
                 "start": "Berowra",
                 "end": "Emu Plains",
+                "label_side": -1,
                 "path": [
-                    [700, 90], [700, 145], [760, 210], [820, 315],
-                    [850, 400], [790, 515], [610, 520], [500, 520],
-                    [370, 470], [265, 385], [95, 385],
+                    [595, 55], [595, 135], [650, 190], [725, 275],
+                    [800, 365], [830, 420], [805, 505], [770, 560],
+                    [600, 560], [520, 560], [430, 520], [315, 420],
+                    [245, 395], [80, 395],
                 ],
+                "anchors": {
+                    "Berowra": [595, 55],
+                    "Hornsby": [595, 135],
+                    "Chatswood": [725, 275],
+                    "North Sydney": [800, 365],
+                    "Wynyard": [825, 430],
+                    "Town Hall": [815, 500],
+                    "Central": [790, 540],
+                    "Redfern": [770, 560],
+                    "Strathfield": [600, 560],
+                    "Lidcombe": [520, 560],
+                    "Parramatta": [430, 520],
+                    "Blacktown": [245, 395],
+                    "Emu Plains": [80, 395],
+                },
             },
             {
                 "array_names": ["T1_SEQ"],
                 "start": "Marayong",
                 "end": "Richmond",
+                "label_side": 1,
                 "path": [
-                    [255, 345], [195, 310], [115, 300], [115, 140],
+                    [225, 350], [180, 325], [150, 315], [150, 140],
                 ],
+                "anchors": {
+                    "Marayong": [225, 350],
+                    "Richmond": [150, 140],
+                },
             },
         ],
     },
@@ -637,10 +659,20 @@ BOARD_LINE_SPECS = [
         "segments": [
             {
                 "array_names": ["T5_SEQ"],
+                "label_side": -1,
                 "path": [
-                    [105, 140], [105, 300], [240, 360], [360, 470],
-                    [315, 590], [255, 690], [75, 750],
+                    [150, 140], [150, 315], [245, 395], [430, 520],
+                    [370, 560], [330, 620], [330, 735], [80, 770],
                 ],
+                "anchors": {
+                    "Richmond": [150, 140],
+                    "Blacktown": [245, 395],
+                    "Parramatta": [430, 520],
+                    "Cabramatta": [330, 590],
+                    "Liverpool": [330, 635],
+                    "Glenfield": [330, 735],
+                    "Leppington": [80, 770],
+                },
             },
         ],
     },
@@ -651,11 +683,29 @@ BOARD_LINE_SPECS = [
         "segments": [
             {
                 "array_names": ["T2_SEG1", "T2_SEG2"],
+                "label_side": 1,
                 "path": [
-                    [75, 750], [255, 690], [315, 590], [360, 520],
-                    [430, 485], [500, 520], [610, 520], [735, 520],
-                    [815, 500], [865, 450],
+                    [80, 770], [330, 735], [330, 635], [330, 590],
+                    [380, 545], [430, 520], [520, 548], [600, 548],
+                    [735, 548], [780, 560], [810, 520], [820, 465],
+                    [865, 430], [900, 500], [860, 565],
                 ],
+                "anchors": {
+                    "Leppington": [80, 770],
+                    "Glenfield": [330, 735],
+                    "Liverpool": [330, 635],
+                    "Cabramatta": [330, 590],
+                    "Parramatta": [430, 520],
+                    "Lidcombe": [520, 548],
+                    "Strathfield": [600, 548],
+                    "Redfern": [780, 560],
+                    "Central": [800, 535],
+                    "Town Hall": [810, 505],
+                    "Wynyard": [820, 465],
+                    "Circular Quay": [865, 430],
+                    "St James": [900, 500],
+                    "Museum": [860, 565],
+                },
             },
         ],
     },
@@ -666,11 +716,27 @@ BOARD_LINE_SPECS = [
         "segments": [
             {
                 "array_names": ["T3_SEQ"],
+                "label_side": -1,
                 "path": [
-                    [315, 590], [415, 610], [545, 650], [565, 600],
-                    [520, 545], [500, 520], [610, 520], [735, 520],
-                    [815, 500], [865, 450],
+                    [330, 635], [330, 590], [435, 600], [490, 595],
+                    [520, 570], [520, 565], [600, 572], [735, 572],
+                    [775, 560], [808, 520], [820, 465], [865, 430],
+                    [900, 500], [860, 565],
                 ],
+                "anchors": {
+                    "Liverpool": [330, 635],
+                    "Cabramatta": [330, 590],
+                    "Regents Park": [490, 595],
+                    "Lidcombe": [520, 565],
+                    "Strathfield": [600, 572],
+                    "Redfern": [775, 560],
+                    "Central": [795, 540],
+                    "Town Hall": [810, 505],
+                    "Wynyard": [820, 465],
+                    "Circular Quay": [865, 430],
+                    "St James": [900, 500],
+                    "Museum": [860, 565],
+                },
             },
         ],
     },
@@ -683,16 +749,35 @@ BOARD_LINE_SPECS = [
                 "array_names": ["T4_SEQ"],
                 "start": "Waterfall",
                 "end": "Loftus",
-                "path": [[795, 855], [795, 760], [795, 705]],
+                "label_side": 1,
+                "path": [[780, 970], [780, 890]],
+                "anchors": {
+                    "Waterfall": [780, 970],
+                    "Loftus": [780, 890],
+                },
             },
             {
                 "array_names": ["T4_SEQ"],
                 "start": "Cronulla",
                 "end": "Bondi Junction",
+                "label_side": -1,
                 "path": [
-                    [1030, 760], [915, 760], [795, 700], [795, 610],
-                    [750, 560], [785, 520], [835, 485], [1005, 455],
+                    [1010, 850], [900, 850], [780, 835], [780, 675],
+                    [760, 610], [775, 575], [805, 540], [835, 510],
+                    [1010, 485],
                 ],
+                "anchors": {
+                    "Cronulla": [1010, 850],
+                    "Sutherland": [780, 835],
+                    "Hurstville": [780, 675],
+                    "Wolli Creek": [760, 610],
+                    "Sydenham": [775, 585],
+                    "Redfern": [775, 565],
+                    "Central": [805, 540],
+                    "Town Hall": [830, 515],
+                    "Martin Place": [865, 500],
+                    "Bondi Junction": [1010, 485],
+                },
             },
         ],
     },
@@ -703,7 +788,13 @@ BOARD_LINE_SPECS = [
         "segments": [
             {
                 "array_names": ["T6_SEQ"],
-                "path": [[565, 650], [545, 615], [520, 570], [500, 520]],
+                "label_side": 1,
+                "path": [[575, 705], [490, 595], [520, 565]],
+                "anchors": {
+                    "Bankstown": [575, 705],
+                    "Regents Park": [490, 595],
+                    "Lidcombe": [520, 565],
+                },
             },
         ],
     },
@@ -714,7 +805,12 @@ BOARD_LINE_SPECS = [
         "segments": [
             {
                 "array_names": ["T7_SEQ"],
-                "path": [[500, 520], [500, 420]],
+                "label_side": -1,
+                "path": [[520, 565], [520, 430]],
+                "anchors": {
+                    "Lidcombe": [520, 565],
+                    "Olympic Park": [520, 430],
+                },
             },
         ],
     },
@@ -725,11 +821,30 @@ BOARD_LINE_SPECS = [
         "segments": [
             {
                 "array_names": ["T8_SEQ"],
+                "label_side": 1,
                 "path": [
-                    [320, 835], [320, 710], [430, 710], [560, 680],
-                    [700, 600], [765, 555], [785, 520], [835, 485],
-                    [865, 450],
+                    [330, 970], [330, 735], [500, 735], [640, 700],
+                    [735, 620], [770, 590], [750, 565], [785, 630],
+                    [850, 615], [875, 550], [835, 515], [820, 465],
+                    [865, 430], [900, 500], [860, 565],
                 ],
+                "anchors": {
+                    "Macarthur": [330, 970],
+                    "Campbelltown": [330, 900],
+                    "Glenfield": [330, 735],
+                    "Revesby": [585, 715],
+                    "Sydenham": [770, 590],
+                    "Redfern": [750, 565],
+                    "Wolli Creek": [785, 630],
+                    "Domestic Airport": [850, 615],
+                    "Green Square": [875, 550],
+                    "Central": [835, 515],
+                    "Town Hall": [820, 490],
+                    "Wynyard": [820, 465],
+                    "Circular Quay": [865, 430],
+                    "St James": [900, 500],
+                    "Museum": [860, 565],
+                },
             },
         ],
     },
@@ -740,11 +855,24 @@ BOARD_LINE_SPECS = [
         "segments": [
             {
                 "array_names": ["T9_SEQ"],
+                "label_side": 1,
                 "path": [
-                    [650, 145], [580, 280], [590, 420], [610, 520],
-                    [735, 520], [820, 480], [855, 390], [800, 300],
-                    [720, 230],
+                    [590, 135], [590, 285], [590, 545], [600, 548],
+                    [735, 548], [790, 530], [820, 470], [830, 420],
+                    [800, 365], [725, 285], [660, 220], [610, 170],
                 ],
+                "anchors": {
+                    "Hornsby": [590, 135],
+                    "Epping": [590, 285],
+                    "Strathfield": [590, 545],
+                    "Redfern": [790, 530],
+                    "Central": [805, 510],
+                    "Town Hall": [815, 485],
+                    "Wynyard": [820, 465],
+                    "North Sydney": [800, 365],
+                    "Chatswood": [725, 285],
+                    "Gordon": [610, 170],
+                },
             },
         ],
     },
@@ -755,11 +883,23 @@ BOARD_LINE_SPECS = [
         "segments": [
             {
                 "array_names": ["M1_SEQ"],
+                "label_side": -1,
                 "path": [
-                    [170, 260], [450, 260], [560, 280], [650, 310],
-                    [735, 470], [760, 520], [720, 570], [600, 650],
-                    [565, 650],
+                    [190, 250], [430, 250], [590, 285], [650, 330],
+                    [725, 360], [800, 420], [850, 490], [810, 540],
+                    [760, 590], [700, 635], [575, 705],
                 ],
+                "anchors": {
+                    "Tallawong": [190, 250],
+                    "Epping": [590, 285],
+                    "Chatswood": [725, 360],
+                    "Barangaroo": [815, 430],
+                    "Martin Place": [850, 490],
+                    "Gadigal": [835, 515],
+                    "Central": [810, 540],
+                    "Sydenham": [760, 590],
+                    "Bankstown": [575, 705],
+                },
             },
         ],
     },
@@ -849,22 +989,83 @@ def _layout_points_for_names(names: list[str], path: list[list[float]]) -> list[
         return [_point_at_distance(path, 0.0) for _ in names]
     return [_point_at_distance(path, total * idx / (len(names) - 1)) for idx in range(len(names))]
 
-def _layout_positions_for_names(names: list[str], path: list[list[float]]) -> list[dict[str, float]]:
+def _path_length(points: list[list[float]]) -> float:
+    return sum(
+        math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))
+        for a, b in zip(points, points[1:])
+    )
+
+def _distance_on_path_for_point(points: list[list[float]], point: list[float]) -> float:
+    if not points:
+        return 0.0
+    if len(points) == 1:
+        return 0.0
+
+    px, py = float(point[0]), float(point[1])
+    walked = 0.0
+    best_dist = float("inf")
+    best_walked = 0.0
+    for a, b in zip(points, points[1:]):
+        ax, ay = float(a[0]), float(a[1])
+        bx, by = float(b[0]), float(b[1])
+        vx, vy = bx - ax, by - ay
+        seg_len_sq = vx * vx + vy * vy
+        if seg_len_sq <= 0:
+            continue
+        t = ((px - ax) * vx + (py - ay) * vy) / seg_len_sq
+        t = max(0.0, min(1.0, t))
+        cx, cy = ax + vx * t, ay + vy * t
+        dist = math.hypot(px - cx, py - cy)
+        if dist < best_dist:
+            best_dist = dist
+            best_walked = walked + math.sqrt(seg_len_sq) * t
+        walked += math.sqrt(seg_len_sq)
+    return best_walked
+
+def _layout_positions_for_names(
+    names: list[str],
+    path: list[list[float]],
+    anchors: T.Optional[dict[str, list[float]]] = None,
+) -> list[dict[str, float]]:
     if not names:
         return []
     if len(names) == 1:
         x, y, angle = _point_angle_at_distance(path, 0.0)
         return [{"x": x, "y": y, "angle": angle}]
-    distances = [
-        math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))
-        for a, b in zip(path, path[1:])
-    ]
-    total = sum(distances)
+    total = _path_length(path)
     if total <= 0:
         return [
             {"x": _point_at_distance(path, 0.0)[0], "y": _point_at_distance(path, 0.0)[1], "angle": 0.0}
             for _ in names
         ]
+
+    anchor_points: dict[int, float] = {}
+    if anchors:
+        for name, point in anchors.items():
+            if name in names:
+                anchor_points[names.index(name)] = _distance_on_path_for_point(path, point)
+    anchor_points.setdefault(0, 0.0)
+    anchor_points.setdefault(len(names) - 1, total)
+
+    if len(anchor_points) > 2:
+        out = [None] * len(names)
+        ordered = sorted(anchor_points.items())
+        for (left_idx, left_dist), (right_idx, right_dist) in zip(ordered, ordered[1:]):
+            span = right_idx - left_idx
+            if span <= 0:
+                continue
+            for idx in range(left_idx, right_idx + 1):
+                if out[idx] is not None:
+                    continue
+                t = (idx - left_idx) / span
+                dist = left_dist + (right_dist - left_dist) * t
+                x, y, angle = _point_angle_at_distance(path, dist)
+                out[idx] = {"x": x, "y": y, "angle": angle}
+        return [
+            item if item is not None else {"x": _point_at_distance(path, 0.0)[0], "y": _point_at_distance(path, 0.0)[1], "angle": 0.0}
+            for item in out
+        ]
+
     out = []
     for idx in range(len(names)):
         x, y, angle = _point_angle_at_distance(path, total * idx / (len(names) - 1))
@@ -914,7 +1115,7 @@ def _board_layout_model() -> dict:
             if not names or not path:
                 continue
             paths.append(path)
-            positions = _layout_positions_for_names(names, path)
+            positions = _layout_positions_for_names(names, path, segment.get("anchors"))
             side = -1.0 if segment.get("label_side", -1) < 0 else 1.0
             for name, pos in zip(names, positions):
                 angle = float(pos["angle"])
@@ -940,7 +1141,7 @@ def _board_layout_model() -> dict:
             "stations": stations,
         })
     return {
-        "viewBox": [0, 0, 1120, 900],
+        "viewBox": [0, 0, 1120, 1040],
         "title": "Sydney Rail Network",
         "lines": lines,
     }
@@ -2170,8 +2371,8 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
       .status-value { margin-top:6px; font-size:19px; font-weight:750; }
       .status-sub { margin-top:4px; color:var(--muted); font-size:13px; }
       .layout-grid { display:grid; grid-template-columns:minmax(0,1fr) 270px; gap:14px; }
-      .board-shell { background:#07090d; border:1px solid #303946; border-radius:8px; overflow:hidden; min-height:420px; }
-      #boardSvg { display:block; width:100%; aspect-ratio:1120/900; min-height:420px; }
+      .board-shell { background:#07090d; border:1px solid #303946; border-radius:8px; overflow:hidden; min-height:520px; }
+      #boardSvg { display:block; width:100%; aspect-ratio:1120/1040; min-height:520px; }
       .network-title { fill:#d7dee7; font-size:46px; font-weight:750; letter-spacing:0; }
       .line-path { fill:none; stroke-width:5; stroke-linecap:round; stroke-linejoin:round; opacity:.42; }
       .station-node { fill:#2a2f38; stroke:#a9b4c1; stroke-width:2; cursor:default; transition:opacity 120ms ease, fill 120ms ease, r 120ms ease; }
@@ -2239,7 +2440,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         <section class="card">
           <div class="section-head"><h3>Board Simulator</h3><span class="tag" id="simStateTag">Loading layout</span></div>
           <div class="layout-grid">
-            <div class="board-shell"><svg id="boardSvg" viewBox="0 0 1120 900" role="img" aria-label="Metroboard simulator"></svg></div>
+            <div class="board-shell"><svg id="boardSvg" viewBox="0 0 1120 1040" role="img" aria-label="Metroboard simulator"></svg></div>
             <div class="sim-side">
               <h4>Test Lights</h4>
               <p class="muted">Select Test lights mode, then click stations or use line controls. Save settings to apply to the physical board.</p>
@@ -2427,9 +2628,13 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           svg.innerHTML = "";
           nodeByKey.clear();
           stationKeys = [];
+          const viewBox = model.viewBox || [0, 0, 1120, 1040];
+          svg.setAttribute("viewBox", viewBox.join(" "));
           const bg = document.createElementNS(ns, "rect");
-          bg.setAttribute("width", "1120");
-          bg.setAttribute("height", "900");
+          bg.setAttribute("x", viewBox[0]);
+          bg.setAttribute("y", viewBox[1]);
+          bg.setAttribute("width", viewBox[2]);
+          bg.setAttribute("height", viewBox[3]);
           bg.setAttribute("fill", "#07090d");
           svg.appendChild(bg);
           const title = document.createElementNS(ns, "text");
