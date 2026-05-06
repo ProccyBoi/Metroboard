@@ -574,6 +574,36 @@ def _get_or_create_board(board_id: str) -> dict:
 
 _SKETCH_SEQUENCE_CACHE: T.Optional[dict[str, list[str]]] = None
 
+MAJOR_BOARD_LABELS = {
+    "Bankstown",
+    "Blacktown",
+    "Bondi Junction",
+    "Campbelltown",
+    "Central",
+    "Chatswood",
+    "Cronulla",
+    "Epping",
+    "Glenfield",
+    "Hornsby",
+    "Hurstville",
+    "Leppington",
+    "Lidcombe",
+    "Liverpool",
+    "Macarthur",
+    "North Sydney",
+    "Parramatta",
+    "Penrith",
+    "Redfern",
+    "Richmond",
+    "Strathfield",
+    "Sutherland",
+    "Sydenham",
+    "Tallawong",
+    "Town Hall",
+    "Waterfall",
+    "Wynyard",
+}
+
 BOARD_LINE_SPECS = [
     {
         "line": "T1",
@@ -783,6 +813,28 @@ def _point_at_distance(points: list[list[float]], target: float) -> list[float]:
     last = points[-1]
     return [float(last[0]), float(last[1])]
 
+def _point_angle_at_distance(points: list[list[float]], target: float) -> tuple[float, float, float]:
+    if not points:
+        return (0.0, 0.0, 0.0)
+    if len(points) == 1:
+        return (float(points[0][0]), float(points[0][1]), 0.0)
+
+    walked = 0.0
+    last_angle = 0.0
+    for a, b in zip(points, points[1:]):
+        ax, ay = float(a[0]), float(a[1])
+        bx, by = float(b[0]), float(b[1])
+        seg = math.hypot(bx - ax, by - ay)
+        if seg <= 0:
+            continue
+        last_angle = math.degrees(math.atan2(by - ay, bx - ax))
+        if walked + seg >= target:
+            t = (target - walked) / seg
+            return (ax + (bx - ax) * t, ay + (by - ay) * t, last_angle)
+        walked += seg
+    last = points[-1]
+    return (float(last[0]), float(last[1]), last_angle)
+
 def _layout_points_for_names(names: list[str], path: list[list[float]]) -> list[list[float]]:
     if not names:
         return []
@@ -796,6 +848,40 @@ def _layout_points_for_names(names: list[str], path: list[list[float]]) -> list[
     if total <= 0:
         return [_point_at_distance(path, 0.0) for _ in names]
     return [_point_at_distance(path, total * idx / (len(names) - 1)) for idx in range(len(names))]
+
+def _layout_positions_for_names(names: list[str], path: list[list[float]]) -> list[dict[str, float]]:
+    if not names:
+        return []
+    if len(names) == 1:
+        x, y, angle = _point_angle_at_distance(path, 0.0)
+        return [{"x": x, "y": y, "angle": angle}]
+    distances = [
+        math.hypot(float(b[0]) - float(a[0]), float(b[1]) - float(a[1]))
+        for a, b in zip(path, path[1:])
+    ]
+    total = sum(distances)
+    if total <= 0:
+        return [
+            {"x": _point_at_distance(path, 0.0)[0], "y": _point_at_distance(path, 0.0)[1], "angle": 0.0}
+            for _ in names
+        ]
+    out = []
+    for idx in range(len(names)):
+        x, y, angle = _point_angle_at_distance(path, total * idx / (len(names) - 1))
+        out.append({"x": x, "y": y, "angle": angle})
+    return out
+
+def _readable_label_angle(angle: float) -> float:
+    angle = ((angle + 180.0) % 360.0) - 180.0
+    if abs(angle) < 18.0:
+        return -42.0
+    if abs(abs(angle) - 90.0) < 18.0:
+        return 0.0
+    if angle > 90.0:
+        angle -= 180.0
+    elif angle < -90.0:
+        angle += 180.0
+    return angle
 
 def _segment_names(sequences: dict[str, list[str]], segment: dict) -> list[str]:
     names: list[str] = []
@@ -828,13 +914,23 @@ def _board_layout_model() -> dict:
             if not names or not path:
                 continue
             paths.append(path)
-            points = _layout_points_for_names(names, path)
-            for name, point in zip(names, points):
+            positions = _layout_positions_for_names(names, path)
+            side = -1.0 if segment.get("label_side", -1) < 0 else 1.0
+            for name, pos in zip(names, positions):
+                angle = float(pos["angle"])
+                rad = math.radians(angle)
+                label_angle = _readable_label_angle(angle)
+                dx = -math.sin(rad) * side * 11.0
+                dy = math.cos(rad) * side * 11.0
                 stations.append({
                     "name": name,
                     "key": f"{name}{spec['suffix']}",
-                    "x": round(point[0], 2),
-                    "y": round(point[1], 2),
+                    "x": round(pos["x"], 2),
+                    "y": round(pos["y"], 2),
+                    "labelAngle": round(label_angle, 1),
+                    "labelDx": round(dx, 2),
+                    "labelDy": round(dy, 2),
+                    "major": name in MAJOR_BOARD_LABELS,
                 })
         lines.append({
             "line": spec["line"],
@@ -2083,6 +2179,9 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
       .station-node.state-1 { fill:var(--line-color); opacity:.34; }
       .station-node.state-2 { fill:var(--line-color); opacity:.68; }
       .station-node.state-3 { fill:var(--line-color); opacity:1; r:6; filter:drop-shadow(0 0 7px var(--line-color)); }
+      .station-label { fill:#d7e0ea; font-size:8px; pointer-events:none; paint-order:stroke; stroke:#07090d; stroke-width:3px; stroke-linejoin:round; opacity:.84; }
+      .station-label.is-major { fill:#ffffff; font-size:10px; font-weight:750; opacity:.95; }
+      body.labels-off .station-label { display:none; }
       .line-badge { fill:#111820; stroke:#c6d2df; stroke-width:1.5; }
       .line-badge-text { fill:#f4f7fb; font-size:14px; font-weight:800; text-anchor:middle; dominant-baseline:central; }
       .sim-side { border:1px solid var(--border); border-radius:8px; padding:12px; background:var(--panel2); }
@@ -2144,6 +2243,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
             <div class="sim-side">
               <h4>Test Lights</h4>
               <p class="muted">Select Test lights mode, then click stations or use line controls. Save settings to apply to the physical board.</p>
+              <label class="option" style="margin-top:12px;"><input id="labelToggle" type="checkbox" checked /><div><strong>Station labels</strong><p class="muted">Show station names on the simulator.</p></div></label>
               <div class="sim-controls" id="testControls">
                 <button class="control" type="button" data-action="all-off">All off</button>
                 <button class="control" type="button" data-action="all-on">All on</button>
@@ -2237,6 +2337,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         const simStateTag = document.getElementById("simStateTag");
         const testControls = document.getElementById("testControls");
         const testStatesInput = document.getElementById("test_states_json");
+        const labelToggle = document.getElementById("labelToggle");
 
         const currentMode = () => document.querySelector('input[name="mode"]:checked')?.value || "live";
         const syncBrightness = () => brightnessValue.textContent = brightness.value;
@@ -2365,6 +2466,17 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
             svg.appendChild(badgeText);
             line.stations.forEach(station => {
               stationKeys.push(station.key);
+              const label = document.createElementNS(ns, "text");
+              const labelX = Number(station.x) + Number(station.labelDx || 0);
+              const labelY = Number(station.y) + Number(station.labelDy || 0);
+              label.setAttribute("x", labelX);
+              label.setAttribute("y", labelY);
+              label.setAttribute("class", "station-label" + (station.major ? " is-major" : ""));
+              label.setAttribute("text-anchor", "middle");
+              label.setAttribute("dominant-baseline", "central");
+              label.setAttribute("transform", `rotate(${Number(station.labelAngle || 0)} ${labelX} ${labelY})`);
+              label.textContent = station.name;
+              svg.appendChild(label);
               const circle = document.createElementNS(ns, "circle");
               circle.setAttribute("cx", station.x);
               circle.setAttribute("cy", station.y);
@@ -2433,6 +2545,9 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           if (!isTest) refreshSimulatorStates();
         };
         document.querySelectorAll('input[name="mode"]').forEach(el => el.addEventListener("change", syncModeUi));
+        labelToggle.addEventListener("change", () => {
+          document.body.classList.toggle("labels-off", !labelToggle.checked);
+        });
 
         const loadLayout = async () => {
           try {
