@@ -2596,7 +2596,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           <label class="option"><input id="ota_enabled" type="checkbox" name="ota_enabled" __OTA_ENABLED__ /><div><strong>Allow OTA updates for this board</strong><p class="muted">Disable this to hold a board on its current firmware.</p></div></label>
           <div class="two-col" style="margin-top:12px;">
             <label class="field">Firmware binary<select name="ota_filename" id="ota_filename">__FIRMWARE_OPTIONS__</select></label>
-            <label class="field">Target version<input type="text" name="ota_target_version" value="__OTA_TARGET_VERSION__" placeholder="1.4.3" maxlength="40" /></label>
+            <label class="field">Target version<input type="text" name="ota_target_version" value="__OTA_TARGET_VERSION__" placeholder="__GLOBAL_FW_VERSION__" maxlength="40" /></label>
           </div>
           <p class="note">Global manifest: __GLOBAL_FW_TEXT__. Active target for this board: __ACTIVE_FW_TEXT__.</p>
         </section>
@@ -3032,6 +3032,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         "__SETTINGS_VERSION__": str(BOARD_SETTINGS_VERSION),
         "__ACTIVE_FW_TEXT__": html.escape(active_fw_text),
         "__GLOBAL_FW_TEXT__": html.escape(global_fw_text),
+        "__GLOBAL_FW_VERSION__": html.escape(str(global_fw.get("version") or "Global manifest")),
         "__TEST_STATES_JSON__": test_states_json,
         "__TEST_STATES_ATTR__": html.escape(test_states_json, quote=True),
         "__MODE_LIVE_CHECKED__": "checked" if mode == "live" else "",
