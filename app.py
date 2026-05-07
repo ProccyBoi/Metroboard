@@ -74,6 +74,8 @@ FIRMWARE_PATH = os.getenv("FIRMWARE_PATH", os.path.join("firmware", "metroboard_
 FIRMWARE_VERSION = os.getenv("FIRMWARE_VERSION", "").strip()
 FIRMWARE_SKETCH_PATH = os.getenv("FIRMWARE_SKETCH_PATH", "metroboard_public.ino")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+BOARD_OVERLAY_PATH = os.getenv("BOARD_OVERLAY_PATH", os.path.join("assets", "board_overlay.png"))
+BOARD_OVERLAY_URL = os.getenv("BOARD_OVERLAY_URL", "").strip()
 
 # board_id -> settings dict
 BOARD_SETTINGS: dict[str, dict] = {}
@@ -328,6 +330,10 @@ def _board_status_snapshot(board_id: str) -> dict:
         "firmware": {
             "current": fw.get("current"),
             "build": fw.get("build"),
+            "last_ota_result": fw.get("last_ota_result"),
+            "last_ota_target": fw.get("last_ota_target"),
+            "last_ota_at": _iso_utc_from_ts(fw.get("last_ota_at")),
+            "last_ota_age_seconds": None if fw.get("last_ota_at") is None else max(0.0, now - fw.get("last_ota_at")),
             "seen_at": _iso_utc_from_ts(fw.get("seen_at")),
             "seen_age_seconds": None if fw.get("seen_at") is None else max(0.0, now - fw.get("seen_at")),
             "last_manifest_at": _iso_utc_from_ts(fw.get("last_manifest_at")),
@@ -345,6 +351,8 @@ def _record_board_firmware_status(
     current: T.Optional[str] = None,
     build: T.Optional[str] = None,
     manifest_check: bool = False,
+    ota_result: T.Optional[str] = None,
+    ota_target: T.Optional[str] = None,
 ) -> None:
     if not board_id:
         return
@@ -356,6 +364,12 @@ def _record_board_firmware_status(
     if build:
         status["build"] = str(build).strip()[:80]
         status["seen_at"] = now
+    if ota_result:
+        status["last_ota_result"] = str(ota_result).strip()[:80]
+        status["last_ota_at"] = now
+    if ota_target:
+        status["last_ota_target"] = str(ota_target).strip()[:40]
+        status["last_ota_at"] = now
     if manifest_check:
         status["last_manifest_at"] = now
 
@@ -399,6 +413,16 @@ def _firmware_dir() -> str:
     manifest_path = _resolve_local_path(FIRMWARE_MANIFEST_PATH)
     directory = os.path.dirname(manifest_path)
     return directory or _resolve_local_path("firmware")
+
+def _board_overlay_file_path() -> str:
+    return _resolve_local_path(BOARD_OVERLAY_PATH)
+
+def _board_overlay_url() -> str:
+    if BOARD_OVERLAY_URL:
+        return BOARD_OVERLAY_URL
+    if BOARD_OVERLAY_PATH and os.path.exists(_board_overlay_file_path()):
+        return "/board_overlay"
+    return ""
 
 def _safe_firmware_filename(filename: T.Optional[str]) -> str:
     filename = (filename or "").strip()
@@ -449,6 +473,27 @@ def _firmware_metadata_for_filename(filename: str, version: str = "") -> dict:
 def _firmware_metadata() -> dict:
     version, path = _firmware_manifest_config()
     return _firmware_metadata_for_path(version, path)
+
+def _version_parts(version: T.Optional[str]) -> T.Optional[tuple[int, ...]]:
+    value = (version or "").strip()
+    if not value:
+        return None
+    parts = re.findall(r"\d+", value)
+    if not parts:
+        return None
+    return tuple(int(part) for part in parts)
+
+def _firmware_update_available(current: str, target: T.Optional[str]) -> bool:
+    target_version = (target or "").strip()
+    if not target_version:
+        return False
+    current_version = (current or "").strip()
+    current_parts = _version_parts(current_version)
+    target_parts = _version_parts(target_version)
+    if current_parts is not None and target_parts is not None:
+        width = max(len(current_parts), len(target_parts))
+        return target_parts + (0,) * (width - len(target_parts)) > current_parts + (0,) * (width - len(current_parts))
+    return current_version != target_version
 
 def _available_firmware_files() -> list[dict]:
     directory = _firmware_dir()
@@ -1165,6 +1210,7 @@ def _board_layout_model() -> dict:
     return {
         "viewBox": BOARD_LAYOUT_VIEWBOX,
         "title": "Sydney Rail Network",
+        "overlayUrl": _board_overlay_url(),
         "lines": lines,
     }
 
@@ -2403,22 +2449,34 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
       .layout-grid { display:grid; grid-template-columns:minmax(0,1fr) 270px; gap:14px; }
       .board-shell { background:#07090d; border:1px solid #303946; border-radius:8px; overflow:hidden; min-height:520px; }
       #boardSvg { display:block; width:100%; aspect-ratio:861/850; min-height:520px; }
+      .board-overlay { opacity:.78; pointer-events:none; }
+      body.overlay-off .board-overlay { display:none; }
       .network-title { fill:#d7dee7; font-size:46px; font-weight:750; letter-spacing:0; }
-      .line-path { fill:none; stroke-width:5; stroke-linecap:round; stroke-linejoin:round; opacity:.42; }
-      .station-node { fill:#2a2f38; stroke:#a9b4c1; stroke-width:2; cursor:default; transition:opacity 120ms ease, fill 120ms ease, r 120ms ease; }
+      .line-path { fill:none; stroke-width:6; stroke-linecap:round; stroke-linejoin:round; opacity:.58; }
+      .station-node { fill:#2a2f38; stroke:#a9b4c1; stroke-width:2; cursor:default; transition:opacity 120ms ease, fill 120ms ease, r 120ms ease, stroke-width 120ms ease; }
       body[data-mode="test"] .station-node { cursor:pointer; }
-      .station-node.state-1 { fill:var(--line-color); opacity:.34; }
-      .station-node.state-2 { fill:var(--line-color); opacity:.68; }
-      .station-node.state-3 { fill:var(--line-color); opacity:1; r:6; filter:drop-shadow(0 0 7px var(--line-color)); }
+      body[data-mode="test"] .station-node:hover, body[data-mode="test"] .station-node:focus { stroke:#fff; stroke-width:3; outline:none; }
+      .station-node.state-1 { fill:var(--active-color,var(--line-color)); opacity:.34; }
+      .station-node.state-2 { fill:var(--active-color,var(--line-color)); opacity:.68; }
+      .station-node.state-3 { fill:var(--active-color,var(--line-color)); opacity:1; r:7; filter:drop-shadow(0 0 7px var(--active-color,var(--line-color))); }
       .station-label { fill:#d7e0ea; font-size:8px; pointer-events:none; paint-order:stroke; stroke:#07090d; stroke-width:3px; stroke-linejoin:round; opacity:.84; }
       .station-label.is-major { fill:#ffffff; font-size:10px; font-weight:750; opacity:.95; }
       body.labels-off .station-label { display:none; }
       .line-badge { fill:#111820; stroke:#c6d2df; stroke-width:1.5; }
       .line-badge-text { fill:#f4f7fb; font-size:14px; font-weight:800; text-anchor:middle; dominant-baseline:central; }
       .sim-side { border:1px solid var(--border); border-radius:8px; padding:12px; background:var(--panel2); }
+      .sim-summary { display:grid; gap:4px; padding:10px 0 2px; }
+      .sim-summary strong { font-size:22px; }
+      .state-legend { display:grid; gap:7px; margin-top:12px; padding-top:12px; border-top:1px solid var(--border); color:var(--muted); font-size:13px; }
+      .legend-row { display:flex; align-items:center; gap:8px; }
+      .legend-dot { width:11px; height:11px; border-radius:999px; display:inline-block; border:1px solid rgba(255,255,255,.22); background:#2a2f38; }
+      .legend-dot.state-1 { background:#667892; }
+      .legend-dot.state-2 { background:#d39b2c; }
+      .legend-dot.state-3 { background:#25d366; box-shadow:0 0 8px rgba(37,211,102,.65); }
       .sim-controls { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-top:12px; }
       button.control { border:1px solid var(--border); border-radius:8px; background:rgba(255,255,255,.05); color:var(--text); padding:9px 10px; font-weight:650; cursor:pointer; }
       button.control:hover { border-color:var(--accent); }
+      button.control[data-line] { border-left:4px solid var(--line-color); }
       .sim-controls.is-disabled button { opacity:.55; cursor:not-allowed; }
       .mode-options { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px; margin-top:12px; }
       .option { border:1px solid var(--border); border-radius:8px; padding:12px 14px; display:flex; gap:10px; align-items:center; background:rgba(255,255,255,.02); }
@@ -2474,10 +2532,21 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
             <div class="sim-side">
               <h4>Test Lights</h4>
               <p class="muted">Select Test lights mode, then click stations or use line controls. Save settings to apply to the physical board.</p>
+              <div class="sim-summary">
+                <div><strong id="activeStationCount">--</strong><span class="muted"> station LEDs lit</span></div>
+                <div class="note" id="simUpdatedAt">Waiting for layout</div>
+              </div>
               <label class="option" style="margin-top:12px;"><input id="labelToggle" type="checkbox" checked /><div><strong>Station labels</strong><p class="muted">Show station names on the simulator.</p></div></label>
+              <label class="option hidden" id="overlayToggleOption" style="margin-top:8px;"><input id="overlayToggle" type="checkbox" checked /><div><strong>Board artwork</strong><p class="muted">Show the configured artwork under the station targets.</p></div></label>
               <div class="sim-controls" id="testControls">
                 <button class="control" type="button" data-action="all-off">All off</button>
                 <button class="control" type="button" data-action="all-on">All on</button>
+              </div>
+              <div class="state-legend" aria-label="Station state legend">
+                <div class="legend-row"><span class="legend-dot"></span><span>Off</span></div>
+                <div class="legend-row"><span class="legend-dot state-1"></span><span>Nearby</span></div>
+                <div class="legend-row"><span class="legend-dot state-2"></span><span>Approaching</span></div>
+                <div class="legend-row"><span class="legend-dot state-3"></span><span>At station</span></div>
               </div>
               <p class="note" id="testModeHint">Station clicks edit test lights only while Test lights mode is selected.</p>
             </div>
@@ -2569,7 +2638,12 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         const testControls = document.getElementById("testControls");
         const testStatesInput = document.getElementById("test_states_json");
         const labelToggle = document.getElementById("labelToggle");
+        const overlayToggle = document.getElementById("overlayToggle");
+        const overlayToggleOption = document.getElementById("overlayToggleOption");
+        const activeStationCount = document.getElementById("activeStationCount");
+        const simUpdatedAt = document.getElementById("simUpdatedAt");
         const customColorAnimations = new Set(__AN_CUSTOM_COLOR_NAMES__);
+        const stateLabels = ["Off", "Nearby", "Approaching", "At station"];
 
         const currentMode = () => document.querySelector('input[name="mode"]:checked')?.value || "live";
         const syncBrightness = () => brightnessValue.textContent = brightness.value;
@@ -2621,16 +2695,44 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           return mins ? `${h}h ${mins}m` : `${h}h`;
         };
 
+        const syncActiveColor = () => {
+          const color = currentMode() === "animation" && customColorAnimations.has(anName.value)
+            ? (pulseColorInput.value || "#FF5000")
+            : "";
+          nodeByKey.forEach(nodes => {
+            nodes.forEach(node => {
+              if (color) node.style.setProperty("--active-color", color);
+              else node.style.removeProperty("--active-color");
+            });
+          });
+        };
+
         const setNodeState = (key, state) => {
-          const node = nodeByKey.get(key);
-          if (!node) return;
+          const nodes = nodeByKey.get(key);
+          if (!nodes) return;
           const normalized = Math.max(0, Math.min(3, Number(state || 0)));
-          node.classList.remove("state-0", "state-1", "state-2", "state-3");
-          node.classList.add("state-" + normalized);
+          nodes.forEach(node => {
+            node.classList.remove("state-0", "state-1", "state-2", "state-3");
+            node.classList.add("state-" + normalized);
+            node.dataset.state = String(normalized);
+            node.setAttribute("aria-label", `${node.dataset.titleBase}: ${stateLabels[normalized]}`);
+            const title = node.querySelector("title");
+            if (title) title.textContent = `${node.dataset.titleBase}: ${stateLabels[normalized]}`;
+          });
         };
         const applyStates = (states) => {
-          stationKeys.forEach(key => setNodeState(key, states[key] || 0));
-          if (simStateTag) simStateTag.textContent = currentMode() === "test" ? "Test states" : "Live states";
+          syncActiveColor();
+          const normalizedStates = {};
+          stationKeys.forEach(key => {
+            const state = Math.max(0, Math.min(3, Number(states[key] || 0)));
+            normalizedStates[key] = state;
+            setNodeState(key, state);
+          });
+          const active = stationKeys.filter(key => normalizedStates[key] > 0).length;
+          const modeLabel = currentMode() === "test" ? "Test" : (currentMode() === "animation" ? "Animation" : "Live");
+          if (simStateTag) simStateTag.textContent = `${modeLabel}: ${active}/${stationKeys.length} lit`;
+          if (activeStationCount) activeStationCount.textContent = `${active}/${stationKeys.length}`;
+          if (simUpdatedAt) simUpdatedAt.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}`;
         };
 
         const buildTestControls = (model) => {
@@ -2641,10 +2743,11 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
             btn.type = "button";
             btn.dataset.action = "line-toggle";
             btn.dataset.line = line.line;
+            btn.style.setProperty("--line-color", line.color);
             btn.textContent = line.line;
             btn.addEventListener("click", () => {
               if (currentMode() !== "test") return;
-              const keys = line.stations.map(st => st.key);
+              const keys = Array.from(new Set(line.stations.map(st => st.key)));
               const anyOff = keys.some(key => Number(testStates[key] || 0) < 3);
               keys.forEach(key => testStates[key] = anyOff ? 3 : 0);
               syncTestStateInput();
@@ -2652,6 +2755,56 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
             });
             testControls.appendChild(btn);
           });
+        };
+
+        const toggleTestStation = (key) => {
+          if (currentMode() !== "test") return;
+          const current = Number(testStates[key] || 0);
+          testStates[key] = current >= 3 ? 0 : 3;
+          syncTestStateInput();
+          applyStates(testStates);
+        };
+
+        const buildAnimationPreviewStates = () => {
+          const keys = stationKeys;
+          const states = {};
+          if (!keys.length) return states;
+          const speed = Math.max(80, Number(document.querySelector('input[name="an_speed"]')?.value || 180));
+          const step = Math.floor(Date.now() / speed);
+          const name = anName.value;
+          if (name === "solid" || name === "rainbow") {
+            keys.forEach(key => states[key] = 3);
+            return states;
+          }
+          if (name === "sparkle") {
+            keys.forEach((key, index) => states[key] = ((index * 17 + step * 13) % 29) < 4 ? 3 : 0);
+            return states;
+          }
+          if (name === "theater") {
+            keys.forEach((key, index) => states[key] = ((index + step) % 3) === 0 ? 3 : 0);
+            return states;
+          }
+          if (name === "wipe") {
+            const edge = step % (keys.length + 1);
+            keys.forEach((key, index) => states[key] = index < edge ? 3 : 0);
+            return states;
+          }
+          if (name === "bounce") {
+            const period = Math.max(1, (keys.length - 1) * 2);
+            let pos = step % period;
+            if (pos >= keys.length) pos = period - pos;
+            keys.forEach((key, index) => {
+              const d = Math.abs(index - pos);
+              states[key] = d === 0 ? 3 : (d === 1 ? 2 : (d === 2 ? 1 : 0));
+            });
+            return states;
+          }
+          const pos = step % keys.length;
+          keys.forEach((key, index) => {
+            const d = (index - pos + keys.length) % keys.length;
+            states[key] = d === 0 ? 3 : (d === 1 ? 2 : (d === 2 ? 1 : 0));
+          });
+          return states;
         };
 
         const renderLayout = (model) => {
@@ -2669,6 +2822,19 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           bg.setAttribute("height", viewBox[3]);
           bg.setAttribute("fill", "#07090d");
           svg.appendChild(bg);
+          if (model.overlayUrl) {
+            const overlay = document.createElementNS(ns, "image");
+            overlay.setAttribute("class", "board-overlay");
+            overlay.setAttribute("x", viewBox[0]);
+            overlay.setAttribute("y", viewBox[1]);
+            overlay.setAttribute("width", viewBox[2]);
+            overlay.setAttribute("height", viewBox[3]);
+            overlay.setAttribute("preserveAspectRatio", "none");
+            overlay.setAttribute("href", model.overlayUrl);
+            overlay.setAttributeNS("http://www.w3.org/1999/xlink", "href", model.overlayUrl);
+            svg.appendChild(overlay);
+          }
+          if (overlayToggleOption) overlayToggleOption.classList.toggle("hidden", !model.overlayUrl);
           const title = document.createElementNS(ns, "text");
           title.setAttribute("x", "44");
           title.setAttribute("y", "66");
@@ -2702,7 +2868,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
             badgeText.textContent = line.line;
             svg.appendChild(badgeText);
             line.stations.forEach(station => {
-              stationKeys.push(station.key);
+              if (!stationKeys.includes(station.key)) stationKeys.push(station.key);
               const label = document.createElementNS(ns, "text");
               const labelX = Number(station.x) + Number(station.labelDx || 0);
               const labelY = Number(station.y) + Number(station.labelDy || 0);
@@ -2719,20 +2885,25 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
               circle.setAttribute("cy", station.y);
               circle.setAttribute("r", "5");
               circle.setAttribute("class", "station-node state-0");
+              circle.setAttribute("tabindex", "0");
+              circle.setAttribute("role", "button");
               circle.dataset.key = station.key;
               circle.dataset.line = line.line;
+              circle.dataset.titleBase = `${station.name} ${line.line}`;
               circle.style.setProperty("--line-color", line.color);
               const titleEl = document.createElementNS(ns, "title");
-              titleEl.textContent = `${station.name} ${line.line}`;
+              titleEl.textContent = `${station.name} ${line.line}: Off`;
               circle.appendChild(titleEl);
               circle.addEventListener("click", () => {
-                if (currentMode() !== "test") return;
-                const current = Number(testStates[station.key] || 0);
-                testStates[station.key] = current >= 3 ? 0 : 3;
-                syncTestStateInput();
-                applyStates(testStates);
+                toggleTestStation(station.key);
               });
-              nodeByKey.set(station.key, circle);
+              circle.addEventListener("keydown", (event) => {
+                if (event.key !== "Enter" && event.key !== " ") return;
+                event.preventDefault();
+                toggleTestStation(station.key);
+              });
+              if (!nodeByKey.has(station.key)) nodeByKey.set(station.key, []);
+              nodeByKey.get(station.key).push(circle);
               svg.appendChild(circle);
             });
           });
@@ -2763,8 +2934,13 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           return merged;
         };
         const refreshSimulatorStates = async () => {
-          if (!layoutModel || currentMode() === "test") {
+          if (!layoutModel) return;
+          if (currentMode() === "test") {
             applyStates(testStates);
+            return;
+          }
+          if (currentMode() === "animation") {
+            applyStates(buildAnimationPreviewStates());
             return;
           }
           if (!stationKeys.length) return;
@@ -2778,13 +2954,33 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           const isTest = currentMode() === "test";
           document.body.dataset.mode = currentMode();
           testControls.classList.toggle("is-disabled", !isTest);
-          applyStates(isTest ? testStates : {});
-          if (!isTest) refreshSimulatorStates();
+          if (isTest) {
+            applyStates(testStates);
+          } else if (currentMode() === "animation") {
+            refreshSimulatorStates();
+          } else {
+            applyStates({});
+            refreshSimulatorStates();
+          }
         };
         document.querySelectorAll('input[name="mode"]').forEach(el => el.addEventListener("change", syncModeUi));
+        [anName, pulseColorInput, document.querySelector('input[name="an_speed"]')].forEach(el => {
+          if (!el) return;
+          el.addEventListener("input", () => {
+            if (currentMode() === "animation") refreshSimulatorStates();
+          });
+          el.addEventListener("change", () => {
+            if (currentMode() === "animation") refreshSimulatorStates();
+          });
+        });
         labelToggle.addEventListener("change", () => {
           document.body.classList.toggle("labels-off", !labelToggle.checked);
         });
+        if (overlayToggle) {
+          overlayToggle.addEventListener("change", () => {
+            document.body.classList.toggle("overlay-off", !overlayToggle.checked);
+          });
+        }
 
         const loadLayout = async () => {
           try {
@@ -2810,7 +3006,8 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
             settingsVersion.textContent = data.settings_version ?? "--";
             firmwareCurrent.textContent = data.firmware?.current || "--";
             const build = data.firmware?.build ? ` - ${data.firmware.build}` : "";
-            firmwareSub.textContent = data.firmware?.seen_age_seconds == null ? "No firmware report yet" : `Seen ${formatAge(data.firmware.seen_age_seconds)} ago${build}`;
+            const otaResult = data.firmware?.last_ota_result ? `; OTA ${data.firmware.last_ota_result}` : "";
+            firmwareSub.textContent = data.firmware?.seen_age_seconds == null ? "No firmware report yet" : `Seen ${formatAge(data.firmware.seen_age_seconds)} ago${build}${otaResult}`;
             otaTarget.textContent = data.ota?.enabled ? (data.ota?.target_version || "Global") : "Held";
             boardSyncTag.textContent = payloadAge === null || payloadAge === undefined ? "No check-in" : "Updated " + formatAge(payloadAge) + " ago";
           } catch (err) {
@@ -2821,6 +3018,9 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         syncBoardStatus();
         window.setInterval(syncBoardStatus, 5000);
         window.setInterval(refreshSimulatorStates, 4000);
+        window.setInterval(() => {
+          if (currentMode() === "animation") refreshSimulatorStates();
+        }, 220);
       })();
     </script>
   </body>
@@ -3036,6 +3236,14 @@ def board_layout_api():
     return _as_no_store(JSONResponse(_board_layout_model()))
 
 
+@app.get("/board_overlay")
+def board_overlay_api():
+    path = _board_overlay_file_path()
+    if not BOARD_OVERLAY_PATH or not os.path.exists(path) or not os.path.isfile(path):
+        return JSONResponse({"error": "board_overlay_not_found"}, status_code=404)
+    return FileResponse(path, headers={"Cache-Control": "no-store"})
+
+
 @app.get("/firmware_options")
 def firmware_options_api(board_id: str = Query(...)):
     board_id = _normalize_board_id(board_id)
@@ -3060,6 +3268,7 @@ def firmware_manifest_api(
     board_id: str = Query(...),
     current: T.Optional[str] = Query(None),
     build: T.Optional[str] = Query(None),
+    record: bool = Query(True),
 ):
     board_id = _normalize_board_id(board_id)
     if not board_id:
@@ -3069,11 +3278,17 @@ def firmware_manifest_api(
     except ValueError:
         return _as_no_store(JSONResponse({"error": "invalid board_id"}, status_code=400))
 
-    _record_board_firmware_status(board_id, current=current, build=build, manifest_check=True)
+    if record:
+        _record_board_firmware_status(board_id, current=current, build=build, manifest_check=True)
 
     meta = _active_firmware_metadata_for_board(cfg)
     current_version = (current or "").strip()
-    update_available = bool(meta.get("available")) and current_version != meta.get("version")
+    update_available = bool(meta.get("available")) and _firmware_update_available(current_version, meta.get("version"))
+    reason = None
+    if not meta.get("available"):
+        reason = meta.get("reason")
+    elif not update_available:
+        reason = "not_newer"
     ota_cfg = cfg.get("ota", {}) or {}
 
     payload = {
@@ -3081,7 +3296,7 @@ def firmware_manifest_api(
         "update_available": update_available,
         "current": current_version,
         "version": meta.get("version"),
-        "reason": None if meta.get("available") else meta.get("reason"),
+        "reason": reason,
         "deployment": {
             "filename": ota_cfg.get("filename") or "",
             "target_version": ota_cfg.get("target_version") or "",
@@ -3317,6 +3532,8 @@ def board_payload(
     only: T.Optional[str] = Query(None, description="Comma-separated station names"),
     fw: T.Optional[str] = Query(None, description="Firmware version reported by the board"),
     build: T.Optional[str] = Query(None, description="Firmware build label reported by the board"),
+    ota: T.Optional[str] = Query(None, description="Last OTA result reported by the board"),
+    ota_target: T.Optional[str] = Query(None, description="Last OTA target version reported by the board"),
 ):
     board_id = _normalize_board_id(board_id)
     if not board_id:
@@ -3329,7 +3546,13 @@ def board_payload(
     now_ts = time.time()
     previous_seen_at = BOARD_LAST_PAYLOAD_AT.get(board_id)
     BOARD_LAST_PAYLOAD_AT[board_id] = now_ts
-    _record_board_firmware_status(board_id, current=fw, build=build)
+    _record_board_firmware_status(
+        board_id,
+        current=fw,
+        build=build,
+        ota_result=ota,
+        ota_target=ota_target,
+    )
 
     subset = _station_subset(only)
     mode = cfg.get("mode", "live")

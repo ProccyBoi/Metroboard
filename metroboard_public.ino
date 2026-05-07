@@ -25,7 +25,7 @@
 static const char* kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
 
-static const char* kFirmwareVersion = "1.4.3";
+static const char* kFirmwareVersion = "1.4.5";
 static const char* kBuildLabel = "public";
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
 static const uint32_t SETTINGS_FETCH_MS = 30000;
@@ -109,6 +109,8 @@ uint32_t lastSettingsFetch = 0;
 uint32_t lastSettingsVersion = 0;
 uint32_t lastOtaCheck = 0;
 volatile bool gOtaInProgress = false;
+String gLastOtaResult = "none";
+String gLastOtaTargetVersion = "";
 
 // ===== Binding model =====
 struct LedBinding {
@@ -253,6 +255,47 @@ static String serviceBaseUrl() {
     int slash = url.lastIndexOf('/');
     if (slash > 0) return url.substring(0, slash);
     return url;
+}
+static bool readVersionPart(const char*& p, int& out) {
+    while (*p && (*p < '0' || *p > '9')) p++;
+    if (!*p) return false;
+    long value = 0;
+    while (*p >= '0' && *p <= '9') {
+        value = value * 10 + (*p - '0');
+        if (value > 32767) value = 32767;
+        p++;
+    }
+    out = (int)value;
+    return true;
+}
+static bool versionIsNewer(const char* candidate, const char* current) {
+    if (!candidate || !*candidate) return false;
+    const char* a = candidate;
+    const char* b = current && *current ? current : "0";
+    for (uint8_t i = 0; i < 6; i++) {
+        int av = 0, bv = 0;
+        bool hasA = readVersionPart(a, av);
+        bool hasB = readVersionPart(b, bv);
+        if (!hasA && !hasB) return false;
+        if (av != bv) return av > bv;
+    }
+    return false;
+}
+static bool isHexMd5(const char* md5) {
+    if (!md5 || strlen(md5) != 32) return false;
+    for (size_t i = 0; i < 32; i++) {
+        char c = md5[i];
+        bool ok = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                  (c >= 'A' && c <= 'F');
+        if (!ok) return false;
+    }
+    return true;
+}
+static bool firmwareUrlIsTrusted(const char* firmwareUrl) {
+    if (!firmwareUrl || !*firmwareUrl) return false;
+    String prefix = serviceBaseUrl();
+    prefix += "/firmware.bin?";
+    return String(firmwareUrl).startsWith(prefix);
 }
 static uint32_t lineColor(Line ln) {
     uint32_t h = LINE_COLOR_HEX[ln];
@@ -826,6 +869,8 @@ bool performOtaUpdate(const char* firmwareUrl, const char* expectedMd5,
     if (WiFi.status() != WL_CONNECTED) return false;
 
     gOtaInProgress = true;
+    gLastOtaTargetVersion = String(targetVersion ? targetVersion : "");
+    gLastOtaResult = "in_progress";
     setStatus(STATUS_OTA_UPDATING);
     Serial.printf(
         "[OTA] Starting update to %s\n",
@@ -842,6 +887,7 @@ bool performOtaUpdate(const char* firmwareUrl, const char* expectedMd5,
 
     if (!http.begin(client, firmwareUrl)) {
         Serial.println("[OTA] Failed to open firmware URL.");
+        gLastOtaResult = "fail_http_begin";
         http.end();
         gOtaInProgress = false;
         setStatus(STATUS_WIFI_CONNECTED_VALID);
@@ -856,6 +902,7 @@ bool performOtaUpdate(const char* firmwareUrl, const char* expectedMd5,
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
         Serial.printf("[OTA] Firmware download HTTP %d\n", code);
+        gLastOtaResult = String("fail_http_") + code;
         http.end();
         gOtaInProgress = false;
         setStatus(STATUS_WIFI_CONNECTED_VALID);
@@ -868,6 +915,7 @@ bool performOtaUpdate(const char* firmwareUrl, const char* expectedMd5,
         expectedSize != contentLength) {
         Serial.printf("[OTA] Size mismatch manifest=%d http=%d\n", expectedSize,
                       contentLength);
+        gLastOtaResult = "fail_size_mismatch";
         http.end();
         gOtaInProgress = false;
         setStatus(STATUS_WIFI_CONNECTED_VALID);
@@ -875,6 +923,16 @@ bool performOtaUpdate(const char* firmwareUrl, const char* expectedMd5,
     }
     if (updateSize <= 0) {
         Serial.println("[OTA] Missing firmware content length.");
+        gLastOtaResult = "fail_no_size";
+        http.end();
+        gOtaInProgress = false;
+        setStatus(STATUS_WIFI_CONNECTED_VALID);
+        return false;
+    }
+    if ((uint32_t)updateSize > ESP.getFreeSketchSpace()) {
+        Serial.printf("[OTA] Firmware too large: %d > free sketch %u\n",
+                      updateSize, ESP.getFreeSketchSpace());
+        gLastOtaResult = "fail_too_large";
         http.end();
         gOtaInProgress = false;
         setStatus(STATUS_WIFI_CONNECTED_VALID);
@@ -884,6 +942,7 @@ bool performOtaUpdate(const char* firmwareUrl, const char* expectedMd5,
     if (!Update.begin((size_t)updateSize)) {
         Serial.printf("[OTA] Update.begin failed, error=%u\n",
                       Update.getError());
+        gLastOtaResult = String("fail_update_begin_") + Update.getError();
         http.end();
         gOtaInProgress = false;
         setStatus(STATUS_WIFI_CONNECTED_VALID);
@@ -893,6 +952,7 @@ bool performOtaUpdate(const char* firmwareUrl, const char* expectedMd5,
     if (expectedMd5 && strlen(expectedMd5) == 32) {
         if (!Update.setMD5(expectedMd5)) {
             Serial.println("[OTA] Invalid MD5 from manifest.");
+            gLastOtaResult = "fail_md5_invalid";
             Update.abort();
             http.end();
             gOtaInProgress = false;
@@ -902,19 +962,61 @@ bool performOtaUpdate(const char* firmwareUrl, const char* expectedMd5,
     }
 
     WiFiClient* stream = http.getStreamPtr();
-    size_t written = Update.writeStream(*stream);
-    if (written != (size_t)updateSize) {
-        Serial.printf("[OTA] Written %u/%d bytes\n", (unsigned)written,
-                      updateSize);
-        Update.abort();
-        http.end();
-        gOtaInProgress = false;
-        setStatus(STATUS_WIFI_CONNECTED_VALID);
-        return false;
+    uint8_t buffer[1024];
+    size_t written = 0;
+    uint32_t lastDataAt = millis();
+    uint32_t lastProgressAt = 0;
+    while (written < (size_t)updateSize) {
+        size_t remaining = (size_t)updateSize - written;
+        int available = stream->available();
+        if (available <= 0) {
+            if (millis() - lastDataAt > 30000) {
+                Serial.printf("[OTA] Download stalled at %u/%d bytes\n",
+                              (unsigned)written, updateSize);
+                gLastOtaResult = "fail_download_stalled";
+                Update.abort();
+                http.end();
+                gOtaInProgress = false;
+                setStatus(STATUS_WIFI_CONNECTED_VALID);
+                return false;
+            }
+            delay(1);
+            continue;
+        }
+
+        size_t toRead = min(remaining, min((size_t)available, sizeof(buffer)));
+        int got = stream->readBytes(buffer, toRead);
+        if (got <= 0) {
+            delay(1);
+            continue;
+        }
+        lastDataAt = millis();
+
+        size_t chunkWritten = Update.write(buffer, (size_t)got);
+        if (chunkWritten != (size_t)got) {
+            Serial.printf("[OTA] Write failed at %u/%d bytes, wrote %u/%d\n",
+                          (unsigned)written, updateSize,
+                          (unsigned)chunkWritten, got);
+            gLastOtaResult = "fail_short_write";
+            Update.abort();
+            http.end();
+            gOtaInProgress = false;
+            setStatus(STATUS_WIFI_CONNECTED_VALID);
+            return false;
+        }
+
+        written += chunkWritten;
+        if (millis() - lastProgressAt >= 1000) {
+            Serial.printf("[OTA] Written %u/%d bytes\n", (unsigned)written,
+                          updateSize);
+            lastProgressAt = millis();
+        }
+        delay(1);
     }
 
     if (!Update.end()) {
         Serial.printf("[OTA] Update.end failed, error=%u\n", Update.getError());
+        gLastOtaResult = String("fail_update_end_") + Update.getError();
         http.end();
         gOtaInProgress = false;
         setStatus(STATUS_WIFI_CONNECTED_VALID);
@@ -923,6 +1025,7 @@ bool performOtaUpdate(const char* firmwareUrl, const char* expectedMd5,
 
     if (!Update.isFinished()) {
         Serial.println("[OTA] Update did not finish cleanly.");
+        gLastOtaResult = "fail_not_finished";
         http.end();
         gOtaInProgress = false;
         setStatus(STATUS_WIFI_CONNECTED_VALID);
@@ -930,6 +1033,7 @@ bool performOtaUpdate(const char* firmwareUrl, const char* expectedMd5,
     }
 
     http.end();
+    gLastOtaResult = "success_rebooting";
     Serial.println("[OTA] Update complete. Rebooting.");
     delay(500);
     ESP.restart();
@@ -960,6 +1064,7 @@ bool checkForOtaUpdate() {
     Serial.printf("[OTA] Checking %s\n", url.c_str());
 
     if (!http.begin(client, url)) {
+        gLastOtaResult = "fail_manifest_begin";
         http.end();
         return false;
     }
@@ -973,6 +1078,7 @@ bool checkForOtaUpdate() {
     int code = http.GET();
     if (code != HTTP_CODE_OK) {
         Serial.printf("[OTA] Manifest HTTP %d\n", code);
+        gLastOtaResult = String("fail_manifest_http_") + code;
         http.end();
         return false;
     }
@@ -985,21 +1091,47 @@ bool checkForOtaUpdate() {
     DeserializationError err = deserializeJson(doc, body);
     if (err) {
         Serial.printf("[OTA] Manifest JSON error: %s\n", err.c_str());
+        gLastOtaResult = "fail_manifest_json";
         return false;
     }
 
+    bool otaEnabled = doc["ota_enabled"] | true;
     bool updateAvailable = doc["update_available"] | false;
     const char* version = doc["version"] | "";
-    if (!updateAvailable) {
-        const char* reason = doc["reason"] | "none";
-        Serial.printf("[OTA] No update. current=%s latest=%s reason=%s\n",
-                      kFirmwareVersion, version, reason);
-        return false;
-    }
-
     const char* firmwareUrl = doc["url"] | "";
     const char* md5 = doc["md5"] | "";
     int size = doc["size"] | 0;
+    gLastOtaTargetVersion = String(version ? version : "");
+
+    if (!otaEnabled || !updateAvailable) {
+        const char* reason = doc["reason"] | "none";
+        Serial.printf("[OTA] No update. current=%s latest=%s reason=%s\n",
+                      kFirmwareVersion, version, reason);
+        gLastOtaResult = otaEnabled ? "no_update" : "disabled";
+        return false;
+    }
+    if (!versionIsNewer(version, kFirmwareVersion)) {
+        Serial.printf("[OTA] Refusing non-newer target. current=%s target=%s\n",
+                      kFirmwareVersion, version);
+        gLastOtaResult = "refuse_not_newer";
+        return false;
+    }
+    if (!firmwareUrlIsTrusted(firmwareUrl)) {
+        Serial.printf("[OTA] Refusing untrusted firmware URL: %s\n", firmwareUrl);
+        gLastOtaResult = "refuse_untrusted_url";
+        return false;
+    }
+    if (!isHexMd5(md5)) {
+        Serial.println("[OTA] Refusing manifest without valid MD5.");
+        gLastOtaResult = "refuse_bad_md5";
+        return false;
+    }
+    if (size <= 0) {
+        Serial.println("[OTA] Refusing manifest without positive size.");
+        gLastOtaResult = "refuse_bad_size";
+        return false;
+    }
+
     return performOtaUpdate(firmwareUrl, md5, size, version);
 }
 
@@ -1012,7 +1144,9 @@ size_t computeBatchEnd(size_t i) {
     size_t baseLen = strlen(base) + strlen("?board_id=") +
                      gConfig.boardId.length() + strlen("&fw=") +
                      strlen(kFirmwareVersion) + strlen("&build=") +
-                     strlen(kBuildLabel) + strlen("&only=");
+                     strlen(kBuildLabel) + strlen("&ota=") +
+                     gLastOtaResult.length() + strlen("&ota_target=") +
+                     gLastOtaTargetVersion.length() + strlen("&only=");
 
     size_t used = baseLen;
     size_t j = i;
@@ -1062,6 +1196,10 @@ int fetchAllBatchesAndRenderOnce(bool allowRender) {
         url += enc(kFirmwareVersion);
         url += "&build=";
         url += enc(kBuildLabel);
+        url += "&ota=";
+        url += enc(gLastOtaResult.c_str());
+        url += "&ota_target=";
+        url += enc(gLastOtaTargetVersion.c_str());
         url += "&only=";
         for (size_t j = i; j < end; j++) {
             if (j > i) url += ',';

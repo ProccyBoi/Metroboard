@@ -9,9 +9,19 @@ Workflow:
 2. Bump both `kFirmwareVersion` in `metroboard_public.ino` and `version` in
    `firmware/manifest.json`.
 3. Run `python -m platformio run -e metroboard_public`; the post-build script
-   copies the binary to `firmware/metroboard_public.bin`.
+   verifies that the sketch version and manifest version match, then copies the
+   binary to `firmware/metroboard_public.bin`.
 4. Commit and push. After Koyeb deploys, boards already running OTA-capable
    firmware will see the newer manifest and install the update.
 
 If `metroboard_public.bin` is absent, `/firmware_manifest` safely reports that
 no update is available.
+
+Safety checks:
+
+- The server only advertises firmware when the target version is newer than the
+  board-reported version.
+- Firmware also refuses non-newer versions, invalid MD5 hashes, invalid sizes,
+  and firmware URLs outside this service before writing flash.
+- OTA writes in small chunks and yields between chunks to avoid the ESP32 task
+  watchdog during large downloads.
