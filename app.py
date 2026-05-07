@@ -2585,7 +2585,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           <div class="section-head"><h3>Animation</h3><span class="tag" id="animationTag">Mode: __AN_NAME_TITLE__</span></div>
           <div class="row">
             <label class="field">Name<select name="an_name" id="an_name">__ANIMATION_OPTIONS__</select></label>
-            <label class="field">Speed<input type="number" name="an_speed" value="__AN_SPEED__" min="20" max="5000" /></label>
+            <label class="field">Frame delay, ms<input type="number" name="an_speed" value="__AN_SPEED__" min="20" max="5000" /></label>
             <label class="field" id="pulseColorField">Effect colour<div class="color-picker"><input class="color-picker__input" type="color" id="an_color" name="an_color" value="__AN_COLOR_HEX__" /><span class="color-picker__value"><span class="color-picker__swatch" id="pulseColorSwatch" style="background:__AN_COLOR_HEX__;"></span><span id="pulseColorValue">__AN_COLOR_HEX__</span></span><span class="color-picker__cta">Change</span></div></label>
           </div>
           <p class="note" id="pulseColorNote"></p>

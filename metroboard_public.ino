@@ -25,10 +25,11 @@
 static const char* kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
 
-static const char* kFirmwareVersion = "1.4.5";
+static const char* kFirmwareVersion = "1.4.6";
 static const char* kBuildLabel = "public";
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
 static const uint32_t SETTINGS_FETCH_MS = 30000;
+static const uint32_t ANIMATION_SETTINGS_FETCH_MS = 3000;
 static const uint32_t OTA_CHECK_MS = 15UL * 60UL * 1000UL;
 static const uint32_t OTA_STARTUP_DELAY_MS = 60UL * 1000UL;
 
@@ -1173,6 +1174,118 @@ size_t computeBatchEnd(size_t i) {
     return j;
 }
 
+void appendDeviceQuery(String& url) {
+    url += "?board_id=";
+    url += gConfig.boardId;
+    url += "&fw=";
+    url += enc(kFirmwareVersion);
+    url += "&build=";
+    url += enc(kBuildLabel);
+    url += "&ota=";
+    url += enc(gLastOtaResult.c_str());
+    url += "&ota_target=";
+    url += enc(gLastOtaTargetVersion.c_str());
+}
+
+bool applySettingsFromPayload(JsonObject root, bool force) {
+    uint32_t ver = root["settings_version"] | 0;
+    if (!force && ver != 0 && ver == lastSettingsVersion &&
+        millis() - lastSettingsFetch < SETTINGS_FETCH_MS) {
+        return false;
+    }
+
+    lastSettingsVersion = ver;
+    lastSettingsFetch = millis();
+
+    const char* mode = root["mode"] | "live";
+    gMode = String(mode);
+    gMode.toLowerCase();
+
+    int b = root["brightness"] | 16;
+    b = constrain(b, 0, 255);
+    int bEff = root["brightness_effective"] | b;
+    bEff = constrain(bEff, 0, 255);
+    gBaseBrightness = b;
+    gEffectiveBrightness = (uint8_t)bEff;
+
+    JsonObject nm = root["night_mode"];
+    if (!nm.isNull()) {
+        gNightMode.enabled = nm["enabled"] | false;
+        gNightMode.active = root["night_mode_active"] | false;
+        gNightMode.start = nm["start"] | "23:00";
+        gNightMode.end = nm["end"] | "06:00";
+        gNightMode.action = nm["action"] | "off";
+        gNightMode.dimLevel = (uint8_t)(nm["dim_level"] | 20);
+    }
+
+    JsonObject an = root["animation"];
+    if (!an.isNull()) {
+        gAnim.name = an["name"] | "pulse";
+        gAnim.speed = an["speed"] | 120;
+        JsonArray col = an["color"].as<JsonArray>();
+        if (col.size() >= 3) {
+            gAnim.r = uint8_t(col[0]);
+            gAnim.g = uint8_t(col[1]);
+            gAnim.b = uint8_t(col[2]);
+        }
+    }
+
+    Serial.printf(
+        "[CFG] ver=%u mode=%s bright=%u eff=%u night=%d active=%d "
+        "anim=%s speed=%d\n",
+        ver, gMode.c_str(), gBaseBrightness, gEffectiveBrightness,
+        gNightMode.enabled, gNightMode.active, gAnim.name.c_str(), gAnim.speed);
+    return true;
+}
+
+bool fetchSettingsOnly() {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(12000);
+    client.setHandshakeTimeout(12000);
+
+    String url = String(kPayloadBase);
+    appendDeviceQuery(url);
+    url += "&only=__settings__";
+
+    HTTPClient http;
+    http.setTimeout(12000);
+    http.setReuse(false);
+    http.useHTTP10(false);
+    http.addHeader("Accept", "application/json");
+    http.addHeader("Accept-Encoding", "identity");
+    http.addHeader("Cache-Control", "no-cache");
+    http.addHeader("Connection", "close");
+    http.addHeader("User-Agent", "ESP32-Metroboard/settings/1.4");
+
+    if (!http.begin(client, url)) {
+        http.end();
+        return false;
+    }
+
+    const char* hk[] = {"Content-Type", "Content-Encoding"};
+    http.collectHeaders(hk, 2);
+
+    int code = http.GET();
+    if (code != HTTP_CODE_OK ||
+        http.header("Content-Encoding").indexOf("gzip") >= 0 ||
+        http.header("Content-Type").indexOf("application/json") < 0) {
+        http.end();
+        return false;
+    }
+
+    String body = http.getString();
+    http.end();
+    body.trim();
+    if (!body.length() || (body.charAt(0) != '{' && body.charAt(0) != '[')) {
+        return false;
+    }
+
+    gDoc.clear();
+    if (deserializeJson(gDoc, body)) return false;
+    return applySettingsFromPayload(gDoc.as<JsonObject>(), true);
+}
+
 int fetchAllBatchesAndRenderOnce(bool allowRender) {
     if (NB == 0) return 0;
 
@@ -1190,16 +1303,7 @@ int fetchAllBatchesAndRenderOnce(bool allowRender) {
         size_t end = computeBatchEnd(i);
 
         String url = String(kPayloadBase);
-        url += "?board_id=";
-        url += gConfig.boardId;
-        url += "&fw=";
-        url += enc(kFirmwareVersion);
-        url += "&build=";
-        url += enc(kBuildLabel);
-        url += "&ota=";
-        url += enc(gLastOtaResult.c_str());
-        url += "&ota_target=";
-        url += enc(gLastOtaTargetVersion.c_str());
+        appendDeviceQuery(url);
         url += "&only=";
         for (size_t j = i; j < end; j++) {
             if (j > i) url += ',';
@@ -1250,52 +1354,8 @@ int fetchAllBatchesAndRenderOnce(bool allowRender) {
 
         JsonObject root = gDoc.as<JsonObject>();
 
-        uint32_t ver = root["settings_version"] | 0;
-        if (!settingsApplied &&
-            (ver == 0 || ver != lastSettingsVersion ||
-             millis() - lastSettingsFetch >= SETTINGS_FETCH_MS)) {
-            lastSettingsVersion = ver;
-            lastSettingsFetch = millis();
-
-            const char* mode = root["mode"] | "live";
-            gMode = String(mode);
-            gMode.toLowerCase();
-
-            int b = root["brightness"] | 16;
-            b = constrain(b, 0, 255);
-            int bEff = root["brightness_effective"] | b;
-            bEff = constrain(bEff, 0, 255);
-            gBaseBrightness = b;
-            gEffectiveBrightness = (uint8_t)bEff;
-
-            JsonObject nm = root["night_mode"];
-            if (!nm.isNull()) {
-                gNightMode.enabled = nm["enabled"] | false;
-                gNightMode.active = root["night_mode_active"] | false;
-                gNightMode.start = nm["start"] | "23:00";
-                gNightMode.end = nm["end"] | "06:00";
-                gNightMode.action = nm["action"] | "off";
-                gNightMode.dimLevel = (uint8_t)(nm["dim_level"] | 20);
-            }
-
-            JsonObject an = root["animation"];
-            if (!an.isNull()) {
-                gAnim.name = an["name"] | "pulse";
-                gAnim.speed = an["speed"] | 120;
-                JsonArray col = an["color"].as<JsonArray>();
-                if (col.size() >= 3) {
-                    gAnim.r = uint8_t(col[0]);
-                    gAnim.g = uint8_t(col[1]);
-                    gAnim.b = uint8_t(col[2]);
-                }
-            }
-
-            settingsApplied = true;
-            Serial.printf(
-                "[CFG] ver=%u mode=%s bright=%u eff=%u night=%d active=%d "
-                "anim=%s\n",
-                ver, gMode.c_str(), gBaseBrightness, gEffectiveBrightness,
-                gNightMode.enabled, gNightMode.active, gAnim.name.c_str());
+        if (!settingsApplied) {
+            settingsApplied = applySettingsFromPayload(root, false);
         }
 
         JsonVariantConst states = root["states"];
@@ -1424,8 +1484,8 @@ void setup() {
                         pollInterval = next;
                     }
                 } else if (gMode == "animation" &&
-                           now - lastSettingsFetch >= SETTINGS_FETCH_MS) {
-                    fetchAllBatchesAndRenderOnce(false);
+                           now - lastSettingsFetch >= ANIMATION_SETTINGS_FETCH_MS) {
+                    fetchSettingsOnly();
                 }
 
                 vTaskDelay(10 / portTICK_PERIOD_MS);
