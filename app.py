@@ -495,6 +495,41 @@ def _firmware_update_available(current: str, target: T.Optional[str]) -> bool:
         return target_parts + (0,) * (width - len(target_parts)) > current_parts + (0,) * (width - len(current_parts))
     return current_version != target_version
 
+def _firmware_update_payload_for_board(request: Request, board_id: str, cfg: dict, current: T.Optional[str]) -> dict:
+    meta = _active_firmware_metadata_for_board(cfg)
+    current_version = (current or "").strip()
+    update_available = bool(meta.get("available")) and _firmware_update_available(current_version, meta.get("version"))
+    reason = None
+    if not meta.get("available"):
+        reason = meta.get("reason")
+    elif not update_available:
+        reason = "not_newer"
+
+    ota_cfg = cfg.get("ota", {}) or {}
+    payload = {
+        "ota_enabled": FIRMWARE_OTA_ENABLED and bool(ota_cfg.get("enabled", True)),
+        "update_available": update_available,
+        "current": current_version,
+        "version": meta.get("version"),
+        "reason": reason,
+    }
+    if meta.get("available"):
+        encoded_board = quote(board_id, safe="")
+        encoded_version = quote(str(meta["version"]), safe="")
+        encoded_filename = quote(str(meta["filename"]), safe="")
+        payload.update({
+            "filename": meta["filename"],
+            "size": meta["size"],
+            "md5": meta["md5"],
+            "sha256": meta["sha256"],
+            "url": (
+                f"{_public_base_url(request)}/firmware.bin"
+                f"?board_id={encoded_board}&version={encoded_version}"
+                f"&filename={encoded_filename}"
+            ),
+        })
+    return payload
+
 def _available_firmware_files() -> list[dict]:
     directory = _firmware_dir()
     if not os.path.isdir(directory):
@@ -3282,43 +3317,14 @@ def firmware_manifest_api(
     if record:
         _record_board_firmware_status(board_id, current=current, build=build, manifest_check=True)
 
-    meta = _active_firmware_metadata_for_board(cfg)
-    current_version = (current or "").strip()
-    update_available = bool(meta.get("available")) and _firmware_update_available(current_version, meta.get("version"))
-    reason = None
-    if not meta.get("available"):
-        reason = meta.get("reason")
-    elif not update_available:
-        reason = "not_newer"
     ota_cfg = cfg.get("ota", {}) or {}
-
-    payload = {
-        "ota_enabled": FIRMWARE_OTA_ENABLED and bool(ota_cfg.get("enabled", True)),
-        "update_available": update_available,
-        "current": current_version,
-        "version": meta.get("version"),
-        "reason": reason,
+    payload = _firmware_update_payload_for_board(request, board_id, cfg, current)
+    payload.update({
         "deployment": {
             "filename": ota_cfg.get("filename") or "",
             "target_version": ota_cfg.get("target_version") or "",
         },
-    }
-
-    if meta.get("available"):
-        encoded_board = quote(board_id, safe="")
-        encoded_version = quote(str(meta["version"]), safe="")
-        encoded_filename = quote(str(meta["filename"]), safe="")
-        payload.update({
-            "filename": meta["filename"],
-            "size": meta["size"],
-            "md5": meta["md5"],
-            "sha256": meta["sha256"],
-            "url": (
-                f"{_public_base_url(request)}/firmware.bin"
-                f"?board_id={encoded_board}&version={encoded_version}"
-                f"&filename={encoded_filename}"
-            ),
-        })
+    })
 
     return _as_no_store(JSONResponse(payload))
 
@@ -3529,6 +3535,7 @@ def states(
 
 @app.get("/board_payload")
 def board_payload(
+    request: Request,
     board_id: str = Query(..., description="Board ID (5-char code)"),
     only: T.Optional[str] = Query(None, description="Comma-separated station names"),
     fw: T.Optional[str] = Query(None, description="Firmware version reported by the board"),
@@ -3583,6 +3590,7 @@ def board_payload(
         "board_previous_seen_age_seconds": (
             None if previous_seen_at is None else max(0.0, now_ts - previous_seen_at)
         ),
+        "firmware_update": _firmware_update_payload_for_board(request, board_id, cfg, fw),
     })
 
 @app.get("/debug_names")

@@ -23,5 +23,8 @@ Safety checks:
   board-reported version.
 - Firmware also refuses non-newer versions, invalid MD5 hashes, invalid sizes,
   and firmware URLs outside this service before writing flash.
+- Current firmware learns about available updates from the regular
+  `/board_payload` response, avoiding a separate periodic manifest request that
+  can visibly stall animations.
 - OTA writes in small chunks and yields between chunks to avoid the ESP32 task
   watchdog during large downloads.

@@ -25,7 +25,7 @@
 static const char* kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
 
-static const char* kFirmwareVersion = "1.4.6";
+static const char* kFirmwareVersion = "1.4.7";
 static const char* kBuildLabel = "public";
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
 static const uint32_t SETTINGS_FETCH_MS = 30000;
@@ -112,6 +112,11 @@ uint32_t lastOtaCheck = 0;
 volatile bool gOtaInProgress = false;
 String gLastOtaResult = "none";
 String gLastOtaTargetVersion = "";
+bool gPendingOtaUpdate = false;
+String gPendingOtaUrl = "";
+String gPendingOtaMd5 = "";
+String gPendingOtaVersion = "";
+int gPendingOtaSize = 0;
 
 // ===== Binding model =====
 struct LedBinding {
@@ -1230,6 +1235,43 @@ bool applySettingsFromPayload(JsonObject root, bool force) {
         }
     }
 
+    JsonObject fw = root["firmware_update"];
+    if (!fw.isNull()) {
+        bool otaEnabled = fw["ota_enabled"] | true;
+        bool updateAvailable = fw["update_available"] | false;
+        const char* version = fw["version"] | "";
+        const char* firmwareUrl = fw["url"] | "";
+        const char* md5 = fw["md5"] | "";
+        int size = fw["size"] | 0;
+        gLastOtaTargetVersion = String(version ? version : "");
+        if (!otaEnabled) {
+            gPendingOtaUpdate = false;
+            gLastOtaResult = "disabled";
+        } else if (!updateAvailable) {
+            gPendingOtaUpdate = false;
+            if (gLastOtaResult == "in_progress") gLastOtaResult = "no_update";
+        } else if (!versionIsNewer(version, kFirmwareVersion)) {
+            gPendingOtaUpdate = false;
+            gLastOtaResult = "refuse_not_newer";
+        } else if (!firmwareUrlIsTrusted(firmwareUrl)) {
+            gPendingOtaUpdate = false;
+            gLastOtaResult = "refuse_untrusted_url";
+        } else if (!isHexMd5(md5)) {
+            gPendingOtaUpdate = false;
+            gLastOtaResult = "refuse_bad_md5";
+        } else if (size <= 0) {
+            gPendingOtaUpdate = false;
+            gLastOtaResult = "refuse_bad_size";
+        } else {
+            gPendingOtaUrl = String(firmwareUrl);
+            gPendingOtaMd5 = String(md5);
+            gPendingOtaVersion = String(version);
+            gPendingOtaSize = size;
+            gPendingOtaUpdate = true;
+            gLastOtaResult = "pending";
+        }
+    }
+
     Serial.printf(
         "[CFG] ver=%u mode=%s bright=%u eff=%u night=%d active=%d "
         "anim=%s speed=%d\n",
@@ -1465,10 +1507,12 @@ void setup() {
                 ensureWifi();
 
                 uint32_t now = millis();
-                if (!gOtaInProgress && now > OTA_STARTUP_DELAY_MS &&
-                    (lastOtaCheck == 0 || now - lastOtaCheck >= OTA_CHECK_MS)) {
+                if (!gOtaInProgress && gPendingOtaUpdate &&
+                    now > OTA_STARTUP_DELAY_MS) {
+                    gPendingOtaUpdate = false;
                     lastOtaCheck = now;
-                    checkForOtaUpdate();
+                    performOtaUpdate(gPendingOtaUrl.c_str(), gPendingOtaMd5.c_str(),
+                                     gPendingOtaSize, gPendingOtaVersion.c_str());
                 }
 
                 if (gMode != "animation" && now - lastPoll >= pollInterval) {
