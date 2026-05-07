@@ -496,8 +496,19 @@ def _firmware_update_available(current: str, target: T.Optional[str]) -> bool:
     return current_version != target_version
 
 def _firmware_update_payload_for_board(request: Request, board_id: str, cfg: dict, current: T.Optional[str]) -> dict:
-    meta = _active_firmware_metadata_for_board(cfg)
     current_version = (current or "").strip()
+    current_lower = current_version.lower()
+    meta = _active_firmware_metadata_for_board(cfg)
+    if "bridge" in current_lower:
+        meta = _firmware_metadata()
+    elif cfg.get("ota", {}).get("filename") and meta.get("available"):
+        global_meta = _firmware_metadata()
+        if (
+            not _firmware_update_available(current_version, meta.get("version"))
+            and global_meta.get("available")
+            and _firmware_update_available(current_version, global_meta.get("version"))
+        ):
+            meta = global_meta
     update_available = bool(meta.get("available")) and _firmware_update_available(current_version, meta.get("version"))
     reason = None
     if not meta.get("available"):

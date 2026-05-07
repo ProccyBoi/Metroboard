@@ -17,6 +17,16 @@ Workflow:
 If `metroboard_public.bin` is absent, `/firmware_manifest` safely reports that
 no update is available.
 
+Recovery bridge:
+
+- `python -m platformio run -e metroboard_bridge` builds a small OTA-only
+  bridge from `src/bridge.cpp`.
+- Copy its output to `firmware/metroboard_bridge_1.4.6.bin` only when a board
+  is stuck on old firmware that cannot take the full image directly.
+- Point that board's OTA filename at the bridge with target version
+  `1.4.6-bridge`. Once the bridge boots, the server advertises the global
+  `metroboard_public.bin` image so the board can finish upgrading.
+
 Safety checks:
 
 - The server only advertises firmware when the target version is newer than the
