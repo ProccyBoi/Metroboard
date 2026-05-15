@@ -635,6 +635,9 @@ def _default_board_settings(board_id: str) -> dict:
             "states": {},
             "updated_at": None,
         },
+        "display": {
+            "distance_brightness": True,
+        },
         "ota": {
             "enabled": True,
             "target_version": "",
@@ -648,7 +651,7 @@ def _normalize_board_config(board_id: str, cfg: T.Optional[dict]) -> dict:
         return base
 
     for key, value in cfg.items():
-        if key in ("night_mode", "animation", "test_mode", "ota") and isinstance(value, dict):
+        if key in ("night_mode", "animation", "test_mode", "display", "ota") and isinstance(value, dict):
             merged = dict(base.get(key, {}))
             merged.update(value)
             base[key] = merged
@@ -670,6 +673,11 @@ def _normalize_board_config(board_id: str, cfg: T.Optional[dict]) -> dict:
         base["brightness"] = max(0, min(150, int(base.get("brightness", 16))))
     except Exception:
         base["brightness"] = 16
+    display = base.get("display")
+    if not isinstance(display, dict):
+        display = {}
+    display["distance_brightness"] = bool(display.get("distance_brightness", True))
+    base["display"] = display
     return base
 
 def _normalize_board_id(board_id: T.Optional[str]) -> str:
@@ -1701,7 +1709,7 @@ def load_station_index(
 
     return idx
 
-# ---------------- Child→Parent map for VP.stop_id resolution ----------------
+# ---------------- Child->Parent map for VP.stop_id resolution ----------------
 def build_child_to_parent(stops="stops.txt") -> dict[str, str]:
     out: dict[str, str] = {}
     with open(stops, encoding="utf-8-sig") as f:
@@ -1713,7 +1721,7 @@ def build_child_to_parent(stops="stops.txt") -> dict[str, str]:
                 out[sid] = pid
             if sid and lt == "1" and is_num_parent(sid):
                 out.setdefault(sid, sid)
-    vlog(f"child→parent: {len(out)}")
+    vlog(f"child->parent: {len(out)}")
     return out
 
 def extract_station_name_from_stop_id(stop_id: str) -> T.Optional[str]:
@@ -1794,6 +1802,76 @@ def route_nearest_station_names(
     if best_d is None:
         return set()
     return {name for name, d in distances if d <= best_d + MB_ROUTE_NEAREST_MARGIN_M}
+
+def parent_from_realtime_stop_id(stop_id: T.Optional[str]) -> T.Optional[str]:
+    if not stop_id:
+        return None
+    parent = CHILD_TO_PARENT.get(stop_id) or (stop_id if is_num_parent(stop_id) else None)
+    if parent:
+        return parent
+    extracted_name = extract_station_name_from_stop_id(stop_id)
+    if extracted_name:
+        return STATION_NAME_TO_PARENT.get(extracted_name)
+    return None
+
+def _route_matches_station(route_short: T.Optional[str], meta: dict) -> bool:
+    if route_short:
+        return (meta.get("route_short") or "").upper() == route_short.upper()
+    return not MB_STRICT_ROUTE_MATCH
+
+def _nearest_station_key(
+    route_short: T.Optional[str],
+    lat: T.Optional[float],
+    lon: T.Optional[float],
+    candidate_keys: T.Optional[T.Iterable[str]] = None,
+) -> tuple[T.Optional[str], T.Optional[float]]:
+    if lat is None or lon is None:
+        return None, None
+
+    allowed = set(candidate_keys) if candidate_keys is not None else None
+    best_key: T.Optional[str] = None
+    best_d: T.Optional[float] = None
+
+    for key, meta in STATION_INDEX.items():
+        if allowed is not None and key not in allowed:
+            continue
+        if not _route_matches_station(route_short, meta):
+            continue
+        d = hav_m(meta["lat"], meta["lon"], lat, lon)
+        if best_d is None or d < best_d or (d == best_d and key < (best_key or key)):
+            best_key = key
+            best_d = d
+
+    return best_key, best_d
+
+def _station_key_for_parent(
+    parent_stop_id: str,
+    route_short: T.Optional[str],
+    lat: T.Optional[float],
+    lon: T.Optional[float],
+) -> tuple[T.Optional[str], T.Optional[float]]:
+    candidates = [
+        key for key, meta in STATION_INDEX.items()
+        if meta.get("stop_id") == parent_stop_id and _route_matches_station(route_short, meta)
+    ]
+    if not candidates:
+        return None, None
+    if lat is not None and lon is not None:
+        return _nearest_station_key(route_short, lat, lon, candidates)
+    key = sorted(candidates)[0]
+    return key, None
+
+def _state_for_target_distance(
+    distance_m: T.Optional[float],
+    vehicle_status: int,
+    matched_reported_stop: bool,
+) -> int:
+    state = status_from_dist(distance_m)
+    if matched_reported_stop and vehicle_status == rt.VehiclePosition.STOPPED_AT:
+        return 3
+    if matched_reported_stop and vehicle_status == rt.VehiclePosition.INCOMING_AT:
+        return max(2, state)
+    return state
 
 # ---------------- GTFS-RT: fetch & parse ----------------
 _FEED_CACHE: T.Optional[rt.FeedMessage] = None
@@ -2186,7 +2264,7 @@ def _startup():
             # Store clean name without route suffix
             STATION_NAME_TO_PARENT[base_name] = pid
     
-    vlog(f"station_name→parent: {len(STATION_NAME_TO_PARENT)}")
+    vlog(f"station_name->parent: {len(STATION_NAME_TO_PARENT)}")
     
     if not STATION_INDEX:
         raise RuntimeError("No stations after filtering")
@@ -2405,7 +2483,9 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
     nm = cfg.get("night_mode", {}) or {}
     an = cfg.get("animation", {}) or {}
     test_mode = cfg.get("test_mode", {}) or {}
+    display = cfg.get("display", {}) or {}
     ota = cfg.get("ota", {}) or {}
+    distance_brightness_enabled = bool(display.get("distance_brightness", True))
 
     an_color = an.get("color", [255, 80, 0])
     if not isinstance(an_color, list) or len(an_color) < 3:
@@ -2612,6 +2692,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           <div class="section-head"><h3>Brightness</h3><span class="tag">0-150</span></div>
           <div class="slider-row"><input id="brightness" type="range" min="0" max="150" name="brightness" value="__BRIGHTNESS__" /><div class="pill" id="brightnessValue">__BRIGHTNESS__</div></div>
           <p class="note">Applies to the entire board; night mode can override this later.</p>
+          <label class="option" style="margin-top:12px;"><input id="distanceBrightness" type="checkbox" name="distance_brightness_enabled" __DISTANCE_BRIGHTNESS_ENABLED__ /><div><strong>Distance brightness</strong><p class="muted">Nearby trains use dim line colour, approaching trains are brighter, and trains at the station use full brightness.</p></div></label>
         </section>
 
         <section class="card">
@@ -2659,6 +2740,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         const nodeByKey = new Map();
         const brightness = document.getElementById("brightness");
         const brightnessValue = document.getElementById("brightnessValue");
+        const distanceBrightnessToggle = document.getElementById("distanceBrightness");
         const nmToggle = document.getElementById("nm_enabled");
         const nightFields = document.querySelectorAll("[data-night-field]");
         const nightStatus = document.getElementById("nightStatus");
@@ -2771,8 +2853,9 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           const normalizedStates = {};
           stationKeys.forEach(key => {
             const state = Math.max(0, Math.min(3, Number(states[key] || 0)));
-            normalizedStates[key] = state;
-            setNodeState(key, state);
+            const displayState = distanceBrightnessToggle && !distanceBrightnessToggle.checked && state < 3 ? 0 : state;
+            normalizedStates[key] = displayState;
+            setNodeState(key, displayState);
           });
           const active = stationKeys.filter(key => normalizedStates[key] > 0).length;
           const modeLabel = currentMode() === "test" ? "Test" : (currentMode() === "animation" ? "Animation" : "Live");
@@ -3009,6 +3092,9 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
             refreshSimulatorStates();
           }
         };
+        if (distanceBrightnessToggle) {
+          distanceBrightnessToggle.addEventListener("change", refreshSimulatorStates);
+        }
         document.querySelectorAll('input[name="mode"]').forEach(el => el.addEventListener("change", syncModeUi));
         [anName, pulseColorInput, document.querySelector('input[name="an_speed"]')].forEach(el => {
           if (!el) return;
@@ -3085,6 +3171,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         "__MODE_TEST_CHECKED__": "checked" if mode == "test" else "",
         "__MODE_ANIMATION_CHECKED__": "checked" if mode == "animation" else "",
         "__BRIGHTNESS__": str(b),
+        "__DISTANCE_BRIGHTNESS_ENABLED__": "checked" if distance_brightness_enabled else "",
         "__NM_ENABLED__": "checked" if nm.get("enabled") else "",
         "__NM_START__": html.escape(str(nm.get("start", "23:00"))),
         "__NM_END__": html.escape(str(nm.get("end", "06:00"))),
@@ -3129,6 +3216,7 @@ async def board_settings_save(
     an_speed: int = Form(120),
     an_color: str = Form("#FF5000"),
     test_states_json: str = Form("{}"),
+    distance_brightness_enabled: T.Optional[str] = Form(None),
     ota_enabled: T.Optional[str] = Form(None),
     ota_target_version: str = Form(""),
     ota_filename: str = Form(""),
@@ -3166,6 +3254,9 @@ async def board_settings_save(
     cfg["test_mode"] = {
         "states": _sanitize_test_states(test_states_json),
         "updated_at": datetime.utcnow().isoformat() + "Z",
+    }
+    cfg["display"] = {
+        "distance_brightness": bool(distance_brightness_enabled),
     }
     safe_ota_filename = _safe_firmware_filename(ota_filename)
     if ota_filename and not safe_ota_filename:
@@ -3441,74 +3532,50 @@ def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
     if not trains:
         return {k: 0 for k in subset.keys()}
 
-    VP_INCOMING = rt.VehiclePosition.INCOMING_AT
-    VP_STOPPED = rt.VehiclePosition.STOPPED_AT
-
-    out: dict[str, int] = {}
+    out: dict[str, int] = {k: 0 for k in subset.keys()}
     matches = 0
     dist_fb = 0
-    name_matches = 0  # NEW: track name-based matches
-    nearest_by_train: dict[int, set[str]] = {}
+    skipped_no_target = 0
 
-    for name, meta in subset.items():
-        pid = meta["stop_id"]
-        slat, slon = meta["lat"], meta["lon"]
-        station_route = (meta.get("route_short") or "").upper()
+    for tlat, tlon, train_route, child_sid, st in trains:
+        if train_route is None and MB_STRICT_ROUTE_MATCH:
+            skipped_no_target += 1
+            continue
 
-        best = 0
-        best_d = None
+        target_key: T.Optional[str] = None
+        target_distance: T.Optional[float] = None
+        matched_reported_stop = False
 
-        for train_idx, (tlat, tlon, train_route, child_sid, st) in enumerate(trains):
-            if train_route is None:
-                if MB_STRICT_ROUTE_MATCH:
-                    continue
-            elif train_route != station_route:
+        if not MB_FORCE_DISTANCE and child_sid:
+            parent = parent_from_realtime_stop_id(child_sid)
+            if parent:
+                target_key, target_distance = _station_key_for_parent(parent, train_route, tlat, tlon)
+                matched_reported_stop = target_key is not None
+
+        if target_key is None:
+            target_key, target_distance = _nearest_station_key(train_route, tlat, tlon)
+            if target_key is None:
+                skipped_no_target += 1
                 continue
 
-            parent = None
-            if not MB_FORCE_DISTANCE and child_sid:
-                # Try 1: Direct parent lookup (numeric GTFS stop_ids)
-                parent = CHILD_TO_PARENT.get(child_sid) or (child_sid if is_num_parent(child_sid) else None)
-                
-                # Try 2: Extract station name from location-based stop_ids (TfNSW format)
-                if not parent or parent != pid:
-                    extracted_name = extract_station_name_from_stop_id(child_sid)
-                    if extracted_name:
-                        parent = STATION_NAME_TO_PARENT.get(extracted_name)
-                        if parent == pid:
-                            name_matches += 1
-                
-                if parent == pid:
-                    if st == VP_STOPPED:
-                        best = 3
-                        matches += 1
-                        break
-                    elif st == VP_INCOMING:
-                        best = max(best, 2)
-                        matches += 1
+        state = _state_for_target_distance(target_distance, st, matched_reported_stop)
+        if state <= 0:
+            continue
 
-            if best < 3 and tlat is not None and tlon is not None:
-                if parent != pid:
-                    if train_idx not in nearest_by_train:
-                        nearest_by_train[train_idx] = route_nearest_station_names(station_route, tlat, tlon)
-                    nearest = nearest_by_train[train_idx]
-                    if nearest and name not in nearest:
-                        continue
-                d = hav_m(slat, slon, tlat, tlon)
-                if best_d is None or d < best_d:
-                    best_d = d
+        if matched_reported_stop:
+            matches += 1
+        else:
+            dist_fb += 1
 
-        if best == 0 and best_d is not None:
-            best = status_from_dist(best_d)
-            if best > 0:
-                dist_fb += 1
-
-        out[name] = best
-
+        if target_key in out:
+            out[target_key] = max(out[target_key], state)
 
     if MB_VERBOSE:
         act = sum(1 for v in out.values() if v > 0)
-        vlog(f"result active={act}/{len(subset)} matches={matches} (name_based={name_matches}) distance_fb={dist_fb}")
+        vlog(
+            f"result active={act}/{len(subset)} matches={matches} "
+            f"distance_fb={dist_fb} skipped_no_target={skipped_no_target}"
+        )
 
     return out
 
@@ -3589,6 +3656,8 @@ def board_payload(
         "mode": mode,
         "brightness": base_brightness,
         "brightness_effective": effective_brightness,
+        "display": cfg.get("display", {}),
+        "distance_brightness": bool((cfg.get("display", {}) or {}).get("distance_brightness", True)),
         "night_mode": nm_cfg,
         "night_mode_active": nm_active,
         "animation": cfg.get("animation", {}),

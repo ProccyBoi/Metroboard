@@ -11,7 +11,7 @@ Metroboard is a FastAPI service that converts Transport for NSW (TfNSW) GTFS-Rea
 - Static GTFS filtering to rail/metro routes (route types 1 and 2) with optional allowlists.
 - Station+route indexing with optional whitelist and bounding box guardrails.
 - LED-friendly status codes for off/far/approaching/at-station.
-- Board settings UI with per-board brightness, night mode, and animation options.
+- Board settings UI with per-board brightness, optional distance-based brightness, night mode, and animation options.
 - Firmware payload endpoint for easy embedded-device integration.
 
 ## How it works (technical overview)
@@ -19,7 +19,7 @@ Metroboard is a FastAPI service that converts Transport for NSW (TfNSW) GTFS-Rea
 2. **Route mapping**: Builds a route short-name mapping and applies overrides (CSV or JSON) when present.
 3. **Station index**: Filters to rail/metro routes, keeps numeric parent stations, and builds station+route keys used by the LED board.
 4. **Realtime merge**: Fetches GTFS-Realtime feeds, merges data, and caches responses for a short interval.
-5. **State calculation**: Matches trains to stations by stop ID when possible; otherwise uses distance thresholds to determine far/near/solid states.
+5. **State calculation**: Matches each train to one station by stop ID when possible; otherwise uses the nearest station on that route and distance thresholds to determine far/near/solid states.
 
 ## Requirements
 - Python 3.10+
@@ -101,6 +101,11 @@ The PlatformIO environment is configured for `COM17`.
 - `2` — approaching (distance > `D_SOLID` and ≤ `D_NEAR`, or incoming status)
 - `3` — at station / solid (stopped or within `D_SOLID`)
 
+When distance brightness is enabled for a board, firmware renders `1` as a dim
+line colour, `2` as medium brightness, and `3` at the board's configured full
+brightness. When disabled, only `3` is lit, matching the older solid-only
+behavior.
+
 ## Running locally
 1. Export a TfNSW API token:
    ```bash
@@ -118,6 +123,7 @@ The PlatformIO environment is configured for `COM17`.
 ## Board settings UI
 The minimal HTML UI at `/login` and `/board/{board_id}` lets you:
 - Set brightness and mode (`live`, `test`, or `animation`).
+- Toggle distance brightness for live train LEDs.
 - Configure night-mode windows and effective brightness.
 - Select manual test LEDs from the simulator.
 - Adjust animation effect, color, and speed.

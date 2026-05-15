@@ -145,10 +145,15 @@ static bool loadConfigFromPrefs() {
     return gConfig.isValid();
 }
 
+static void applyWifiRadioTuning() {
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+}
+
 static bool wifiConnect(uint32_t timeoutMs) {
     if (!gConfig.isValid()) return false;
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
+    applyWifiRadioTuning();
     if (gConfig.pass.length() > 0) {
         WiFi.begin(gConfig.ssid.c_str(), gConfig.pass.c_str());
     } else {

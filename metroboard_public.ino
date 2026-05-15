@@ -25,7 +25,7 @@
 static const char* kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
 
-static const char* kFirmwareVersion = "1.4.7";
+static const char* kFirmwareVersion = "1.4.8";
 static const char* kBuildLabel = "public";
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
 static const uint32_t SETTINGS_FETCH_MS = 30000;
@@ -52,6 +52,9 @@ uint8_t gBaseBrightness = 16;
 uint8_t gEffectiveBrightness = 16;
 static const uint8_t kStatusBrightness = 16;
 bool gBoardIdValid = false;
+bool gDistanceBrightnessEnabled = true;
+static const uint8_t kDistanceLevelFar = 55;
+static const uint8_t kDistanceLevelApproaching = 150;
 
 enum Line : uint8_t {
     L_T9,
@@ -314,6 +317,25 @@ static uint32_t lineColorScaled(Line ln, uint8_t level) {
     uint8_t g = (uint8_t)(((h >> 8) & 0xFF) * level / 255);
     uint8_t b = (uint8_t)((h & 0xFF) * level / 255);
     return strips[ln].Color(r, g, b);
+}
+static uint8_t distanceLevelForState(uint8_t state, uint8_t ttl) {
+    if (ttl > 0) return 255;
+    if (!gDistanceBrightnessEnabled) return state == 3 ? 255 : 0;
+    switch (state) {
+        case 1:
+            return kDistanceLevelFar;
+        case 2:
+            return kDistanceLevelApproaching;
+        case 3:
+            return 255;
+        default:
+            return 0;
+    }
+}
+static uint32_t lineColorForState(Line ln, uint8_t state, uint8_t ttl) {
+    uint8_t level = distanceLevelForState(state, ttl);
+    if (level == 0) return 0;
+    return level == 255 ? lineColor(ln) : lineColorScaled(ln, level);
 }
 static uint32_t customColorFor(Line ln, uint8_t level = 255) {
     uint8_t r = (uint8_t)(gAnim.r * level / 255);
@@ -657,8 +679,8 @@ void repaintDirtyLinesAndDecayOnce() {
         strips[ln].clear();
         for (size_t i = 0; i < NB; i++) {
             if (B[i].line != (Line)ln) continue;
-            bool on = (stateBuf[i] == 3) || (ttlBuf[i] > 0);
-            if (on) strips[ln].setPixelColor(B[i].led, lineColor(B[i].line));
+            uint32_t color = lineColorForState(B[i].line, stateBuf[i], ttlBuf[i]);
+            if (color) strips[ln].setPixelColor(B[i].led, color);
         }
         strips[ln].show();
     }
@@ -673,8 +695,8 @@ void renderAll() {
         strips[ln].clear();
     }
     for (size_t i = 0; i < NB; i++) {
-        bool on = (stateBuf[i] == 3) || (ttlBuf[i] > 0);
-        if (on) strips[B[i].line].setPixelColor(B[i].led, lineColor(B[i].line));
+        uint32_t color = lineColorForState(B[i].line, stateBuf[i], ttlBuf[i]);
+        if (color) strips[B[i].line].setPixelColor(B[i].led, color);
     }
     for (uint8_t ln = 0; ln < LINE_COUNT; ln++) strips[ln].show();
     for (size_t i = 0; i < NB; i++)
@@ -735,9 +757,12 @@ String configPageHtml() {
     return html;
 }
 
+void applyWifiRadioTuning();
+
 void startConfigPortal() {
     WiFi.disconnect(true, true);
     WiFi.mode(WIFI_AP);
+    applyWifiRadioTuning();
     uint32_t suffix = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF);
     String apName = "Metroboard-Setup-" + String(suffix, HEX);
     WiFi.softAP(apName.c_str());
@@ -806,9 +831,14 @@ void startConfigPortal() {
 }
 
 // ===== networking & polling =====
+void applyWifiRadioTuning() {
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+}
+
 bool wifiConnect(uint32_t timeoutMs = 20000) {
     WiFi.mode(WIFI_STA);
-    WiFi.setSleep(false);
+    applyWifiRadioTuning();
     setStatus(STATUS_WIFI_CONNECTING);
     if (gConfig.pass.length() > 0)
         WiFi.begin(gConfig.ssid.c_str(), gConfig.pass.c_str());
@@ -843,6 +873,8 @@ void ensureWifi() {
     Serial.println("[WiFi] LOST connection. Reconnecting...");
     setStatus(STATUS_WIFI_CONNECTING);
 
+    WiFi.mode(WIFI_STA);
+    applyWifiRadioTuning();
     WiFi.disconnect(true, true);
     delay(100);
     if (gConfig.pass.length() > 0)
@@ -1213,6 +1245,16 @@ bool applySettingsFromPayload(JsonObject root, bool force) {
     gBaseBrightness = b;
     gEffectiveBrightness = (uint8_t)bEff;
 
+    bool distanceBrightness = root["distance_brightness"] | true;
+    JsonObject display = root["display"];
+    if (!display.isNull()) {
+        distanceBrightness = display["distance_brightness"] | distanceBrightness;
+    }
+    if (distanceBrightness != gDistanceBrightnessEnabled) {
+        for (uint8_t ln = 0; ln < LINE_COUNT; ln++) dirtyLine[ln] = true;
+    }
+    gDistanceBrightnessEnabled = distanceBrightness;
+
     JsonObject nm = root["night_mode"];
     if (!nm.isNull()) {
         gNightMode.enabled = nm["enabled"] | false;
@@ -1274,9 +1316,10 @@ bool applySettingsFromPayload(JsonObject root, bool force) {
 
     Serial.printf(
         "[CFG] ver=%u mode=%s bright=%u eff=%u night=%d active=%d "
-        "anim=%s speed=%d\n",
+        "distBright=%d anim=%s speed=%d\n",
         ver, gMode.c_str(), gBaseBrightness, gEffectiveBrightness,
-        gNightMode.enabled, gNightMode.active, gAnim.name.c_str(), gAnim.speed);
+        gNightMode.enabled, gNightMode.active, gDistanceBrightnessEnabled,
+        gAnim.name.c_str(), gAnim.speed);
     return true;
 }
 
