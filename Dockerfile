@@ -9,6 +9,9 @@ ENV STOP_TIMES_PATH=/app/gtfs/stop_times.txt
 RUN python /app/scripts/ensure_stop_times.py
 COPY station_line_pairs.txt station_line_pairs.csv /app/
 COPY boards.json /app/
+RUN mkdir -p /app/data
+COPY data/boards.json /app/data/boards.json
+ENV BOARD_SETTINGS_PATH=/app/data/boards.json
 COPY firmware /app/firmware
 COPY metroboard_public.ino /app/metroboard_public.ino
 COPY app.py .

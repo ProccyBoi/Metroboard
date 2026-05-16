@@ -38,7 +38,7 @@ Environment variables:
 - `MB_D_SOLID`, `MB_D_NEAR`, `MB_D_FAR` (distance thresholds in meters; defaults 200/800/1500).
 - `MB_AGENCIES`, `MB_ROUTE_SHORT_ALLOW` (allowlists for agencies/route shorts).
 - `ROUTE_SHORT_OVERRIDES_PATH`, `ROUTE_SHORT_OVERRIDES_JSON` (override route short names).
-- `BOARD_SETTINGS_PATH` (board config file; default `boards.json`).
+- `BOARD_SETTINGS_PATH` (board config file; default `data/boards.json`).
 - `STOP_TIMES_PATH` or `GTFS_STOP_TIMES_PATH` (override the stop times file; default prefers `gtfs/stop_times.txt`).
 - `CORS_ALLOW_ORIGIN` (comma-separated CORS origins).
 - `SYD_BBOX` or `SYD_BBOX_DISABLE` (configure/disable bounding box guardrail).
@@ -50,8 +50,9 @@ Environment variables:
 - `FIRMWARE_PATH` (fallback firmware binary path; default `firmware/metroboard_public.bin`).
 - `FIRMWARE_VERSION` (fallback firmware version when no manifest is present).
 - `PUBLIC_BASE_URL` (optional public URL override for OTA download links).
-- `BOARD_OVERLAY_PATH` (optional local board artwork image; default `assets/board_overlay.png`).
-- `BOARD_OVERLAY_URL` (optional externally hosted board artwork image URL).
+- `BOARD_SETTINGS_PATH` should point at persistent storage in hosted deployments if dashboard edits must survive redeploys.
+- `BOARD_OVERLAY_PATH` (legacy optional local board artwork image; default `assets/board_overlay.png`).
+- `BOARD_OVERLAY_URL` (legacy optional externally hosted board artwork image URL).
 
 ## Data files
 Place these alongside `app.py` (repository root):
@@ -69,8 +70,8 @@ Place these alongside `app.py` (repository root):
 - `GET /board_payload?board_id=...` — firmware-friendly settings plus state map.
 - `GET /firmware_manifest?board_id=...&current=...` — OTA firmware metadata.
 - `GET /firmware.bin?board_id=...&version=...` — OTA firmware binary, when deployed.
-- `GET /board_layout` — simulator geometry and optional board artwork URL.
-- `GET /board_overlay` — configured local board artwork image, if present.
+- `GET /board_layout` — station keys and line grouping metadata for dashboard controls.
+- `GET /board_overlay` — legacy configured local board artwork image, if present.
 
 ## Firmware OTA
 The public ESP32 sketch supports HTTP OTA through Koyeb from firmware version `1.4.1`.
@@ -101,6 +102,8 @@ The PlatformIO environment is configured for `COM17`.
 - `2` — approaching (distance > `D_SOLID` and ≤ `D_NEAR`, or incoming status)
 - `3` — at station / solid (stopped or within `D_SOLID`)
 
+Dashboard distance-curve settings can override these default radii per board.
+
 When distance brightness is enabled for a board, firmware renders `1` as a dim
 line colour, `2` as medium brightness, and `3` at the board's configured full
 brightness. When disabled, only `3` is lit, matching the older solid-only
@@ -123,14 +126,17 @@ behavior.
 ## Board settings UI
 The minimal HTML UI at `/login` and `/board/{board_id}` lets you:
 - Set brightness and mode (`live`, `test`, or `animation`).
-- Toggle distance brightness for live train LEDs.
+- Toggle distance brightness for live train LEDs and tune far/approaching brightness plus solid/near/far distance radii.
 - Configure night-mode windows and effective brightness.
-- Select manual test LEDs from the simulator.
+- Select whole-line test LEDs.
 - Adjust animation effect, color, and speed.
 - Configure per-board OTA firmware targets.
 
-Settings are stored in `boards.json` and included in the firmware payload.
+Settings are stored in `data/boards.json` by default and included in the
+firmware payload. For permanent hosted settings, set `BOARD_SETTINGS_PATH` to a
+persistent volume path or move settings storage to a database such as Postgres.
+The ESP setup portal validates Board ID format as you type and checks the
+backend live when the device has Wi-Fi during setup.
 
-To use a photo/print as the simulator background, add a straight-on cropped
-image at `assets/board_overlay.png` or set `BOARD_OVERLAY_URL`. The UI draws the
-interactive station hit targets over that artwork.
+The dashboard intentionally uses compact line controls instead of rendering the
+station visualiser.

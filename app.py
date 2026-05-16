@@ -51,6 +51,9 @@ else:
 D_SOLID = int(os.getenv("MB_D_SOLID", "200"))
 D_NEAR  = int(os.getenv("MB_D_NEAR",  "800"))
 D_FAR   = int(os.getenv("MB_D_FAR",   "1500"))
+DISTANCE_BRIGHTNESS_FAR_DEFAULT = 55
+DISTANCE_BRIGHTNESS_APPROACHING_DEFAULT = 150
+DISTANCE_RADIUS_MAX_M = 5000
 
 # Allowlists (empty=set() means all)
 AGENCY_NAME_ALLOW: set[str] = {a.strip() for a in os.getenv("MB_AGENCIES", "").split(",") if a.strip()}
@@ -637,6 +640,11 @@ def _default_board_settings(board_id: str) -> dict:
         },
         "display": {
             "distance_brightness": True,
+            "far_brightness": DISTANCE_BRIGHTNESS_FAR_DEFAULT,
+            "approaching_brightness": DISTANCE_BRIGHTNESS_APPROACHING_DEFAULT,
+            "solid_radius_m": D_SOLID,
+            "near_radius_m": D_NEAR,
+            "far_radius_m": D_FAR,
         },
         "ota": {
             "enabled": True,
@@ -677,6 +685,38 @@ def _normalize_board_config(board_id: str, cfg: T.Optional[dict]) -> dict:
     if not isinstance(display, dict):
         display = {}
     display["distance_brightness"] = bool(display.get("distance_brightness", True))
+    try:
+        far_brightness = int(display.get("far_brightness", DISTANCE_BRIGHTNESS_FAR_DEFAULT))
+    except Exception:
+        far_brightness = DISTANCE_BRIGHTNESS_FAR_DEFAULT
+    try:
+        approaching_brightness = int(display.get("approaching_brightness", DISTANCE_BRIGHTNESS_APPROACHING_DEFAULT))
+    except Exception:
+        approaching_brightness = DISTANCE_BRIGHTNESS_APPROACHING_DEFAULT
+    far_brightness = max(0, min(255, far_brightness))
+    approaching_brightness = max(far_brightness, min(255, approaching_brightness))
+
+    try:
+        solid_radius = int(display.get("solid_radius_m", D_SOLID))
+    except Exception:
+        solid_radius = D_SOLID
+    try:
+        near_radius = int(display.get("near_radius_m", D_NEAR))
+    except Exception:
+        near_radius = D_NEAR
+    try:
+        far_radius = int(display.get("far_radius_m", D_FAR))
+    except Exception:
+        far_radius = D_FAR
+    solid_radius = max(0, min(DISTANCE_RADIUS_MAX_M, solid_radius))
+    near_radius = max(solid_radius, min(DISTANCE_RADIUS_MAX_M, near_radius))
+    far_radius = max(near_radius, min(DISTANCE_RADIUS_MAX_M, far_radius))
+
+    display["far_brightness"] = far_brightness
+    display["approaching_brightness"] = approaching_brightness
+    display["solid_radius_m"] = solid_radius
+    display["near_radius_m"] = near_radius
+    display["far_radius_m"] = far_radius
     base["display"] = display
     return base
 
@@ -1319,14 +1359,18 @@ def within_bbox(lat: float, lon: float, bbox: tuple[float, float, float, float])
 def is_num_parent(s: str) -> bool:
     return s.isdigit()
 
-def status_from_dist(m: T.Optional[float]) -> int:
+def status_from_dist(m: T.Optional[float], display: T.Optional[dict] = None) -> int:
     if m is None:
         return 0
-    if m <= D_SOLID:
+    display = display if isinstance(display, dict) else {}
+    solid_radius = int(display.get("solid_radius_m", D_SOLID))
+    near_radius = int(display.get("near_radius_m", D_NEAR))
+    far_radius = int(display.get("far_radius_m", D_FAR))
+    if m <= solid_radius:
         return 3  # solid/stopped
-    if m <= D_NEAR:
+    if m <= near_radius:
         return 2  # approaching/medium
-    if m <= D_FAR:
+    if m <= far_radius:
         return 1  # in area/dim
     return 0
 
@@ -1865,8 +1909,9 @@ def _state_for_target_distance(
     distance_m: T.Optional[float],
     vehicle_status: int,
     matched_reported_stop: bool,
+    display: T.Optional[dict] = None,
 ) -> int:
-    state = status_from_dist(distance_m)
+    state = status_from_dist(distance_m, display)
     if matched_reported_stop and vehicle_status == rt.VehiclePosition.STOPPED_AT:
         return 3
     if matched_reported_stop and vehicle_status == rt.VehiclePosition.INCOMING_AT:
@@ -2486,6 +2531,14 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
     display = cfg.get("display", {}) or {}
     ota = cfg.get("ota", {}) or {}
     distance_brightness_enabled = bool(display.get("distance_brightness", True))
+    distance_far_brightness = max(0, min(255, int(display.get("far_brightness", DISTANCE_BRIGHTNESS_FAR_DEFAULT))))
+    distance_approaching_brightness = max(
+        distance_far_brightness,
+        min(255, int(display.get("approaching_brightness", DISTANCE_BRIGHTNESS_APPROACHING_DEFAULT))),
+    )
+    distance_solid_radius = max(0, min(DISTANCE_RADIUS_MAX_M, int(display.get("solid_radius_m", D_SOLID))))
+    distance_near_radius = max(distance_solid_radius, min(DISTANCE_RADIUS_MAX_M, int(display.get("near_radius_m", D_NEAR))))
+    distance_far_radius = max(distance_near_radius, min(DISTANCE_RADIUS_MAX_M, int(display.get("far_radius_m", D_FAR))))
 
     an_color = an.get("color", [255, 80, 0])
     if not isinstance(an_color, list) or len(an_color) < 3:
@@ -2572,24 +2625,6 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
       .status-label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.08em; }
       .status-value { margin-top:6px; font-size:19px; font-weight:750; }
       .status-sub { margin-top:4px; color:var(--muted); font-size:13px; }
-      .layout-grid { display:grid; grid-template-columns:minmax(0,1fr) 270px; gap:14px; }
-      .board-shell { background:#07090d; border:1px solid #303946; border-radius:8px; overflow:hidden; min-height:520px; }
-      #boardSvg { display:block; width:100%; aspect-ratio:861/850; min-height:520px; }
-      .board-overlay { opacity:.78; pointer-events:none; }
-      body.overlay-off .board-overlay { display:none; }
-      .network-title { fill:#d7dee7; font-size:46px; font-weight:750; letter-spacing:0; }
-      .line-path { fill:none; stroke-width:6; stroke-linecap:round; stroke-linejoin:round; opacity:.58; }
-      .station-node { fill:#2a2f38; stroke:#a9b4c1; stroke-width:2; cursor:default; transition:opacity 120ms ease, fill 120ms ease, r 120ms ease, stroke-width 120ms ease; }
-      body[data-mode="test"] .station-node { cursor:pointer; }
-      body[data-mode="test"] .station-node:hover, body[data-mode="test"] .station-node:focus { stroke:#fff; stroke-width:3; outline:none; }
-      .station-node.state-1 { fill:var(--active-color,var(--line-color)); opacity:.34; }
-      .station-node.state-2 { fill:var(--active-color,var(--line-color)); opacity:.68; }
-      .station-node.state-3 { fill:var(--active-color,var(--line-color)); opacity:1; r:7; filter:drop-shadow(0 0 7px var(--active-color,var(--line-color))); }
-      .station-label { fill:#d7e0ea; font-size:8px; pointer-events:none; paint-order:stroke; stroke:#07090d; stroke-width:3px; stroke-linejoin:round; opacity:.84; }
-      .station-label.is-major { fill:#ffffff; font-size:10px; font-weight:750; opacity:.95; }
-      body.labels-off .station-label { display:none; }
-      .line-badge { fill:#111820; stroke:#c6d2df; stroke-width:1.5; }
-      .line-badge-text { fill:#f4f7fb; font-size:14px; font-weight:800; text-anchor:middle; dominant-baseline:central; }
       .sim-side { border:1px solid var(--border); border-radius:8px; padding:12px; background:var(--panel2); }
       .sim-summary { display:grid; gap:4px; padding:10px 0 2px; }
       .sim-summary strong { font-size:22px; }
@@ -2603,6 +2638,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
       button.control { border:1px solid var(--border); border-radius:8px; background:rgba(255,255,255,.05); color:var(--text); padding:9px 10px; font-weight:650; cursor:pointer; }
       button.control:hover { border-color:var(--accent); }
       button.control[data-line] { border-left:4px solid var(--line-color); }
+      button.control.is-active { background:rgba(245,158,11,.14); border-color:var(--accent); }
       .sim-controls.is-disabled button { opacity:.55; cursor:not-allowed; }
       .mode-options { display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:10px; margin-top:12px; }
       .option { border:1px solid var(--border); border-radius:8px; padding:12px 14px; display:flex; gap:10px; align-items:center; background:rgba(255,255,255,.02); }
@@ -2623,7 +2659,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
       .actions { display:flex; justify-content:flex-end; margin-top:16px; }
       button.primary { background:var(--accent); color:#111; border:none; border-radius:8px; padding:12px 18px; font-weight:800; cursor:pointer; }
       button.primary:hover { filter:brightness(1.08); }
-      @media (max-width:880px) { .layout-grid{grid-template-columns:1fr;} .topbar{align-items:flex-start; flex-direction:column;} }
+      @media (max-width:880px) { .topbar{align-items:flex-start; flex-direction:column;} }
       @media (max-width:640px) { main{padding:18px 10px 42px;} .card{padding:14px;} .sim-controls{grid-template-columns:1fr;} }
     </style>
   </head>
@@ -2652,29 +2688,23 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         <input type="hidden" id="test_states_json" name="test_states_json" value="__TEST_STATES_ATTR__" />
 
         <section class="card">
-          <div class="section-head"><h3>Board Simulator</h3><span class="tag" id="simStateTag">Loading layout</span></div>
-          <div class="layout-grid">
-            <div class="board-shell"><svg id="boardSvg" viewBox="0 0 861 850" role="img" aria-label="Metroboard simulator"></svg></div>
-            <div class="sim-side">
-              <h4>Test Lights</h4>
-              <p class="muted">Select Test lights mode, then click stations or use line controls. Save settings to apply to the physical board.</p>
-              <div class="sim-summary">
-                <div><strong id="activeStationCount">--</strong><span class="muted"> station LEDs lit</span></div>
-                <div class="note" id="simUpdatedAt">Waiting for layout</div>
-              </div>
-              <label class="option" style="margin-top:12px;"><input id="labelToggle" type="checkbox" checked /><div><strong>Station labels</strong><p class="muted">Show station names on the simulator.</p></div></label>
-              <label class="option hidden" id="overlayToggleOption" style="margin-top:8px;"><input id="overlayToggle" type="checkbox" checked /><div><strong>Board artwork</strong><p class="muted">Show the configured artwork under the station targets.</p></div></label>
-              <div class="sim-controls" id="testControls">
-                <button class="control" type="button" data-action="all-off">All off</button>
-                <button class="control" type="button" data-action="all-on">All on</button>
-              </div>
-              <div class="state-legend" aria-label="Station state legend">
-                <div class="legend-row"><span class="legend-dot"></span><span>Off</span></div>
-                <div class="legend-row"><span class="legend-dot state-1"></span><span>Nearby</span></div>
-                <div class="legend-row"><span class="legend-dot state-2"></span><span>Approaching</span></div>
-                <div class="legend-row"><span class="legend-dot state-3"></span><span>At station</span></div>
-              </div>
-              <p class="note" id="testModeHint">Station clicks edit test lights only while Test lights mode is selected.</p>
+          <div class="section-head"><h3>Test Lines</h3><span class="tag" id="simStateTag">Loading lines</span></div>
+          <div class="sim-side">
+            <h4>Line Controls</h4>
+            <p class="muted">Select Test lights mode, then choose whole lines to light on the physical board.</p>
+            <div class="sim-summary">
+              <div><strong id="activeStationCount">--</strong><span class="muted"> station LEDs lit</span></div>
+              <div class="note" id="simUpdatedAt">Waiting for line controls</div>
+            </div>
+            <div class="sim-controls" id="testControls">
+              <button class="control" type="button" data-action="all-off">All off</button>
+              <button class="control" type="button" data-action="all-on">All on</button>
+            </div>
+            <div class="state-legend" aria-label="Station state legend">
+              <div class="legend-row"><span class="legend-dot"></span><span>Off</span></div>
+              <div class="legend-row"><span class="legend-dot state-1"></span><span>Nearby</span></div>
+              <div class="legend-row"><span class="legend-dot state-2"></span><span>Approaching</span></div>
+              <div class="legend-row"><span class="legend-dot state-3"></span><span>At station</span></div>
             </div>
           </div>
         </section>
@@ -2683,7 +2713,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           <div class="section-head"><h3>Display Mode</h3><span class="tag">Live, Test, Animation</span></div>
           <div class="mode-options">
             <label class="option"><input type="radio" name="mode" value="live" __MODE_LIVE_CHECKED__ /><div><strong>Live trains</strong><p class="muted">Use the network feed to light up stations.</p></div></label>
-            <label class="option"><input type="radio" name="mode" value="test" __MODE_TEST_CHECKED__ /><div><strong>Test lights</strong><p class="muted">Display manually selected LEDs from the simulator.</p></div></label>
+            <label class="option"><input type="radio" name="mode" value="test" __MODE_TEST_CHECKED__ /><div><strong>Test lights</strong><p class="muted">Display manually selected line LEDs.</p></div></label>
             <label class="option"><input type="radio" name="mode" value="animation" __MODE_ANIMATION_CHECKED__ /><div><strong>Animation</strong><p class="muted">Ignore live trains and play the configured effect.</p></div></label>
           </div>
         </section>
@@ -2693,6 +2723,15 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           <div class="slider-row"><input id="brightness" type="range" min="0" max="150" name="brightness" value="__BRIGHTNESS__" /><div class="pill" id="brightnessValue">__BRIGHTNESS__</div></div>
           <p class="note">Applies to the entire board; night mode can override this later.</p>
           <label class="option" style="margin-top:12px;"><input id="distanceBrightness" type="checkbox" name="distance_brightness_enabled" __DISTANCE_BRIGHTNESS_ENABLED__ /><div><strong>Distance brightness</strong><p class="muted">Nearby trains use dim line colour, approaching trains are brighter, and trains at the station use full brightness.</p></div></label>
+          <div class="two-col" style="margin-top:12px;">
+            <label class="field">Far brightness<div class="slider-row"><input data-range-output="distanceFarBrightnessValue" type="range" min="0" max="255" name="distance_far_brightness" value="__DISTANCE_FAR_BRIGHTNESS__" /><div class="pill" id="distanceFarBrightnessValue">__DISTANCE_FAR_BRIGHTNESS__</div></div></label>
+            <label class="field">Approaching brightness<div class="slider-row"><input data-range-output="distanceApproachingBrightnessValue" type="range" min="0" max="255" name="distance_approaching_brightness" value="__DISTANCE_APPROACHING_BRIGHTNESS__" /><div class="pill" id="distanceApproachingBrightnessValue">__DISTANCE_APPROACHING_BRIGHTNESS__</div></div></label>
+          </div>
+          <div class="two-col" style="margin-top:10px;">
+            <label class="field">Solid radius, m<div class="slider-row"><input data-range-output="distanceSolidRadiusValue" type="range" min="0" max="5000" step="25" name="distance_solid_radius_m" value="__DISTANCE_SOLID_RADIUS__" /><div class="pill" id="distanceSolidRadiusValue">__DISTANCE_SOLID_RADIUS__</div></div></label>
+            <label class="field">Near radius, m<div class="slider-row"><input data-range-output="distanceNearRadiusValue" type="range" min="0" max="5000" step="25" name="distance_near_radius_m" value="__DISTANCE_NEAR_RADIUS__" /><div class="pill" id="distanceNearRadiusValue">__DISTANCE_NEAR_RADIUS__</div></div></label>
+            <label class="field">Far radius, m<div class="slider-row"><input data-range-output="distanceFarRadiusValue" type="range" min="0" max="5000" step="25" name="distance_far_radius_m" value="__DISTANCE_FAR_RADIUS__" /><div class="pill" id="distanceFarRadiusValue">__DISTANCE_FAR_RADIUS__</div></div></label>
+          </div>
         </section>
 
         <section class="card">
@@ -2737,7 +2776,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         let testStates = __TEST_STATES_JSON__;
         let layoutModel = null;
         let stationKeys = [];
-        const nodeByKey = new Map();
+        const lineKeysByName = new Map();
         const brightness = document.getElementById("brightness");
         const brightnessValue = document.getElementById("brightnessValue");
         const distanceBrightnessToggle = document.getElementById("distanceBrightness");
@@ -2761,17 +2800,12 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         const firmwareCurrent = document.getElementById("firmwareCurrent");
         const firmwareSub = document.getElementById("firmwareSub");
         const otaTarget = document.getElementById("otaTarget");
-        const svg = document.getElementById("boardSvg");
         const simStateTag = document.getElementById("simStateTag");
         const testControls = document.getElementById("testControls");
         const testStatesInput = document.getElementById("test_states_json");
-        const labelToggle = document.getElementById("labelToggle");
-        const overlayToggle = document.getElementById("overlayToggle");
-        const overlayToggleOption = document.getElementById("overlayToggleOption");
         const activeStationCount = document.getElementById("activeStationCount");
         const simUpdatedAt = document.getElementById("simUpdatedAt");
         const customColorAnimations = new Set(__AN_CUSTOM_COLOR_NAMES__);
-        const stateLabels = ["Off", "Nearby", "Approaching", "At station"];
 
         const currentMode = () => document.querySelector('input[name="mode"]:checked')?.value || "live";
         const syncBrightness = () => brightnessValue.textContent = brightness.value;
@@ -2779,6 +2813,12 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         brightness.addEventListener("input", syncBrightness);
         syncBrightness();
         syncTestStateInput();
+        document.querySelectorAll("[data-range-output]").forEach(el => {
+          const out = document.getElementById(el.dataset.rangeOutput);
+          const sync = () => { if (out) out.textContent = el.value; };
+          el.addEventListener("input", sync);
+          sync();
+        });
 
         const formatTime = (v) => {
           if (!v || !v.includes(":")) return v || "-";
@@ -2823,60 +2863,45 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           return mins ? `${h}h ${mins}m` : `${h}h`;
         };
 
-        const syncActiveColor = () => {
-          const color = currentMode() === "animation" && customColorAnimations.has(anName.value)
-            ? (pulseColorInput.value || "#FF5000")
-            : "";
-          nodeByKey.forEach(nodes => {
-            nodes.forEach(node => {
-              if (color) node.style.setProperty("--active-color", color);
-              else node.style.removeProperty("--active-color");
-            });
-          });
-        };
-
-        const setNodeState = (key, state) => {
-          const nodes = nodeByKey.get(key);
-          if (!nodes) return;
-          const normalized = Math.max(0, Math.min(3, Number(state || 0)));
-          nodes.forEach(node => {
-            node.classList.remove("state-0", "state-1", "state-2", "state-3");
-            node.classList.add("state-" + normalized);
-            node.dataset.state = String(normalized);
-            node.setAttribute("aria-label", `${node.dataset.titleBase}: ${stateLabels[normalized]}`);
-            const title = node.querySelector("title");
-            if (title) title.textContent = `${node.dataset.titleBase}: ${stateLabels[normalized]}`;
+        const syncLineButtons = (states) => {
+          testControls.querySelectorAll("button[data-line]").forEach(btn => {
+            const keys = lineKeysByName.get(btn.dataset.line) || [];
+            const active = keys.filter(key => Number(states[key] || 0) > 0).length;
+            btn.classList.toggle("is-active", active > 0);
+            btn.title = `${active}/${keys.length} station LEDs lit`;
           });
         };
         const applyStates = (states) => {
-          syncActiveColor();
           const normalizedStates = {};
           stationKeys.forEach(key => {
             const state = Math.max(0, Math.min(3, Number(states[key] || 0)));
             const displayState = distanceBrightnessToggle && !distanceBrightnessToggle.checked && state < 3 ? 0 : state;
             normalizedStates[key] = displayState;
-            setNodeState(key, displayState);
           });
           const active = stationKeys.filter(key => normalizedStates[key] > 0).length;
           const modeLabel = currentMode() === "test" ? "Test" : (currentMode() === "animation" ? "Animation" : "Live");
           if (simStateTag) simStateTag.textContent = `${modeLabel}: ${active}/${stationKeys.length} lit`;
           if (activeStationCount) activeStationCount.textContent = `${active}/${stationKeys.length}`;
           if (simUpdatedAt) simUpdatedAt.textContent = `Updated ${new Date().toLocaleTimeString([], { hour: "numeric", minute: "2-digit", second: "2-digit" })}`;
+          syncLineButtons(normalizedStates);
         };
 
         const buildTestControls = (model) => {
           testControls.querySelectorAll("[data-line]").forEach(btn => btn.remove());
+          lineKeysByName.clear();
           model.lines.forEach(line => {
+            const keys = Array.from(new Set((line.stations || []).map(st => st.key)));
+            if (!keys.length) return;
+            lineKeysByName.set(line.line, keys);
             const btn = document.createElement("button");
             btn.className = "control";
             btn.type = "button";
             btn.dataset.action = "line-toggle";
             btn.dataset.line = line.line;
             btn.style.setProperty("--line-color", line.color);
-            btn.textContent = line.line;
+            btn.textContent = `${line.line} (${keys.length})`;
             btn.addEventListener("click", () => {
               if (currentMode() !== "test") return;
-              const keys = Array.from(new Set(line.stations.map(st => st.key)));
               const anyOff = keys.some(key => Number(testStates[key] || 0) < 3);
               keys.forEach(key => testStates[key] = anyOff ? 3 : 0);
               syncTestStateInput();
@@ -2884,14 +2909,6 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
             });
             testControls.appendChild(btn);
           });
-        };
-
-        const toggleTestStation = (key) => {
-          if (currentMode() !== "test") return;
-          const current = Number(testStates[key] || 0);
-          testStates[key] = current >= 3 ? 0 : 3;
-          syncTestStateInput();
-          applyStates(testStates);
         };
 
         const buildAnimationPreviewStates = () => {
@@ -2936,104 +2953,11 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           return states;
         };
 
-        const renderLayout = (model) => {
-          const ns = "http://www.w3.org/2000/svg";
-          svg.innerHTML = "";
-          nodeByKey.clear();
+        const loadLineControls = (model) => {
           stationKeys = [];
-          const viewBox = model.viewBox || [0, 0, 861, 850];
-          svg.style.aspectRatio = `${viewBox[2]} / ${viewBox[3]}`;
-          svg.setAttribute("viewBox", viewBox.join(" "));
-          const bg = document.createElementNS(ns, "rect");
-          bg.setAttribute("x", viewBox[0]);
-          bg.setAttribute("y", viewBox[1]);
-          bg.setAttribute("width", viewBox[2]);
-          bg.setAttribute("height", viewBox[3]);
-          bg.setAttribute("fill", "#07090d");
-          svg.appendChild(bg);
-          if (model.overlayUrl) {
-            const overlay = document.createElementNS(ns, "image");
-            overlay.setAttribute("class", "board-overlay");
-            overlay.setAttribute("x", viewBox[0]);
-            overlay.setAttribute("y", viewBox[1]);
-            overlay.setAttribute("width", viewBox[2]);
-            overlay.setAttribute("height", viewBox[3]);
-            overlay.setAttribute("preserveAspectRatio", "none");
-            overlay.setAttribute("href", model.overlayUrl);
-            overlay.setAttributeNS("http://www.w3.org/1999/xlink", "href", model.overlayUrl);
-            svg.appendChild(overlay);
-          }
-          if (overlayToggleOption) overlayToggleOption.classList.toggle("hidden", !model.overlayUrl);
-          const title = document.createElementNS(ns, "text");
-          title.setAttribute("x", "44");
-          title.setAttribute("y", "66");
-          title.setAttribute("class", "network-title");
-          title.textContent = model.title || "Sydney Rail Network";
-          svg.appendChild(title);
-          model.lines.forEach(line => {
-            (line.paths || [line.path]).filter(Boolean).forEach(path => {
-              const poly = document.createElementNS(ns, "polyline");
-              poly.setAttribute("class", "line-path");
-              poly.setAttribute("points", path.map(p => p.join(",")).join(" "));
-              poly.setAttribute("stroke", line.color);
-              svg.appendChild(poly);
-            });
-          });
-          model.lines.forEach(line => {
-            if (!line.stations.length) return;
-            const first = line.stations[0];
-            const badge = document.createElementNS(ns, "rect");
-            badge.setAttribute("x", first.x - 15);
-            badge.setAttribute("y", first.y - 22);
-            badge.setAttribute("width", "30");
-            badge.setAttribute("height", "22");
-            badge.setAttribute("rx", "3");
-            badge.setAttribute("class", "line-badge");
-            svg.appendChild(badge);
-            const badgeText = document.createElementNS(ns, "text");
-            badgeText.setAttribute("x", first.x);
-            badgeText.setAttribute("y", first.y - 11);
-            badgeText.setAttribute("class", "line-badge-text");
-            badgeText.textContent = line.line;
-            svg.appendChild(badgeText);
-            line.stations.forEach(station => {
+          (model.lines || []).forEach(line => {
+            (line.stations || []).forEach(station => {
               if (!stationKeys.includes(station.key)) stationKeys.push(station.key);
-              const label = document.createElementNS(ns, "text");
-              const labelX = Number(station.x) + Number(station.labelDx || 0);
-              const labelY = Number(station.y) + Number(station.labelDy || 0);
-              label.setAttribute("x", labelX);
-              label.setAttribute("y", labelY);
-              label.setAttribute("class", "station-label" + (station.major ? " is-major" : ""));
-              label.setAttribute("text-anchor", "middle");
-              label.setAttribute("dominant-baseline", "central");
-              label.setAttribute("transform", `rotate(${Number(station.labelAngle || 0)} ${labelX} ${labelY})`);
-              label.textContent = station.name;
-              svg.appendChild(label);
-              const circle = document.createElementNS(ns, "circle");
-              circle.setAttribute("cx", station.x);
-              circle.setAttribute("cy", station.y);
-              circle.setAttribute("r", "5");
-              circle.setAttribute("class", "station-node state-0");
-              circle.setAttribute("tabindex", "0");
-              circle.setAttribute("role", "button");
-              circle.dataset.key = station.key;
-              circle.dataset.line = line.line;
-              circle.dataset.titleBase = `${station.name} ${line.line}`;
-              circle.style.setProperty("--line-color", line.color);
-              const titleEl = document.createElementNS(ns, "title");
-              titleEl.textContent = `${station.name} ${line.line}: Off`;
-              circle.appendChild(titleEl);
-              circle.addEventListener("click", () => {
-                toggleTestStation(station.key);
-              });
-              circle.addEventListener("keydown", (event) => {
-                if (event.key !== "Enter" && event.key !== " ") return;
-                event.preventDefault();
-                toggleTestStation(station.key);
-              });
-              if (!nodeByKey.has(station.key)) nodeByKey.set(station.key, []);
-              nodeByKey.get(station.key).push(circle);
-              svg.appendChild(circle);
             });
           });
           buildTestControls(model);
@@ -3076,7 +3000,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           try {
             applyStates(await fetchStatesInBatches());
           } catch (err) {
-            if (simStateTag) simStateTag.textContent = "Simulator unavailable";
+            if (simStateTag) simStateTag.textContent = "Line controls unavailable";
           }
         };
         const syncModeUi = () => {
@@ -3105,25 +3029,16 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
             if (currentMode() === "animation") refreshSimulatorStates();
           });
         });
-        labelToggle.addEventListener("change", () => {
-          document.body.classList.toggle("labels-off", !labelToggle.checked);
-        });
-        if (overlayToggle) {
-          overlayToggle.addEventListener("change", () => {
-            document.body.classList.toggle("overlay-off", !overlayToggle.checked);
-          });
-        }
-
         const loadLayout = async () => {
           try {
             const resp = await fetch("/board_layout", { cache: "no-store" });
             if (!resp.ok) throw new Error("status " + resp.status);
             layoutModel = await resp.json();
-            renderLayout(layoutModel);
+            loadLineControls(layoutModel);
             syncModeUi();
             refreshSimulatorStates();
           } catch (err) {
-            if (simStateTag) simStateTag.textContent = "Layout unavailable";
+            if (simStateTag) simStateTag.textContent = "Line controls unavailable";
           }
         };
         const syncBoardStatus = async () => {
@@ -3172,6 +3087,11 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         "__MODE_ANIMATION_CHECKED__": "checked" if mode == "animation" else "",
         "__BRIGHTNESS__": str(b),
         "__DISTANCE_BRIGHTNESS_ENABLED__": "checked" if distance_brightness_enabled else "",
+        "__DISTANCE_FAR_BRIGHTNESS__": str(distance_far_brightness),
+        "__DISTANCE_APPROACHING_BRIGHTNESS__": str(distance_approaching_brightness),
+        "__DISTANCE_SOLID_RADIUS__": str(distance_solid_radius),
+        "__DISTANCE_NEAR_RADIUS__": str(distance_near_radius),
+        "__DISTANCE_FAR_RADIUS__": str(distance_far_radius),
         "__NM_ENABLED__": "checked" if nm.get("enabled") else "",
         "__NM_START__": html.escape(str(nm.get("start", "23:00"))),
         "__NM_END__": html.escape(str(nm.get("end", "06:00"))),
@@ -3217,6 +3137,11 @@ async def board_settings_save(
     an_color: str = Form("#FF5000"),
     test_states_json: str = Form("{}"),
     distance_brightness_enabled: T.Optional[str] = Form(None),
+    distance_far_brightness: int = Form(DISTANCE_BRIGHTNESS_FAR_DEFAULT),
+    distance_approaching_brightness: int = Form(DISTANCE_BRIGHTNESS_APPROACHING_DEFAULT),
+    distance_solid_radius_m: int = Form(D_SOLID),
+    distance_near_radius_m: int = Form(D_NEAR),
+    distance_far_radius_m: int = Form(D_FAR),
     ota_enabled: T.Optional[str] = Form(None),
     ota_target_version: str = Form(""),
     ota_filename: str = Form(""),
@@ -3255,8 +3180,18 @@ async def board_settings_save(
         "states": _sanitize_test_states(test_states_json),
         "updated_at": datetime.utcnow().isoformat() + "Z",
     }
+    distance_far_brightness = max(0, min(255, int(distance_far_brightness)))
+    distance_approaching_brightness = max(distance_far_brightness, min(255, int(distance_approaching_brightness)))
+    distance_solid_radius_m = max(0, min(DISTANCE_RADIUS_MAX_M, int(distance_solid_radius_m)))
+    distance_near_radius_m = max(distance_solid_radius_m, min(DISTANCE_RADIUS_MAX_M, int(distance_near_radius_m)))
+    distance_far_radius_m = max(distance_near_radius_m, min(DISTANCE_RADIUS_MAX_M, int(distance_far_radius_m)))
     cfg["display"] = {
         "distance_brightness": bool(distance_brightness_enabled),
+        "far_brightness": distance_far_brightness,
+        "approaching_brightness": distance_approaching_brightness,
+        "solid_radius_m": distance_solid_radius_m,
+        "near_radius_m": distance_near_radius_m,
+        "far_radius_m": distance_far_radius_m,
     }
     safe_ota_filename = _safe_firmware_filename(ota_filename)
     if ota_filename and not safe_ota_filename:
@@ -3519,7 +3454,10 @@ def _station_subset(only: T.Optional[str]) -> dict[str, dict]:
     return subset
 
 
-def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
+def _calculate_states_for_subset(
+    subset: dict[str, dict],
+    display: T.Optional[dict] = None,
+) -> dict[str, int]:
     if not subset:
         return {}
 
@@ -3558,7 +3496,7 @@ def _calculate_states_for_subset(subset: dict[str, dict]) -> dict[str, int]:
                 skipped_no_target += 1
                 continue
 
-        state = _state_for_target_distance(target_distance, st, matched_reported_stop)
+        state = _state_for_target_distance(target_distance, st, matched_reported_stop, display)
         if state <= 0:
             continue
 
@@ -3608,7 +3546,7 @@ def states(
     if cfg and cfg.get("mode") == "test":
         return JSONResponse(_calculate_test_states_for_subset(cfg, subset))
 
-    return JSONResponse(_calculate_states_for_subset(subset))
+    return JSONResponse(_calculate_states_for_subset(subset, (cfg or {}).get("display")))
 
 
 @app.get("/board_payload")
@@ -3645,7 +3583,7 @@ def board_payload(
     if mode == "test":
         states_payload = _calculate_test_states_for_subset(cfg, subset)
     else:
-        states_payload = _calculate_states_for_subset(subset)
+        states_payload = _calculate_states_for_subset(subset, cfg.get("display"))
 
     base_brightness = int(cfg.get("brightness", 16))
     nm_cfg = cfg.get("night_mode", {}) or {}

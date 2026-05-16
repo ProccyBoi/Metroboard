@@ -9,6 +9,7 @@
 #include <WebServer.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_wifi.h>
 #include <time.h>
 
 // =========================================
@@ -25,7 +26,7 @@
 static const char* kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
 
-static const char* kFirmwareVersion = "1.4.8";
+static const char* kFirmwareVersion = "1.5.0";
 static const char* kBuildLabel = "public";
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
 static const uint32_t SETTINGS_FETCH_MS = 30000;
@@ -53,8 +54,8 @@ uint8_t gEffectiveBrightness = 16;
 static const uint8_t kStatusBrightness = 16;
 bool gBoardIdValid = false;
 bool gDistanceBrightnessEnabled = true;
-static const uint8_t kDistanceLevelFar = 55;
-static const uint8_t kDistanceLevelApproaching = 150;
+uint8_t gDistanceLevelFar = 55;
+uint8_t gDistanceLevelApproaching = 150;
 
 enum Line : uint8_t {
     L_T9,
@@ -323,9 +324,9 @@ static uint8_t distanceLevelForState(uint8_t state, uint8_t ttl) {
     if (!gDistanceBrightnessEnabled) return state == 3 ? 255 : 0;
     switch (state) {
         case 1:
-            return kDistanceLevelFar;
+            return gDistanceLevelFar;
         case 2:
-            return kDistanceLevelApproaching;
+            return gDistanceLevelApproaching;
         case 3:
             return 255;
         default:
@@ -724,6 +725,55 @@ void saveConfigToPrefs(const DeviceConfig& cfg) {
     gPrefs.end();
 }
 
+bool isBoardIdFormatValid(String boardId) {
+    boardId.trim();
+    boardId.toUpperCase();
+    if (boardId.length() < 5 || boardId.length() > 16) return false;
+    for (size_t i = 0; i < boardId.length(); i++) {
+        char c = boardId.charAt(i);
+        bool ok = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+bool validateBoardIdWithServer(const String& boardId, bool& checked) {
+    checked = false;
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setTimeout(8000);
+    client.setHandshakeTimeout(8000);
+
+    HTTPClient http;
+    http.setTimeout(8000);
+    http.setReuse(false);
+
+    String url = serviceBaseUrl();
+    url += "/board_settings?board_id=";
+    url += enc(boardId.c_str());
+
+    if (!http.begin(client, url)) {
+        http.end();
+        return false;
+    }
+
+    int code = http.GET();
+    http.end();
+
+    if (code == HTTP_CODE_OK) {
+        checked = true;
+        return true;
+    }
+    if (code == HTTP_CODE_BAD_REQUEST || code == HTTP_CODE_NOT_FOUND ||
+        code == HTTP_CODE_FORBIDDEN) {
+        checked = true;
+        return false;
+    }
+    return false;
+}
+
 String configPageHtml() {
     String html =
         "<!doctype html><html><head><meta charset='utf-8'/>"
@@ -733,7 +783,10 @@ String configPageHtml() {
         "label{display:block;margin-top:12px;font-weight:600;}"
         "input{width:100%;max-width:360px;padding:8px;margin-top:6px;}"
         "button{margin-top:18px;padding:10px 16px;font-size:15px;}"
-        ".note{margin-top:18px;color:#555;}</style></head><body>"
+        ".note{margin-top:18px;color:#555;}"
+        ".status{margin-top:8px;font-size:14px;color:#555;}"
+        ".status.ok{color:#147a2e;}.status.bad{color:#b00020;}"
+        ".status.warn{color:#9a6200;}</style></head><body>"
         "<h1>Metroboard Setup</h1>"
         "<form method='POST' action='/save'>"
         "<label>WiFi SSID</label>"
@@ -745,27 +798,56 @@ String configPageHtml() {
         gConfig.pass +
         "'/>"
         "<label>Board ID</label>"
-        "<input name='board' required value='" +
+        "<input id='board' name='board' required maxlength='16' value='" +
         gConfig.boardId +
         "'/>"
+        "<div id='boardStatus' class='status'>Enter the board ID.</div>"
         "<button type='submit'>Save & Restart</button>"
         "</form>"
         "<p class='note'>After saving, the board will reboot and connect to "
         "your "
         "WiFi.</p>"
+        "<script>"
+        "const board=document.getElementById('board');"
+        "const statusEl=document.getElementById('boardStatus');"
+        "let timer=0;"
+        "function setStatus(text,cls){statusEl.textContent=text;"
+        "statusEl.className='status '+(cls||'');}"
+        "async function validateBoard(){"
+        "const id=(board.value||'').trim().toUpperCase();"
+        "board.value=id;"
+        "if(!id){setStatus('Enter the board ID.','');return;}"
+        "if(!/^[A-Z0-9]{5,16}$/.test(id)){setStatus('Use 5-16 letters or numbers.','bad');return;}"
+        "setStatus('Checking board ID...','warn');"
+        "try{const r=await fetch('/validate_board?board='+encodeURIComponent(id),{cache:'no-store'});"
+        "const data=await r.json();"
+        "if(data.valid){setStatus('Board ID found.','ok');}"
+        "else if(data.checked){setStatus('Board ID was not found.','bad');}"
+        "else{setStatus(data.message||'Format looks valid; cloud check unavailable until WiFi is connected.','warn');}}"
+        "catch(e){setStatus('Format looks valid; live check unavailable.','warn');}}"
+        "board.addEventListener('input',()=>{clearTimeout(timer);timer=setTimeout(validateBoard,350);});"
+        "validateBoard();"
+        "</script>"
         "</body></html>";
     return html;
 }
 
-void applyWifiRadioTuning();
+void applyWifiRadioTuning(wifi_interface_t iface = WIFI_IF_STA);
 
 void startConfigPortal() {
     WiFi.disconnect(true, true);
-    WiFi.mode(WIFI_AP);
-    applyWifiRadioTuning();
+    WiFi.mode(WIFI_AP_STA);
+    applyWifiRadioTuning(WIFI_IF_AP);
+    applyWifiRadioTuning(WIFI_IF_STA);
     uint32_t suffix = (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF);
     String apName = "Metroboard-Setup-" + String(suffix, HEX);
     WiFi.softAP(apName.c_str());
+    if (gConfig.ssid.length() > 0) {
+        if (gConfig.pass.length() > 0)
+            WiFi.begin(gConfig.ssid.c_str(), gConfig.pass.c_str());
+        else
+            WiFi.begin(gConfig.ssid.c_str());
+    }
     IPAddress ip = WiFi.softAPIP();
     Serial.printf("\n[CFG] AP \"%s\" IP=%s\n", apName.c_str(),
                   ip.toString().c_str());
@@ -774,6 +856,34 @@ void startConfigPortal() {
 
     gConfigServer.on("/", HTTP_GET, []() {
         gConfigServer.send(200, "text/html", configPageHtml());
+    });
+    gConfigServer.on("/validate_board", HTTP_GET, []() {
+        String board = gConfigServer.arg("board");
+        board.trim();
+        board.toUpperCase();
+        String boardJson = board;
+        boardJson.replace("\\", "\\\\");
+        boardJson.replace("\"", "\\\"");
+
+        String body = "{\"board_id\":\"" + boardJson + "\",";
+        if (!isBoardIdFormatValid(board)) {
+            body += "\"valid\":false,\"checked\":false,"
+                    "\"message\":\"Use 5-16 letters or numbers.\"}";
+            gConfigServer.send(200, "application/json", body);
+            return;
+        }
+
+        bool checked = false;
+        bool valid = validateBoardIdWithServer(board, checked);
+        body += "\"valid\":";
+        body += valid ? "true" : "false";
+        body += ",\"checked\":";
+        body += checked ? "true" : "false";
+        body += ",\"message\":\"";
+        body += checked ? (valid ? "Board ID found." : "Board ID was not found.")
+                        : "Format looks valid; cloud check unavailable until WiFi is connected.";
+        body += "\"}";
+        gConfigServer.send(200, "application/json", body);
     });
     gConfigServer.on("/generate_204", HTTP_GET, []() {
         gConfigServer.sendHeader("Location", "/", true);
@@ -802,10 +912,16 @@ void startConfigPortal() {
         next.boardId = gConfigServer.arg("board");
         next.ssid.trim();
         next.boardId.trim();
+        next.boardId.toUpperCase();
 
         if (!next.isValid()) {
             gConfigServer.send(400, "text/plain",
                                "SSID and Board ID are required.");
+            return;
+        }
+        if (!isBoardIdFormatValid(next.boardId)) {
+            gConfigServer.send(400, "text/plain",
+                               "Board ID must be 5-16 letters or numbers.");
             return;
         }
 
@@ -831,9 +947,10 @@ void startConfigPortal() {
 }
 
 // ===== networking & polling =====
-void applyWifiRadioTuning() {
+void applyWifiRadioTuning(wifi_interface_t iface) {
     WiFi.setSleep(false);
     WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    esp_wifi_set_bandwidth(iface, WIFI_BW_HT20);
 }
 
 bool wifiConnect(uint32_t timeoutMs = 20000) {
@@ -1249,6 +1366,12 @@ bool applySettingsFromPayload(JsonObject root, bool force) {
     JsonObject display = root["display"];
     if (!display.isNull()) {
         distanceBrightness = display["distance_brightness"] | distanceBrightness;
+        int farLevel = display["far_brightness"] | gDistanceLevelFar;
+        int approachingLevel = display["approaching_brightness"] | gDistanceLevelApproaching;
+        farLevel = constrain(farLevel, 0, 255);
+        approachingLevel = constrain(approachingLevel, farLevel, 255);
+        gDistanceLevelFar = (uint8_t)farLevel;
+        gDistanceLevelApproaching = (uint8_t)approachingLevel;
     }
     if (distanceBrightness != gDistanceBrightnessEnabled) {
         for (uint8_t ln = 0; ln < LINE_COUNT; ln++) dirtyLine[ln] = true;

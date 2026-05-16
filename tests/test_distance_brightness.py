@@ -94,6 +94,55 @@ class DistanceBrightnessStateTests(unittest.TestCase):
         self.assertEqual(states["Alpha1"], 0)
         self.assertEqual(states["Gamma1"], 0)
 
+    def test_custom_distance_radius_changes_state_classification(self):
+        self.trains = [
+            (0.0, 0.007, "T1", None, metro.rt.VehiclePosition.IN_TRANSIT_TO),
+        ]
+        display = {
+            "solid_radius_m": 500,
+            "near_radius_m": 900,
+            "far_radius_m": 1600,
+        }
+
+        states = metro._calculate_states_for_subset(metro.STATION_INDEX, display)
+
+        self.assertEqual(states["Beta1"], 3)
+        self.assertEqual(states["Alpha1"], 0)
+        self.assertEqual(states["Gamma1"], 0)
+
+    def test_display_curve_settings_are_normalized(self):
+        cfg = metro._normalize_board_config("TEST1", {
+            "display": {
+                "distance_brightness": True,
+                "far_brightness": 260,
+                "approaching_brightness": 10,
+                "solid_radius_m": 900,
+                "near_radius_m": 100,
+                "far_radius_m": 200,
+            },
+        })
+
+        display = cfg["display"]
+        self.assertEqual(display["far_brightness"], 255)
+        self.assertEqual(display["approaching_brightness"], 255)
+        self.assertEqual(display["solid_radius_m"], 900)
+        self.assertEqual(display["near_radius_m"], 900)
+        self.assertEqual(display["far_radius_m"], 900)
+
+    def test_dashboard_uses_line_controls_without_station_visualiser(self):
+        html = metro._render_board_settings_console(
+            "TEST1",
+            metro._default_board_settings("TEST1"),
+        )
+
+        self.assertIn("Test Lines", html)
+        self.assertIn("Line Controls", html)
+        self.assertIn("distance_far_brightness", html)
+        self.assertIn("distance_solid_radius_m", html)
+        self.assertNotIn("boardSvg", html)
+        self.assertNotIn("station-node", html)
+        self.assertNotIn("Board Simulator", html)
+
 
 if __name__ == "__main__":
     unittest.main()

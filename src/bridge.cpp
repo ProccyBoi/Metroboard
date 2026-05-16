@@ -5,6 +5,7 @@
 #include <Update.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <esp_wifi.h>
 
 static const char* kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
@@ -148,6 +149,7 @@ static bool loadConfigFromPrefs() {
 static void applyWifiRadioTuning() {
     WiFi.setSleep(false);
     WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    esp_wifi_set_bandwidth(WIFI_IF_STA, WIFI_BW_HT20);
 }
 
 static bool wifiConnect(uint32_t timeoutMs) {
