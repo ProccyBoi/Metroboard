@@ -126,11 +126,11 @@ behavior.
 ## Board settings UI
 The minimal HTML UI at `/login` and `/board/{board_id}` lets you:
 - Set brightness and mode (`live`, `test`, or `animation`).
-- Toggle distance brightness for live train LEDs and tune far/approaching brightness plus solid/near/far distance radii.
+- Toggle distance brightness for live train LEDs and tune far/approaching brightness plus solid/near/far distance radii. Distance brightness is off by default.
 - Configure night-mode windows and effective brightness.
-- Select whole-line test LEDs.
-- Adjust animation effect, color, and speed.
-- Configure per-board OTA firmware targets.
+- Select whole-line test LEDs when Test lights mode is active.
+- Adjust animation effect, color, and speed when Animation mode is active.
+- Enable developer mode to view board status and configure per-board OTA firmware targets. Developer mode is off by default except for board `AB12C`.
 
 Settings are stored in `data/boards.json` by default and included in the
 firmware payload. For permanent hosted settings, set `BOARD_SETTINGS_PATH` to a

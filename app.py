@@ -323,12 +323,16 @@ def _board_status_snapshot(board_id: str) -> dict:
     fw = BOARD_FIRMWARE_STATUS.get(board_id, {})
     cfg = BOARD_SETTINGS.get(board_id, {}) or {}
     ota = cfg.get("ota", {}) or {}
+    developer = cfg.get("developer", {}) or {}
     now = time.time()
     return {
         "board_id": board_id,
         "last_payload_at": _iso_utc_from_ts(last),
         "last_payload_age_seconds": None if last is None else max(0.0, now - last),
         "settings_version": BOARD_SETTINGS_VERSION,
+        "developer": {
+            "enabled": bool(developer.get("enabled", board_id == "AB12C")),
+        },
         "feed_age_seconds": _feed_age_seconds(),
         "firmware": {
             "current": fw.get("current"),
@@ -639,12 +643,15 @@ def _default_board_settings(board_id: str) -> dict:
             "updated_at": None,
         },
         "display": {
-            "distance_brightness": True,
+            "distance_brightness": False,
             "far_brightness": DISTANCE_BRIGHTNESS_FAR_DEFAULT,
             "approaching_brightness": DISTANCE_BRIGHTNESS_APPROACHING_DEFAULT,
             "solid_radius_m": D_SOLID,
             "near_radius_m": D_NEAR,
             "far_radius_m": D_FAR,
+        },
+        "developer": {
+            "enabled": board_id == "AB12C",
         },
         "ota": {
             "enabled": True,
@@ -659,7 +666,7 @@ def _normalize_board_config(board_id: str, cfg: T.Optional[dict]) -> dict:
         return base
 
     for key, value in cfg.items():
-        if key in ("night_mode", "animation", "test_mode", "display", "ota") and isinstance(value, dict):
+        if key in ("night_mode", "animation", "test_mode", "display", "developer", "ota") and isinstance(value, dict):
             merged = dict(base.get(key, {}))
             merged.update(value)
             base[key] = merged
@@ -684,7 +691,7 @@ def _normalize_board_config(board_id: str, cfg: T.Optional[dict]) -> dict:
     display = base.get("display")
     if not isinstance(display, dict):
         display = {}
-    display["distance_brightness"] = bool(display.get("distance_brightness", True))
+    display["distance_brightness"] = bool(display.get("distance_brightness", False))
     try:
         far_brightness = int(display.get("far_brightness", DISTANCE_BRIGHTNESS_FAR_DEFAULT))
     except Exception:
@@ -718,6 +725,11 @@ def _normalize_board_config(board_id: str, cfg: T.Optional[dict]) -> dict:
     display["near_radius_m"] = near_radius
     display["far_radius_m"] = far_radius
     base["display"] = display
+    developer = base.get("developer")
+    if not isinstance(developer, dict):
+        developer = {}
+    developer["enabled"] = bool(developer.get("enabled", board_id == "AB12C"))
+    base["developer"] = developer
     return base
 
 def _normalize_board_id(board_id: T.Optional[str]) -> str:
@@ -2529,8 +2541,10 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
     an = cfg.get("animation", {}) or {}
     test_mode = cfg.get("test_mode", {}) or {}
     display = cfg.get("display", {}) or {}
+    developer = cfg.get("developer", {}) or {}
     ota = cfg.get("ota", {}) or {}
-    distance_brightness_enabled = bool(display.get("distance_brightness", True))
+    developer_enabled = bool(developer.get("enabled", board_id == "AB12C"))
+    distance_brightness_enabled = bool(display.get("distance_brightness", False))
     distance_far_brightness = max(0, min(255, int(display.get("far_brightness", DISTANCE_BRIGHTNESS_FAR_DEFAULT))))
     distance_approaching_brightness = max(
         distance_far_brightness,
@@ -2656,6 +2670,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
       .color-picker__swatch { width:18px; height:18px; border-radius:5px; border:1px solid rgba(255,255,255,.2); box-shadow:0 0 8px rgba(0,0,0,.4); }
       .color-picker__cta { font-size:12px; font-weight:700; color:var(--muted); text-transform:uppercase; letter-spacing:.08em; }
       .hidden { display:none; }
+      [hidden] { display:none !important; }
       .actions { display:flex; justify-content:flex-end; margin-top:16px; }
       button.primary { background:var(--accent); color:#111; border:none; border-radius:8px; padding:12px 18px; font-weight:800; cursor:pointer; }
       button.primary:hover { filter:brightness(1.08); }
@@ -2673,25 +2688,23 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         <div><span class="tag" id="boardSyncTag">Checking</span> <a href="/login">Switch board</a></div>
       </div>
 
-      <section class="card">
-        <div class="section-head"><h3>Board Status</h3><span class="tag">Heartbeat</span></div>
-        <div class="status-grid">
-          <div class="status-item"><div class="status-label">Last check-in</div><div class="status-value" id="lastPayloadAge">--</div><div class="status-sub" id="lastPayloadAt">Waiting for board</div></div>
-          <div class="status-item"><div class="status-label">Train feed age</div><div class="status-value" id="feedAge">--</div><div class="status-sub">TfNSW cache age</div></div>
-          <div class="status-item"><div class="status-label">Settings version</div><div class="status-value" id="settingsVersion">__SETTINGS_VERSION__</div><div class="status-sub">Updates after saving</div></div>
-          <div class="status-item"><div class="status-label">Firmware</div><div class="status-value" id="firmwareCurrent">--</div><div class="status-sub" id="firmwareSub">Waiting for board</div></div>
-          <div class="status-item"><div class="status-label">OTA target</div><div class="status-value" id="otaTarget">__ACTIVE_FW_TEXT__</div><div class="status-sub">Per-board deployment</div></div>
-        </div>
-      </section>
-
       <form id="settingsForm" method="post" action="/board/__BOARD_ID__">
         <input type="hidden" id="test_states_json" name="test_states_json" value="__TEST_STATES_ATTR__" />
 
         <section class="card">
+          <div class="section-head"><h3>Display Mode</h3><span class="tag">Live, Test, Animation</span></div>
+          <div class="mode-options">
+            <label class="option"><input type="radio" name="mode" value="live" __MODE_LIVE_CHECKED__ /><div><strong>Live trains</strong><p class="muted">Use the network feed to light up stations.</p></div></label>
+            <label class="option"><input type="radio" name="mode" value="test" __MODE_TEST_CHECKED__ /><div><strong>Test lights</strong><p class="muted">Display manually selected line LEDs.</p></div></label>
+            <label class="option"><input type="radio" name="mode" value="animation" __MODE_ANIMATION_CHECKED__ /><div><strong>Animation</strong><p class="muted">Ignore live trains and play the configured effect.</p></div></label>
+          </div>
+        </section>
+
+        <section class="card" id="testSection" __TEST_SECTION_HIDDEN__>
           <div class="section-head"><h3>Test Lines</h3><span class="tag" id="simStateTag">Loading lines</span></div>
           <div class="sim-side">
             <h4>Line Controls</h4>
-            <p class="muted">Select Test lights mode, then choose whole lines to light on the physical board.</p>
+            <p class="muted">Choose whole lines to light on the physical board.</p>
             <div class="sim-summary">
               <div><strong id="activeStationCount">--</strong><span class="muted"> station LEDs lit</span></div>
               <div class="note" id="simUpdatedAt">Waiting for line controls</div>
@@ -2710,27 +2723,20 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         </section>
 
         <section class="card">
-          <div class="section-head"><h3>Display Mode</h3><span class="tag">Live, Test, Animation</span></div>
-          <div class="mode-options">
-            <label class="option"><input type="radio" name="mode" value="live" __MODE_LIVE_CHECKED__ /><div><strong>Live trains</strong><p class="muted">Use the network feed to light up stations.</p></div></label>
-            <label class="option"><input type="radio" name="mode" value="test" __MODE_TEST_CHECKED__ /><div><strong>Test lights</strong><p class="muted">Display manually selected line LEDs.</p></div></label>
-            <label class="option"><input type="radio" name="mode" value="animation" __MODE_ANIMATION_CHECKED__ /><div><strong>Animation</strong><p class="muted">Ignore live trains and play the configured effect.</p></div></label>
-          </div>
-        </section>
-
-        <section class="card">
           <div class="section-head"><h3>Brightness</h3><span class="tag">0-150</span></div>
           <div class="slider-row"><input id="brightness" type="range" min="0" max="150" name="brightness" value="__BRIGHTNESS__" /><div class="pill" id="brightnessValue">__BRIGHTNESS__</div></div>
           <p class="note">Applies to the entire board; night mode can override this later.</p>
           <label class="option" style="margin-top:12px;"><input id="distanceBrightness" type="checkbox" name="distance_brightness_enabled" __DISTANCE_BRIGHTNESS_ENABLED__ /><div><strong>Distance brightness</strong><p class="muted">Nearby trains use dim line colour, approaching trains are brighter, and trains at the station use full brightness.</p></div></label>
-          <div class="two-col" style="margin-top:12px;">
-            <label class="field">Far brightness<div class="slider-row"><input data-range-output="distanceFarBrightnessValue" type="range" min="0" max="255" name="distance_far_brightness" value="__DISTANCE_FAR_BRIGHTNESS__" /><div class="pill" id="distanceFarBrightnessValue">__DISTANCE_FAR_BRIGHTNESS__</div></div></label>
-            <label class="field">Approaching brightness<div class="slider-row"><input data-range-output="distanceApproachingBrightnessValue" type="range" min="0" max="255" name="distance_approaching_brightness" value="__DISTANCE_APPROACHING_BRIGHTNESS__" /><div class="pill" id="distanceApproachingBrightnessValue">__DISTANCE_APPROACHING_BRIGHTNESS__</div></div></label>
-          </div>
-          <div class="two-col" style="margin-top:10px;">
-            <label class="field">Solid radius, m<div class="slider-row"><input data-range-output="distanceSolidRadiusValue" type="range" min="0" max="5000" step="25" name="distance_solid_radius_m" value="__DISTANCE_SOLID_RADIUS__" /><div class="pill" id="distanceSolidRadiusValue">__DISTANCE_SOLID_RADIUS__</div></div></label>
-            <label class="field">Near radius, m<div class="slider-row"><input data-range-output="distanceNearRadiusValue" type="range" min="0" max="5000" step="25" name="distance_near_radius_m" value="__DISTANCE_NEAR_RADIUS__" /><div class="pill" id="distanceNearRadiusValue">__DISTANCE_NEAR_RADIUS__</div></div></label>
-            <label class="field">Far radius, m<div class="slider-row"><input data-range-output="distanceFarRadiusValue" type="range" min="0" max="5000" step="25" name="distance_far_radius_m" value="__DISTANCE_FAR_RADIUS__" /><div class="pill" id="distanceFarRadiusValue">__DISTANCE_FAR_RADIUS__</div></div></label>
+          <div id="distanceSettings" __DISTANCE_SETTINGS_HIDDEN__>
+            <div class="two-col" style="margin-top:12px;">
+              <label class="field">Far brightness<div class="slider-row"><input data-range-output="distanceFarBrightnessValue" type="range" min="0" max="255" name="distance_far_brightness" value="__DISTANCE_FAR_BRIGHTNESS__" /><div class="pill" id="distanceFarBrightnessValue">__DISTANCE_FAR_BRIGHTNESS__</div></div></label>
+              <label class="field">Approaching brightness<div class="slider-row"><input data-range-output="distanceApproachingBrightnessValue" type="range" min="0" max="255" name="distance_approaching_brightness" value="__DISTANCE_APPROACHING_BRIGHTNESS__" /><div class="pill" id="distanceApproachingBrightnessValue">__DISTANCE_APPROACHING_BRIGHTNESS__</div></div></label>
+            </div>
+            <div class="two-col" style="margin-top:10px;">
+              <label class="field">Solid radius, m<div class="slider-row"><input data-range-output="distanceSolidRadiusValue" type="range" min="0" max="5000" step="25" name="distance_solid_radius_m" value="__DISTANCE_SOLID_RADIUS__" /><div class="pill" id="distanceSolidRadiusValue">__DISTANCE_SOLID_RADIUS__</div></div></label>
+              <label class="field">Near radius, m<div class="slider-row"><input data-range-output="distanceNearRadiusValue" type="range" min="0" max="5000" step="25" name="distance_near_radius_m" value="__DISTANCE_NEAR_RADIUS__" /><div class="pill" id="distanceNearRadiusValue">__DISTANCE_NEAR_RADIUS__</div></div></label>
+              <label class="field">Far radius, m<div class="slider-row"><input data-range-output="distanceFarRadiusValue" type="range" min="0" max="5000" step="25" name="distance_far_radius_m" value="__DISTANCE_FAR_RADIUS__" /><div class="pill" id="distanceFarRadiusValue">__DISTANCE_FAR_RADIUS__</div></div></label>
+            </div>
           </div>
         </section>
 
@@ -2747,7 +2753,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           </div>
         </section>
 
-        <section class="card">
+        <section class="card" id="animationSection" __ANIMATION_SECTION_HIDDEN__>
           <div class="section-head"><h3>Animation</h3><span class="tag" id="animationTag">Mode: __AN_NAME_TITLE__</span></div>
           <div class="row">
             <label class="field">Name<select name="an_name" id="an_name">__ANIMATION_OPTIONS__</select></label>
@@ -2758,13 +2764,26 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         </section>
 
         <section class="card">
-          <div class="section-head"><h3>OTA Deployment</h3><span class="tag">Per-board target</span></div>
-          <label class="option"><input id="ota_enabled" type="checkbox" name="ota_enabled" __OTA_ENABLED__ /><div><strong>Allow OTA updates for this board</strong><p class="muted">Disable this to hold a board on its current firmware.</p></div></label>
-          <div class="two-col" style="margin-top:12px;">
-            <label class="field">Firmware binary<select name="ota_filename" id="ota_filename">__FIRMWARE_OPTIONS__</select></label>
-            <label class="field">Target version<input type="text" name="ota_target_version" value="__OTA_TARGET_VERSION__" placeholder="__GLOBAL_FW_VERSION__" maxlength="40" /></label>
+          <div class="section-head"><h3>Developer Mode</h3><span class="tag">Advanced</span></div>
+          <label class="option"><input id="developer_enabled" type="checkbox" name="developer_enabled" __DEVELOPER_ENABLED__ /><div><strong>Show deployment and board status tools</strong><p class="muted">For firmware checks, OTA targets, and board heartbeat details.</p></div></label>
+          <div id="developerPanel" __DEVELOPER_PANEL_HIDDEN__>
+            <div class="section-head" style="margin-top:16px;"><h3>Board Status</h3><span class="tag">Heartbeat</span></div>
+            <div class="status-grid">
+              <div class="status-item"><div class="status-label">Last check-in</div><div class="status-value" id="lastPayloadAge">--</div><div class="status-sub" id="lastPayloadAt">Waiting for board</div></div>
+              <div class="status-item"><div class="status-label">Train feed age</div><div class="status-value" id="feedAge">--</div><div class="status-sub">TfNSW cache age</div></div>
+              <div class="status-item"><div class="status-label">Settings version</div><div class="status-value" id="settingsVersion">__SETTINGS_VERSION__</div><div class="status-sub">Updates after saving</div></div>
+              <div class="status-item"><div class="status-label">Firmware</div><div class="status-value" id="firmwareCurrent">--</div><div class="status-sub" id="firmwareSub">Waiting for board</div></div>
+              <div class="status-item"><div class="status-label">OTA target</div><div class="status-value" id="otaTarget">__ACTIVE_FW_TEXT__</div><div class="status-sub">Per-board deployment</div></div>
+            </div>
+
+            <div class="section-head" style="margin-top:16px;"><h3>OTA Deployment</h3><span class="tag">Per-board target</span></div>
+            <label class="option"><input id="ota_enabled" type="checkbox" name="ota_enabled" __OTA_ENABLED__ /><div><strong>Allow OTA updates for this board</strong><p class="muted">Disable this to hold a board on its current firmware.</p></div></label>
+            <div class="two-col" style="margin-top:12px;">
+              <label class="field">Firmware binary<select name="ota_filename" id="ota_filename">__FIRMWARE_OPTIONS__</select></label>
+              <label class="field">Target version<input type="text" name="ota_target_version" value="__OTA_TARGET_VERSION__" placeholder="__GLOBAL_FW_VERSION__" maxlength="40" /></label>
+            </div>
+            <p class="note">Global manifest: __GLOBAL_FW_TEXT__. Active target for this board: __ACTIVE_FW_TEXT__.</p>
           </div>
-          <p class="note">Global manifest: __GLOBAL_FW_TEXT__. Active target for this board: __ACTIVE_FW_TEXT__.</p>
         </section>
 
         <div class="actions"><button class="primary" type="submit">Save settings</button></div>
@@ -2780,6 +2799,7 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         const brightness = document.getElementById("brightness");
         const brightnessValue = document.getElementById("brightnessValue");
         const distanceBrightnessToggle = document.getElementById("distanceBrightness");
+        const distanceSettings = document.getElementById("distanceSettings");
         const nmToggle = document.getElementById("nm_enabled");
         const nightFields = document.querySelectorAll("[data-night-field]");
         const nightStatus = document.getElementById("nightStatus");
@@ -2801,18 +2821,32 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         const firmwareSub = document.getElementById("firmwareSub");
         const otaTarget = document.getElementById("otaTarget");
         const simStateTag = document.getElementById("simStateTag");
+        const testSection = document.getElementById("testSection");
         const testControls = document.getElementById("testControls");
         const testStatesInput = document.getElementById("test_states_json");
         const activeStationCount = document.getElementById("activeStationCount");
         const simUpdatedAt = document.getElementById("simUpdatedAt");
+        const animationSection = document.getElementById("animationSection");
+        const developerToggle = document.getElementById("developer_enabled");
+        const developerPanel = document.getElementById("developerPanel");
         const customColorAnimations = new Set(__AN_CUSTOM_COLOR_NAMES__);
 
         const currentMode = () => document.querySelector('input[name="mode"]:checked')?.value || "live";
         const syncBrightness = () => brightnessValue.textContent = brightness.value;
         const syncTestStateInput = () => { testStatesInput.value = JSON.stringify(testStates); };
+        const syncDistancePanel = () => {
+          if (distanceSettings && distanceBrightnessToggle) distanceSettings.hidden = !distanceBrightnessToggle.checked;
+        };
+        const syncDeveloperPanel = () => {
+          const enabled = !!(developerToggle && developerToggle.checked);
+          if (developerPanel) developerPanel.hidden = !enabled;
+          if (!enabled && boardSyncTag) boardSyncTag.textContent = "Developer off";
+        };
         brightness.addEventListener("input", syncBrightness);
         syncBrightness();
         syncTestStateInput();
+        syncDistancePanel();
+        syncDeveloperPanel();
         document.querySelectorAll("[data-range-output]").forEach(el => {
           const out = document.getElementById(el.dataset.rangeOutput);
           const sync = () => { if (out) out.textContent = el.value; };
@@ -3005,11 +3039,14 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         };
         const syncModeUi = () => {
           const isTest = currentMode() === "test";
+          const isAnimation = currentMode() === "animation";
           document.body.dataset.mode = currentMode();
+          if (testSection) testSection.hidden = !isTest;
+          if (animationSection) animationSection.hidden = !isAnimation;
           testControls.classList.toggle("is-disabled", !isTest);
           if (isTest) {
             applyStates(testStates);
-          } else if (currentMode() === "animation") {
+          } else if (isAnimation) {
             refreshSimulatorStates();
           } else {
             applyStates({});
@@ -3017,7 +3054,16 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           }
         };
         if (distanceBrightnessToggle) {
-          distanceBrightnessToggle.addEventListener("change", refreshSimulatorStates);
+          distanceBrightnessToggle.addEventListener("change", () => {
+            syncDistancePanel();
+            refreshSimulatorStates();
+          });
+        }
+        if (developerToggle) {
+          developerToggle.addEventListener("change", () => {
+            syncDeveloperPanel();
+            if (developerToggle.checked) syncBoardStatus();
+          });
         }
         document.querySelectorAll('input[name="mode"]').forEach(el => el.addEventListener("change", syncModeUi));
         [anName, pulseColorInput, document.querySelector('input[name="an_speed"]')].forEach(el => {
@@ -3042,6 +3088,10 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
           }
         };
         const syncBoardStatus = async () => {
+          if (developerToggle && !developerToggle.checked) {
+            syncDeveloperPanel();
+            return;
+          }
           try {
             const resp = await fetch(`/board_status?board_id=${encodeURIComponent(boardId)}`, { cache: "no-store" });
             if (!resp.ok) throw new Error("status " + resp.status);
@@ -3087,11 +3137,16 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
         "__MODE_ANIMATION_CHECKED__": "checked" if mode == "animation" else "",
         "__BRIGHTNESS__": str(b),
         "__DISTANCE_BRIGHTNESS_ENABLED__": "checked" if distance_brightness_enabled else "",
+        "__DISTANCE_SETTINGS_HIDDEN__": "" if distance_brightness_enabled else "hidden",
+        "__TEST_SECTION_HIDDEN__": "" if mode == "test" else "hidden",
+        "__ANIMATION_SECTION_HIDDEN__": "" if mode == "animation" else "hidden",
         "__DISTANCE_FAR_BRIGHTNESS__": str(distance_far_brightness),
         "__DISTANCE_APPROACHING_BRIGHTNESS__": str(distance_approaching_brightness),
         "__DISTANCE_SOLID_RADIUS__": str(distance_solid_radius),
         "__DISTANCE_NEAR_RADIUS__": str(distance_near_radius),
         "__DISTANCE_FAR_RADIUS__": str(distance_far_radius),
+        "__DEVELOPER_ENABLED__": "checked" if developer_enabled else "",
+        "__DEVELOPER_PANEL_HIDDEN__": "" if developer_enabled else "hidden",
         "__NM_ENABLED__": "checked" if nm.get("enabled") else "",
         "__NM_START__": html.escape(str(nm.get("start", "23:00"))),
         "__NM_END__": html.escape(str(nm.get("end", "06:00"))),
@@ -3142,6 +3197,7 @@ async def board_settings_save(
     distance_solid_radius_m: int = Form(D_SOLID),
     distance_near_radius_m: int = Form(D_NEAR),
     distance_far_radius_m: int = Form(D_FAR),
+    developer_enabled: T.Optional[str] = Form(None),
     ota_enabled: T.Optional[str] = Form(None),
     ota_target_version: str = Form(""),
     ota_filename: str = Form(""),
@@ -3192,6 +3248,9 @@ async def board_settings_save(
         "solid_radius_m": distance_solid_radius_m,
         "near_radius_m": distance_near_radius_m,
         "far_radius_m": distance_far_radius_m,
+    }
+    cfg["developer"] = {
+        "enabled": bool(developer_enabled),
     }
     safe_ota_filename = _safe_firmware_filename(ota_filename)
     if ota_filename and not safe_ota_filename:
@@ -3595,7 +3654,7 @@ def board_payload(
         "brightness": base_brightness,
         "brightness_effective": effective_brightness,
         "display": cfg.get("display", {}),
-        "distance_brightness": bool((cfg.get("display", {}) or {}).get("distance_brightness", True)),
+        "distance_brightness": bool((cfg.get("display", {}) or {}).get("distance_brightness", False)),
         "night_mode": nm_cfg,
         "night_mode_active": nm_active,
         "animation": cfg.get("animation", {}),

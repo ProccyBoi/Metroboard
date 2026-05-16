@@ -123,11 +123,20 @@ class DistanceBrightnessStateTests(unittest.TestCase):
         })
 
         display = cfg["display"]
+        self.assertTrue(display["distance_brightness"])
         self.assertEqual(display["far_brightness"], 255)
         self.assertEqual(display["approaching_brightness"], 255)
         self.assertEqual(display["solid_radius_m"], 900)
         self.assertEqual(display["near_radius_m"], 900)
         self.assertEqual(display["far_radius_m"], 900)
+
+    def test_distance_brightness_and_developer_mode_defaults(self):
+        test_cfg = metro._default_board_settings("TEST1")
+        ab12c_cfg = metro._default_board_settings("AB12C")
+
+        self.assertFalse(test_cfg["display"]["distance_brightness"])
+        self.assertFalse(test_cfg["developer"]["enabled"])
+        self.assertTrue(ab12c_cfg["developer"]["enabled"])
 
     def test_dashboard_uses_line_controls_without_station_visualiser(self):
         html = metro._render_board_settings_console(
@@ -139,9 +148,22 @@ class DistanceBrightnessStateTests(unittest.TestCase):
         self.assertIn("Line Controls", html)
         self.assertIn("distance_far_brightness", html)
         self.assertIn("distance_solid_radius_m", html)
+        self.assertIn('id="distanceSettings" hidden', html)
+        self.assertIn('id="testSection" hidden', html)
+        self.assertIn('id="animationSection" hidden', html)
+        self.assertIn('id="developerPanel" hidden', html)
         self.assertNotIn("boardSvg", html)
         self.assertNotIn("station-node", html)
         self.assertNotIn("Board Simulator", html)
+
+    def test_ab12c_shows_developer_tools_by_default(self):
+        html = metro._render_board_settings_console(
+            "AB12C",
+            metro._default_board_settings("AB12C"),
+        )
+
+        self.assertIn('id="developer_enabled" type="checkbox" name="developer_enabled" checked', html)
+        self.assertIn('id="developerPanel" >', html)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@
 static const char* kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
 
-static const char* kFirmwareVersion = "1.5.0";
+static const char* kFirmwareVersion = "1.5.1";
 static const char* kBuildLabel = "public";
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
 static const uint32_t SETTINGS_FETCH_MS = 30000;
@@ -53,7 +53,7 @@ uint8_t gBaseBrightness = 16;
 uint8_t gEffectiveBrightness = 16;
 static const uint8_t kStatusBrightness = 16;
 bool gBoardIdValid = false;
-bool gDistanceBrightnessEnabled = true;
+bool gDistanceBrightnessEnabled = false;
 uint8_t gDistanceLevelFar = 55;
 uint8_t gDistanceLevelApproaching = 150;
 
@@ -1362,7 +1362,7 @@ bool applySettingsFromPayload(JsonObject root, bool force) {
     gBaseBrightness = b;
     gEffectiveBrightness = (uint8_t)bEff;
 
-    bool distanceBrightness = root["distance_brightness"] | true;
+    bool distanceBrightness = root["distance_brightness"] | false;
     JsonObject display = root["display"];
     if (!display.isNull()) {
         distanceBrightness = display["distance_brightness"] | distanceBrightness;
