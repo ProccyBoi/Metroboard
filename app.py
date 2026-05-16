@@ -111,6 +111,9 @@ MB_TIMEZONE = os.getenv("MB_TIMEZONE", "Australia/Sydney")
 MB_STRICT_ROUTE_MATCH = _env_flag("MB_STRICT_ROUTE_MATCH", True)
 MB_GUESS_AMBIGUOUS = _env_flag("MB_GUESS_AMBIGUOUS", True)
 MB_ROUTE_NEAREST_MARGIN_M = int(os.getenv("MB_ROUTE_NEAREST_MARGIN_M", "250"))
+BOARD_ID_RE = re.compile(r"^[A-Z0-9]{5,16}$")
+SAFE_FW_FILENAME_RE = re.compile(r"^[A-Za-z0-9._-]+\.bin$", re.IGNORECASE)
+SAFE_HOST_RE = re.compile(r"^[A-Za-z0-9.-]+(?::\d{1,5})?$")
 
 IGNORED_ROUTE_PREFIXES = {"RTTA"}
 NO_STATION_INFERENCE_PREFIXES = IGNORED_ROUTE_PREFIXES | {"CTY"}
@@ -148,6 +151,21 @@ SYD_BBOX = _bbox_env()
 def vlog(*a):
     if MB_VERBOSE:
         print("[metroboard]", *a)
+
+def _coerce_bool(value: T.Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        text = value.strip().lower()
+        if text in ("1", "true", "yes", "on"):
+            return True
+        if text in ("0", "false", "no", "off"):
+            return False
+    return default
 
 def route_id_prefix(route_id: str) -> str:
     return (route_id or "").split("_", 1)[0].split(".", 1)[0].upper()
@@ -293,8 +311,11 @@ def _save_board_settings() -> None:
         settings_dir = os.path.dirname(settings_path)
         if settings_dir:
             os.makedirs(settings_dir, exist_ok=True)
-        with open(settings_path, "w", encoding="utf-8") as f:
+        tmp_path = f"{settings_path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(BOARD_SETTINGS, f, indent=2, sort_keys=True)
+            f.write("\n")
+        os.replace(tmp_path, settings_path)
         vlog(f"boards.json saved to {settings_path}")
     except Exception as e:
         vlog("WARN: failed to save boards.json:", e)
@@ -331,7 +352,7 @@ def _board_status_snapshot(board_id: str) -> dict:
         "last_payload_age_seconds": None if last is None else max(0.0, now - last),
         "settings_version": BOARD_SETTINGS_VERSION,
         "developer": {
-            "enabled": bool(developer.get("enabled", board_id == "AB12C")),
+            "enabled": _coerce_bool(developer.get("enabled"), board_id == "AB12C"),
         },
         "feed_age_seconds": _feed_age_seconds(),
         "firmware": {
@@ -347,7 +368,7 @@ def _board_status_snapshot(board_id: str) -> dict:
             "last_manifest_age_seconds": None if fw.get("last_manifest_at") is None else max(0.0, now - fw.get("last_manifest_at")),
         },
         "ota": {
-            "enabled": bool(ota.get("enabled", True)),
+            "enabled": _coerce_bool(ota.get("enabled"), True),
             "target_version": ota.get("target_version") or "",
             "filename": ota.get("filename") or "",
         },
@@ -391,6 +412,11 @@ def _public_base_url(request: Request) -> str:
     proto = request.headers.get("x-forwarded-proto") or request.url.scheme or "https"
     proto = proto.split(",")[0].strip()
     host = host.split(",")[0].strip()
+    if proto not in ("http", "https"):
+        proto = "https"
+    if not SAFE_HOST_RE.fullmatch(host or ""):
+        fallback_host = request.url.netloc
+        host = fallback_host if SAFE_HOST_RE.fullmatch(fallback_host or "") else "localhost"
     if host.endswith(".koyeb.app"):
         proto = "https"
     return f"{proto}://{host}".rstrip("/")
@@ -436,7 +462,7 @@ def _safe_firmware_filename(filename: T.Optional[str]) -> str:
     if not filename or "/" in filename or "\\" in filename:
         return ""
     base = os.path.basename(filename)
-    if base != filename or not base.lower().endswith(".bin"):
+    if base != filename or not SAFE_FW_FILENAME_RE.fullmatch(base):
         return ""
     return base
 
@@ -525,7 +551,7 @@ def _firmware_update_payload_for_board(request: Request, board_id: str, cfg: dic
 
     ota_cfg = cfg.get("ota", {}) or {}
     payload = {
-        "ota_enabled": FIRMWARE_OTA_ENABLED and bool(ota_cfg.get("enabled", True)),
+        "ota_enabled": FIRMWARE_OTA_ENABLED and _coerce_bool(ota_cfg.get("enabled"), True),
         "update_available": update_available,
         "current": current_version,
         "version": meta.get("version"),
@@ -571,7 +597,7 @@ def _available_firmware_files() -> list[dict]:
 
 def _active_firmware_metadata_for_board(cfg: dict) -> dict:
     ota = cfg.get("ota", {}) or {}
-    if not ota.get("enabled", True):
+    if not _coerce_bool(ota.get("enabled"), True):
         return {"available": False, "reason": "board_ota_disabled", "version": ota.get("target_version", "")}
 
     filename = _safe_firmware_filename(ota.get("filename"))
@@ -595,7 +621,7 @@ def _night_mode_effect(brightness: int, nm: dict) -> tuple[int, bool]:
     Returns (effective_brightness, active_flag) based on night-mode settings.
     If parsing fails or disabled, returns (brightness, False).
     """
-    if not nm or not nm.get("enabled"):
+    if not nm or not _coerce_bool(nm.get("enabled"), False):
         return brightness, False
 
     start = _parse_hhmm(nm.get("start", ""))
@@ -614,7 +640,10 @@ def _night_mode_effect(brightness: int, nm: dict) -> tuple[int, bool]:
         return brightness, False
 
     action = (nm.get("action") or "").lower()
-    dim_level = int(nm.get("dim_level", 0))
+    try:
+        dim_level = int(nm.get("dim_level", 0))
+    except Exception:
+        dim_level = 0
     dim_level = max(0, min(255, dim_level))
 
     if action == "off":
@@ -691,7 +720,7 @@ def _normalize_board_config(board_id: str, cfg: T.Optional[dict]) -> dict:
     display = base.get("display")
     if not isinstance(display, dict):
         display = {}
-    display["distance_brightness"] = bool(display.get("distance_brightness", False))
+    display["distance_brightness"] = _coerce_bool(display.get("distance_brightness"), False)
     try:
         far_brightness = int(display.get("far_brightness", DISTANCE_BRIGHTNESS_FAR_DEFAULT))
     except Exception:
@@ -728,18 +757,28 @@ def _normalize_board_config(board_id: str, cfg: T.Optional[dict]) -> dict:
     developer = base.get("developer")
     if not isinstance(developer, dict):
         developer = {}
-    developer["enabled"] = bool(developer.get("enabled", board_id == "AB12C"))
+    developer["enabled"] = _coerce_bool(developer.get("enabled"), board_id == "AB12C")
     base["developer"] = developer
+    ota = base.get("ota")
+    if not isinstance(ota, dict):
+        ota = {}
+    ota["enabled"] = _coerce_bool(ota.get("enabled"), True)
+    ota["target_version"] = str(ota.get("target_version") or "").strip()[:40]
+    ota["filename"] = _safe_firmware_filename(ota.get("filename"))
+    base["ota"] = ota
     return base
 
 def _normalize_board_id(board_id: T.Optional[str]) -> str:
     return (board_id or "").strip().upper()
 
+def _is_valid_board_id(board_id: str) -> bool:
+    return bool(BOARD_ID_RE.fullmatch(board_id or ""))
+
 def _get_or_create_board(board_id: str) -> dict:
     board_id = _normalize_board_id(board_id)
-    if not board_id:
-        vlog("invalid board_id: empty")
-        raise ValueError("empty board_id")
+    if not _is_valid_board_id(board_id):
+        vlog("invalid board_id format")
+        raise ValueError("invalid board_id")
     if board_id not in BOARD_SETTINGS:
         vlog(f"invalid board_id: {board_id} not in BOARD_SETTINGS")
         raise ValueError("unknown board_id")
@@ -2543,8 +2582,8 @@ def _render_board_settings_console(board_id: str, cfg: dict) -> str:
     display = cfg.get("display", {}) or {}
     developer = cfg.get("developer", {}) or {}
     ota = cfg.get("ota", {}) or {}
-    developer_enabled = bool(developer.get("enabled", board_id == "AB12C"))
-    distance_brightness_enabled = bool(display.get("distance_brightness", False))
+    developer_enabled = _coerce_bool(developer.get("enabled"), board_id == "AB12C")
+    distance_brightness_enabled = _coerce_bool(display.get("distance_brightness"), False)
     distance_far_brightness = max(0, min(255, int(display.get("far_brightness", DISTANCE_BRIGHTNESS_FAR_DEFAULT))))
     distance_approaching_brightness = max(
         distance_far_brightness,
@@ -3203,7 +3242,10 @@ async def board_settings_save(
     ota_filename: str = Form(""),
 ):
     board_id = _normalize_board_id(board_id)
-    cfg = _get_or_create_board(board_id)
+    try:
+        cfg = _get_or_create_board(board_id)
+    except ValueError:
+        return HTMLResponse("Invalid board_id", status_code=400)
 
     mode = mode if mode in ("live", "animation", "test") else "live"
     brightness = max(0, min(150, brightness))
@@ -3213,15 +3255,22 @@ async def board_settings_save(
         s = s.lstrip("#")
         if len(s) == 3: s = "".join(c*2 for c in s)
         if len(s) != 6: return [255, 80, 0]
-        return [int(s[i:i+2], 16) for i in (0, 2, 4)]
+        try:
+            return [int(s[i:i+2], 16) for i in (0, 2, 4)]
+        except ValueError:
+            return [255, 80, 0]
+
+    def _clean_hhmm(value: str, fallback: str) -> str:
+        value = str(value or "").strip()[:5]
+        return value if _parse_hhmm(value) else fallback
 
     cfg["mode"] = mode
     cfg["brightness"] = brightness
     cfg["night_mode"] = {
         "enabled": bool(nm_enabled),
-        "start": nm_start,
-        "end": nm_end,
-        "action": nm_action,
+        "start": _clean_hhmm(nm_start, "23:00"),
+        "end": _clean_hhmm(nm_end, "06:00"),
+        "action": nm_action if nm_action in ("off", "dim") else "off",
         "dim_level": nm_dim,
     }
     an_name = str(an_name or "pulse").strip().lower()
@@ -3438,6 +3487,8 @@ def firmware_binary_api(
         cfg = _get_or_create_board(board_id)
     except ValueError:
         return JSONResponse({"error": "invalid board_id"}, status_code=400)
+    if not _coerce_bool((cfg.get("ota") or {}).get("enabled"), True):
+        return JSONResponse({"error": "firmware_unavailable", "reason": "board_ota_disabled"}, status_code=404)
 
     if filename:
         meta = _firmware_metadata_for_filename(filename, version or "")
@@ -3495,7 +3546,10 @@ def _calculate_test_states_for_subset(cfg: dict, subset: dict[str, dict]) -> dic
 def _station_subset(only: T.Optional[str]) -> dict[str, dict]:
     subset = STATION_INDEX
     if only:
-        wanted = [x.strip() for x in only.split(",") if x.strip()]
+        if len(only) > 20000:
+            wanted = []
+        else:
+            wanted = [x.strip() for x in only.split(",") if x.strip()][:600]
         layout_keys = _board_layout_keys()
         subset = {}
         for n in wanted:
@@ -3654,7 +3708,7 @@ def board_payload(
         "brightness": base_brightness,
         "brightness_effective": effective_brightness,
         "display": cfg.get("display", {}),
-        "distance_brightness": bool((cfg.get("display", {}) or {}).get("distance_brightness", False)),
+        "distance_brightness": _coerce_bool((cfg.get("display", {}) or {}).get("distance_brightness"), False),
         "night_mode": nm_cfg,
         "night_mode_active": nm_active,
         "animation": cfg.get("animation", {}),

@@ -138,6 +138,41 @@ class DistanceBrightnessStateTests(unittest.TestCase):
         self.assertFalse(test_cfg["developer"]["enabled"])
         self.assertTrue(ab12c_cfg["developer"]["enabled"])
 
+    def test_persisted_boolean_strings_and_firmware_names_are_normalized(self):
+        cfg = metro._normalize_board_config("TEST1", {
+            "display": {"distance_brightness": "false"},
+            "developer": {"enabled": "false"},
+            "ota": {
+                "enabled": "false",
+                "filename": "../metroboard_public.bin",
+                "target_version": "1.2.3-extra-text-that-should-be-truncated",
+            },
+        })
+
+        self.assertFalse(cfg["display"]["distance_brightness"])
+        self.assertFalse(cfg["developer"]["enabled"])
+        self.assertFalse(cfg["ota"]["enabled"])
+        self.assertEqual(cfg["ota"]["filename"], "")
+        self.assertLessEqual(len(cfg["ota"]["target_version"]), 40)
+
+    def test_firmware_filename_validation_is_strict(self):
+        self.assertEqual(
+            metro._safe_firmware_filename("metroboard_public.bin"),
+            "metroboard_public.bin",
+        )
+        self.assertEqual(
+            metro._safe_firmware_filename("METROBOARD_PUBLIC.BIN"),
+            "METROBOARD_PUBLIC.BIN",
+        )
+        self.assertEqual(metro._safe_firmware_filename("../metroboard_public.bin"), "")
+        self.assertEqual(metro._safe_firmware_filename("metroboard public.bin"), "")
+        self.assertEqual(metro._safe_firmware_filename("metroboard_public.hex"), "")
+
+    def test_large_only_filter_is_rejected_without_expanding_work(self):
+        subset = metro._station_subset("A" * 20001)
+
+        self.assertEqual(subset, {})
+
     def test_dashboard_uses_line_controls_without_station_visualiser(self):
         html = metro._render_board_settings_console(
             "TEST1",
