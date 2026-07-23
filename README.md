@@ -34,7 +34,9 @@ pip install -r requirements.txt
 Environment variables:
 - `TFNSW_API_TOKEN` (required for live data).
 - `FEEDS` (comma-separated GTFS-RT URLs; defaults to Sydney Trains + Metro).
-- `FEED_CACHE_SEC` (cache duration in seconds; default 3).
+- `FEED_CACHE_SEC` (successful-feed refresh interval in seconds; default 5, with a hard minimum of 5 even if a lower hosted value is still configured).
+- `FEED_FAILURE_BACKOFF_MAX_SEC` (maximum per-feed retry delay after failures or rate limiting; default 300 seconds).
+- `FEED_STALE_MAX_SEC` (maximum age for last-good feed data; default 90 seconds and never lower than `FEED_CACHE_SEC`; expired train positions are removed even during backoff).
 - `MB_D_SOLID`, `MB_D_NEAR`, `MB_D_FAR` (distance thresholds in meters; defaults 200/800/1500).
 - `MB_AGENCIES`, `MB_ROUTE_SHORT_ALLOW` (allowlists for agencies/route shorts).
 - `ROUTE_SHORT_OVERRIDES_PATH`, `ROUTE_SHORT_OVERRIDES_JSON` (override route short names).
