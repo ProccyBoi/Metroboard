@@ -18,6 +18,7 @@ import math
 import shutil
 import re
 import random
+import threading
 from datetime import datetime, time as dtime
 import typing as T
 
@@ -101,8 +102,31 @@ ANIMATION_NAMES = {name for name, _label in ANIMATION_OPTIONS}
 ANIMATION_CUSTOM_COLOR_NAMES = {"pulse", "sparkle", "theater", "solid"}
 BOARD_LAYOUT_VIEWBOX = [0, 0, 861, 850]
 
+
+def _effective_feed_cache_seconds(raw_value: T.Optional[str]) -> int:
+    return max(5, int(raw_value or "5"))
+
+
+def _effective_feed_stale_max_seconds(
+    raw_value: T.Optional[str],
+    cache_seconds: int,
+) -> int:
+    return max(cache_seconds, int(raw_value or "90"))
+
+
 # Caching/CORS/logging
-FEED_CACHE_SEC = int(os.getenv("FEED_CACHE_SEC", "3"))
+# Two upstream feeds at a five-second cadence use 34,560 requests/day. The hard
+# minimum prevents an old hosted FEED_CACHE_SEC=3 setting from silently exceeding
+# the intended quota budget.
+FEED_CACHE_SEC = _effective_feed_cache_seconds(os.getenv("FEED_CACHE_SEC"))
+FEED_FAILURE_BACKOFF_MAX_SEC = max(
+    FEED_CACHE_SEC,
+    int(os.getenv("FEED_FAILURE_BACKOFF_MAX_SEC", "300")),
+)
+FEED_STALE_MAX_SEC = _effective_feed_stale_max_seconds(
+    os.getenv("FEED_STALE_MAX_SEC"),
+    FEED_CACHE_SEC,
+)
 CORS_ALLOW_ORIGIN = os.getenv("CORS_ALLOW_ORIGIN")
 MB_VERBOSE = os.getenv("MB_VERBOSE", "1") == "1"
 MB_RESOLUTION_VERBOSE = os.getenv("MB_RESOLUTION_VERBOSE", "0") == "1"
@@ -335,9 +359,13 @@ def _iso_utc_from_ts(ts: T.Optional[float]) -> T.Optional[str]:
     return datetime.utcfromtimestamp(ts).isoformat() + "Z"
 
 def _feed_age_seconds() -> T.Optional[float]:
-    if _FEED_TS == 0:
+    now_wall = _feed_now_wall()
+    with _FEED_CONDITION:
+        _refresh_merged_feed_locked(now_wall)
+        feed_ts = _FEED_TS
+    if feed_ts == 0:
         return None
-    return max(0.0, time.time() - _FEED_TS)
+    return max(0.0, now_wall - feed_ts)
 
 def _board_status_snapshot(board_id: str) -> dict:
     last = BOARD_LAST_PAYLOAD_AT.get(board_id)
@@ -1373,10 +1401,11 @@ SHORT_RE = re.compile(r"\b([TM]\d{1,2})\b", re.I)
 def _session() -> requests.Session:
     s = requests.Session()
     retry = Retry(
-        total=4,
-        backoff_factor=0.6,
-        status_forcelist=(500, 502, 503, 504),
-        allowed_methods=frozenset(["GET"]),
+        total=0,
+        connect=0,
+        read=0,
+        status=0,
+        redirect=0,
         raise_on_status=False,
     )
     s.mount("https://", HTTPAdapter(max_retries=retry))
@@ -1972,15 +2001,138 @@ def _state_for_target_distance(
 # ---------------- GTFS-RT: fetch & parse ----------------
 _FEED_CACHE: T.Optional[rt.FeedMessage] = None
 _FEED_TS = 0.0
+_FEED_LAST_GOOD_BY_URL: dict[str, rt.FeedMessage] = {}
+_FEED_LAST_GOOD_TS_BY_URL: dict[str, float] = {}
+_FEED_NEXT_DUE_BY_URL: dict[str, float] = {}
+_FEED_FAILURES_BY_URL: dict[str, int] = {}
+_FEED_LAST_ATTEMPT_TS = 0.0
+_FEED_CONSECUTIVE_TOTAL_FAILURES = 0
+_FEED_REFRESHING = False
+_FEED_CONDITION = threading.Condition()
+
+
+def _feed_now_monotonic() -> float:
+    return time.monotonic()
+
+
+def _feed_now_wall() -> float:
+    return time.time()
+
+
+def _empty_feed() -> rt.FeedMessage:
+    feed = rt.FeedMessage()
+    feed.header.gtfs_realtime_version = "2.0"
+    return feed
+
+
+def _feed_result_locked(now_wall: float) -> tuple[rt.FeedMessage, float]:
+    _refresh_merged_feed_locked(now_wall)
+    feed = _FEED_CACHE if _FEED_CACHE is not None else _empty_feed()
+    age = 0.0 if _FEED_TS == 0 else max(0.0, now_wall - _FEED_TS)
+    return feed, age
+
+
+def _feed_failure_backoff_seconds(failure_count: int) -> int:
+    exponent = max(0, min(int(failure_count) - 1, 16))
+    return min(FEED_FAILURE_BACKOFF_MAX_SEC, FEED_CACHE_SEC * (2 ** exponent))
+
+
+def _feed_refresh_jitter_seconds() -> float:
+    return random.uniform(0.0, 0.25)
+
+
+def _feed_cache_diagnostics() -> dict[str, T.Optional[float] | int]:
+    now_mono = _feed_now_monotonic()
+    now_wall = _feed_now_wall()
+    with _FEED_CONDITION:
+        next_due = [
+            _FEED_NEXT_DUE_BY_URL.get(url, 0.0)
+            for url in URLS_VP
+        ]
+        last_attempt_ts = _FEED_LAST_ATTEMPT_TS
+        total_failures = _FEED_CONSECUTIVE_TOTAL_FAILURES
+    return {
+        "feed_cache_seconds": FEED_CACHE_SEC,
+        "feed_stale_max_seconds": FEED_STALE_MAX_SEC,
+        "feed_last_attempt_age_seconds": (
+            None
+            if last_attempt_ts == 0
+            else max(0.0, now_wall - last_attempt_ts)
+        ),
+        "feed_retry_in_seconds": (
+            None
+            if not next_due
+            else max(0.0, min(next_due) - now_mono)
+        ),
+        "feed_consecutive_total_failures": total_failures,
+    }
+
+
+def _merge_last_good_feeds_locked(now_wall: float) -> tuple[rt.FeedMessage, float]:
+    merged = _empty_feed()
+    timestamps: list[float] = []
+    expired_urls: list[str] = []
+    for url in URLS_VP:
+        feed = _FEED_LAST_GOOD_BY_URL.get(url)
+        if feed is None:
+            continue
+        timestamp = _FEED_LAST_GOOD_TS_BY_URL.get(url)
+        if timestamp is None or (now_wall - timestamp) > FEED_STALE_MAX_SEC:
+            expired_urls.append(url)
+            continue
+        merged.entity.extend(feed.entity)
+        timestamps.append(timestamp)
+    for url in expired_urls:
+        _FEED_LAST_GOOD_BY_URL.pop(url, None)
+        _FEED_LAST_GOOD_TS_BY_URL.pop(url, None)
+    return merged, (min(timestamps) if timestamps else 0.0)
+
+
+def _refresh_merged_feed_locked(now_wall: float) -> None:
+    global _FEED_CACHE, _FEED_TS
+    if not _FEED_LAST_GOOD_BY_URL:
+        return
+    has_expired_snapshot = any(
+        (
+            _FEED_LAST_GOOD_TS_BY_URL.get(url) is None
+            or (
+                now_wall - _FEED_LAST_GOOD_TS_BY_URL[url]
+            ) > FEED_STALE_MAX_SEC
+        )
+        for url in URLS_VP
+        if url in _FEED_LAST_GOOD_BY_URL
+    )
+    if not has_expired_snapshot:
+        return
+    _FEED_CACHE, _FEED_TS = _merge_last_good_feeds_locked(now_wall)
+
 
 def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
-    global _FEED_CACHE, _FEED_TS
-    now = time.time()
-    if _FEED_CACHE is not None and (now - _FEED_TS) < FEED_CACHE_SEC:
-        return _FEED_CACHE, (now - _FEED_TS)
-
+    global _FEED_CACHE, _FEED_TS, _FEED_LAST_ATTEMPT_TS
+    global _FEED_CONSECUTIVE_TOTAL_FAILURES, _FEED_REFRESHING
     if not API_TOKEN:
         raise RuntimeError("TFNSW_API_TOKEN is not configured; live feeds unavailable")
+
+    now_mono = _feed_now_monotonic()
+    now_wall = _feed_now_wall()
+    with _FEED_CONDITION:
+        due_urls = [
+            url for url in URLS_VP
+            if now_mono >= _FEED_NEXT_DUE_BY_URL.get(url, 0.0)
+        ]
+        if not due_urls:
+            return _feed_result_locked(now_wall)
+
+        if _FEED_REFRESHING:
+            # A stale last-good snapshot is safe to serve while one request does
+            # the upstream work. Only cold-start callers need to wait.
+            if _FEED_CACHE is not None:
+                return _feed_result_locked(now_wall)
+            while _FEED_REFRESHING and _FEED_CACHE is None:
+                _FEED_CONDITION.wait()
+            return _feed_result_locked(_feed_now_wall())
+
+        _FEED_REFRESHING = True
 
     hdr = {
         "Authorization": f"apikey {API_TOKEN}",
@@ -1988,30 +2140,77 @@ def fetch_vp_cached() -> tuple[rt.FeedMessage, float]:
         "Cache-Control": "no-cache",
         "User-Agent": "metroboard/1.0",
     }
-    s = _session()
-    time.sleep(random.uniform(0, 0.25))  # stagger
+    successful: dict[str, rt.FeedMessage] = {}
+    failed: dict[str, tuple[Exception, T.Optional[int]]] = {}
 
-    merged = rt.FeedMessage()
-    merged.header.gtfs_realtime_version = "2.0"
-    total = 0
+    try:
+        jitter_seconds = _feed_refresh_jitter_seconds()
+        if jitter_seconds > 0:
+            time.sleep(jitter_seconds)
+        s = _session()
+        for url in due_urls:
+            try:
+                response = s.get(url, headers=hdr, timeout=20)
+                response.raise_for_status()
+                feed = rt.FeedMessage()
+                feed.ParseFromString(response.content)
+                successful[url] = feed
+                vehicles = sum(1 for entity in feed.entity if entity.HasField("vehicle"))
+                vlog(f"fetched {url}: vehicles={vehicles}")
+            except Exception as exc:
+                response = getattr(exc, "response", None)
+                status_code = getattr(response, "status_code", None)
+                failed[url] = (exc, status_code)
+                vlog("WARN fetch", url, f"HTTP {status_code}" if status_code else exc)
+    except Exception as exc:
+        for url in due_urls:
+            failed[url] = (exc, None)
+        vlog("WARN feed refresh", exc)
 
-    for url in URLS_VP:
+    finished_mono = _feed_now_monotonic()
+    finished_wall = _feed_now_wall()
+    with _FEED_CONDITION:
         try:
-            r = s.get(url, headers=hdr, timeout=20)
-            r.raise_for_status()
-            feed = rt.FeedMessage()
-            feed.ParseFromString(r.content)
-            veh = sum(1 for e in feed.entity if e.HasField("vehicle"))
-            merged.entity.extend(feed.entity)
-            total += veh
-            vlog(f"fetched {url}: vehicles={veh}")
-        except Exception as e:
-            vlog("WARN fetch", url, e)
+            _FEED_LAST_ATTEMPT_TS = finished_wall
+            if successful:
+                _FEED_CONSECUTIVE_TOTAL_FAILURES = 0
+            else:
+                _FEED_CONSECUTIVE_TOTAL_FAILURES += 1
 
-    _FEED_CACHE = merged
-    _FEED_TS = now
-    vlog("feed merged vehicles", total)
-    return merged, 0.0
+            for url, feed in successful.items():
+                _FEED_LAST_GOOD_BY_URL[url] = feed
+                _FEED_LAST_GOOD_TS_BY_URL[url] = finished_wall
+                _FEED_FAILURES_BY_URL[url] = 0
+                _FEED_NEXT_DUE_BY_URL[url] = finished_mono + FEED_CACHE_SEC
+
+            for url in failed:
+                failures = _FEED_FAILURES_BY_URL.get(url, 0) + 1
+                _FEED_FAILURES_BY_URL[url] = failures
+                _FEED_NEXT_DUE_BY_URL[url] = (
+                    finished_mono + _feed_failure_backoff_seconds(failures)
+                )
+
+            if _FEED_LAST_GOOD_BY_URL:
+                _FEED_CACHE, _FEED_TS = _merge_last_good_feeds_locked(finished_wall)
+            elif _FEED_CACHE is None:
+                # Cache the cold-start failure as an empty snapshot so callers
+                # share its backoff instead of starting a retry storm.
+                _FEED_CACHE = _empty_feed()
+
+            total = sum(
+                1 for entity in _FEED_CACHE.entity
+                if entity.HasField("vehicle")
+            ) if _FEED_CACHE is not None else 0
+            vlog(
+                "feed merged vehicles",
+                total,
+                f"fresh={len(successful)}",
+                f"failed={len(failed)}",
+            )
+            return _feed_result_locked(finished_wall)
+        finally:
+            _FEED_REFRESHING = False
+            _FEED_CONDITION.notify_all()
 
 def load_station_route_pairs(path: str = "station_line_pairs.csv") -> dict[str, set[str]]:
     """Load parent_stop_id -> set of route_short from station_line_pairs.csv"""
@@ -2372,12 +2571,12 @@ def root():
 
 @app.get("/healthz")
 def healthz():
-    age = None if _FEED_TS == 0 else (time.time() - _FEED_TS)
     return {
         "status": "ok",
         "stations": len(STATION_INDEX),
         "stop_route_pairs": len(STOP_ROUTE_PAIRS),
-        "trains_last_fetch_s": age,
+        "trains_last_fetch_s": _feed_age_seconds(),
+        **_feed_cache_diagnostics(),
     }
 
 @app.get("/login", response_class=HTMLResponse)
