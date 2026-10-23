@@ -142,3 +142,26 @@ backend live when the device has Wi-Fi during setup.
 
 The dashboard intentionally uses compact line controls instead of rendering the
 station visualiser.
+
+## M1 extension to Bankstown
+
+The public firmware already maps all 31 M1 LEDs from Tallawong to Bankstown,
+including the ten stations beyond Sydenham. Keep their order and LED indices
+unchanged when updating firmware. The backend includes those stations in its
+station/line data and uses M1 vehicle positions to drive them; no opening-date
+switch is required. Hills Showground is included in the station whitelist.
+
+Keep the TfNSW token valid for both configured realtime feeds and refresh the
+static GTFS data when the new service is published. The regression suite checks
+stopped trains, GPS fallback for unknown platform IDs, approaching states, and
+separation between M1 and T6 at Bankstown. These simulations do not verify the
+operator's opening-day feed availability or route identifiers.
+
+Run the regression suite from the repository root:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Firmware releases must include a successfully built binary matching the sketch
+and manifest version. Updating a version number alone does not update boards.

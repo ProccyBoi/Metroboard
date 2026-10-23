@@ -494,6 +494,41 @@ def _safe_firmware_filename(filename: T.Optional[str]) -> str:
         return ""
     return base
 
+_FIRMWARE_HASH_CACHE: dict[str, tuple[tuple[int, ...], str, str]] = {}
+_FIRMWARE_HASH_LOCK = threading.Lock()
+
+
+def _firmware_stat_key(stat: os.stat_result) -> tuple[int, ...]:
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+
+
+def _firmware_hashes(path: str, stat: os.stat_result) -> tuple[str, str]:
+    fingerprint = _firmware_stat_key(stat)
+    with _FIRMWARE_HASH_LOCK:
+        cached = _FIRMWARE_HASH_CACHE.get(path)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1], cached[2]
+
+        md5 = hashlib.md5()
+        sha256 = hashlib.sha256()
+        with open(path, "rb") as f:
+            before = _firmware_stat_key(os.fstat(f.fileno()))
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                md5.update(chunk)
+                sha256.update(chunk)
+            after = _firmware_stat_key(os.fstat(f.fileno()))
+        hashes = md5.hexdigest(), sha256.hexdigest()
+
+        # Never retain a digest from a file changed or replaced while reading.
+        if before == after == fingerprint == _firmware_stat_key(os.stat(path)):
+            if path not in _FIRMWARE_HASH_CACHE and len(_FIRMWARE_HASH_CACHE) >= 32:
+                _FIRMWARE_HASH_CACHE.pop(next(iter(_FIRMWARE_HASH_CACHE)))
+            _FIRMWARE_HASH_CACHE[path] = (fingerprint, *hashes)
+        else:
+            _FIRMWARE_HASH_CACHE.pop(path, None)
+        return hashes
+
+
 def _firmware_metadata_for_path(version: str, path: str) -> dict:
     path = _resolve_local_path(path)
     if not FIRMWARE_OTA_ENABLED:
@@ -502,16 +537,12 @@ def _firmware_metadata_for_path(version: str, path: str) -> dict:
         return {"available": False, "reason": "missing_version", "version": version}
     if not os.path.exists(path):
         return {"available": False, "reason": "missing_binary", "version": version, "path": path}
-    size = os.path.getsize(path)
+    stat = os.stat(path)
+    size = stat.st_size
     if size <= 0:
         return {"available": False, "reason": "empty_binary", "version": version, "path": path}
 
-    md5 = hashlib.md5()
-    sha256 = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            md5.update(chunk)
-            sha256.update(chunk)
+    md5, sha256 = _firmware_hashes(path, stat)
 
     return {
         "available": True,
@@ -519,8 +550,8 @@ def _firmware_metadata_for_path(version: str, path: str) -> dict:
         "path": path,
         "filename": os.path.basename(path),
         "size": size,
-        "md5": md5.hexdigest(),
-        "sha256": sha256.hexdigest(),
+        "md5": md5,
+        "sha256": sha256,
         "mtime": os.path.getmtime(path),
     }
 
@@ -1388,10 +1419,14 @@ def _board_layout_model() -> dict:
     }
 
 def _board_layout_keys() -> set[str]:
+    sequences = _load_firmware_sequences()
     keys: set[str] = set()
-    for line in _board_layout_model()["lines"]:
-        for station in line["stations"]:
-            keys.add(station["key"])
+    for spec in BOARD_LINE_SPECS:
+        for segment in spec.get("segments", []):
+            if not segment.get("path", []):
+                continue
+            for name in _segment_names(sequences, segment):
+                keys.add(f"{name}{spec['suffix']}")
     return keys
 
 EXCLUDE_SUB = ("wharf", "light rail", "b-line", "interchange", "motorway", " m2")
@@ -1556,6 +1591,27 @@ def load_trip_route_shortnames(
     return out
 
 # ---------------- Static GTFS filters: allowed parents & pairs ----------------
+def _iter_stop_time_ids(path: str) -> T.Iterator[tuple[str, str]]:
+    """Stream the two identifiers needed from the large stop-times table.
+
+    Preserve DictReader's treatment of duplicate headers (last value wins),
+    short rows, missing columns and blank rows without allocating a dictionary
+    for every stop time.
+    """
+    with open(path, encoding="utf-8-sig") as f:
+        rows = csv.reader(f)
+        columns = {name: index for index, name in enumerate(next(rows, []))}
+        trip_column = columns.get("trip_id", -1)
+        stop_column = columns.get("stop_id", -1)
+        for row in rows:
+            if not row:
+                continue
+            width = len(row)
+            trip_id = row[trip_column].strip() if 0 <= trip_column < width else ""
+            stop_id = row[stop_column].strip() if 0 <= stop_column < width else ""
+            yield trip_id, stop_id
+
+
 def require_allowed_parents(
     stops="stops.txt",
     routes="routes.txt",
@@ -1612,22 +1668,21 @@ def require_allowed_parents(
 
     allowed: set[str] = set()
     seen_types, seen_ag = set(), set()
-    with open(stop_times, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            rid = trip_route.get((r.get("trip_id") or "").strip(), "")
-            rtype, rshort, ag = route_meta.get(rid, (None, "", ""))
-            if rtype is None:
-                continue
-            seen_types.add(rtype); seen_ag.add(ag)
-            if types and rtype not in types:
-                continue
-            if agencies_allowed and ag not in agencies_allowed:
-                continue
-            if route_short_allow and rshort and rshort.upper() not in route_short_allow:
-                continue
-            p = parent_of((r.get("stop_id") or "").strip())
-            if p and is_num_parent(p):
-                allowed.add(p)
+    for trip_id, stop_id in _iter_stop_time_ids(stop_times):
+        rid = trip_route.get(trip_id, "")
+        rtype, rshort, ag = route_meta.get(rid, (None, "", ""))
+        if rtype is None:
+            continue
+        seen_types.add(rtype); seen_ag.add(ag)
+        if types and rtype not in types:
+            continue
+        if agencies_allowed and ag not in agencies_allowed:
+            continue
+        if route_short_allow and rshort and rshort.upper() not in route_short_allow:
+            continue
+        p = parent_of(stop_id)
+        if p and is_num_parent(p):
+            allowed.add(p)
 
     vlog("routes types seen", sorted(seen_types), "agencies", sorted(seen_ag))
     if allowed:
@@ -1715,26 +1770,25 @@ def require_allowed_pairs(
     pairs: set[tuple[str, str]] = set()
     missing_short_seen: dict[str, int] = {}
 
-    with open(stop_times, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            rid = trip_route.get((r.get("trip_id") or "").strip(), "")
-            rtype, ag, _ = rt_meta.get(rid, (None, "", ""))
-            if rtype is None:
-                continue
-            if types and rtype not in types:
-                continue
-            if agencies_allowed and ag not in agencies_allowed:
-                continue
-            rshort = (route_id_to_short.get(rid, "") or "").upper()
-            if not rshort:
-                if len(missing_short_seen) < 20:
-                    missing_short_seen[rid] = missing_short_seen.get(rid, 0) + 1
-                continue
-            if route_short_allow and rshort not in route_short_allow:
-                continue
-            p = parent_of((r.get("stop_id") or "").strip())
-            if p and is_num_parent(p):
-                pairs.add((p, rshort))
+    for trip_id, stop_id in _iter_stop_time_ids(stop_times):
+        rid = trip_route.get(trip_id, "")
+        rtype, ag, _ = rt_meta.get(rid, (None, "", ""))
+        if rtype is None:
+            continue
+        if types and rtype not in types:
+            continue
+        if agencies_allowed and ag not in agencies_allowed:
+            continue
+        rshort = (route_id_to_short.get(rid, "") or "").upper()
+        if not rshort:
+            if len(missing_short_seen) < 20:
+                missing_short_seen[rid] = missing_short_seen.get(rid, 0) + 1
+            continue
+        if route_short_allow and rshort not in route_short_allow:
+            continue
+        p = parent_of(stop_id)
+        if p and is_num_parent(p):
+            pairs.add((p, rshort))
 
     if pairs:
         vlog(f"pairs strict: {len(pairs)}")
@@ -2265,20 +2319,18 @@ def load_stop_route_pairs(
                 stops_seen.add(sid)
 
     pairs: dict[str, set[str]] = {}
-    with open(stop_times, encoding="utf-8-sig") as f:
-        for r in csv.DictReader(f):
-            sid = (r.get("stop_id") or "").strip()
-            if not sid or sid not in stops_seen:
-                continue
-            rid = trip_route.get((r.get("trip_id") or "").strip(), "")
-            if types and route_types.get(rid) not in types:
-                continue
-            rs = (route_id_to_short.get(rid, "") or "").upper()
-            if not rs:
-                continue
-            if route_short_allow and rs not in route_short_allow:
-                continue
-            pairs.setdefault(sid, set()).add(rs)
+    for trip_id, sid in _iter_stop_time_ids(stop_times):
+        if not sid or sid not in stops_seen:
+            continue
+        rid = trip_route.get(trip_id, "")
+        if types and route_types.get(rid) not in types:
+            continue
+        rs = (route_id_to_short.get(rid, "") or "").upper()
+        if not rs:
+            continue
+        if route_short_allow and rs not in route_short_allow:
+            continue
+        pairs.setdefault(sid, set()).add(rs)
 
     vlog(f"Loaded {len(pairs)} stop->route mappings from static GTFS")
     return pairs
