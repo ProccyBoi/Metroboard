@@ -117,8 +117,9 @@ static void reportStatus() {
 
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(8000);
-    client.setHandshakeTimeout(8000);
+    // Secure-client timeouts use seconds; HTTPClient timeouts use milliseconds.
+    client.setTimeout(8);
+    client.setHandshakeTimeout(8);
 
     HTTPClient http;
     http.setTimeout(8000);
@@ -198,8 +199,8 @@ static bool performOtaUpdate(const char* firmwareUrl, const char* expectedMd5,
 
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(30000);
-    client.setHandshakeTimeout(30000);
+    client.setTimeout(30);
+    client.setHandshakeTimeout(30);
 
     HTTPClient http;
     http.setTimeout(30000);
@@ -344,8 +345,8 @@ static bool checkForOtaUpdate() {
 
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(20000);
-    client.setHandshakeTimeout(20000);
+    client.setTimeout(20);
+    client.setHandshakeTimeout(20);
 
     HTTPClient http;
     http.setTimeout(20000);

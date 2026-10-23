@@ -163,5 +163,10 @@ Run the regression suite from the repository root:
 python -m unittest discover -s tests -v
 ```
 
+The firmware logic tests require `g++` or `clang++`. They compile selected
+functions from the actual sketch and compare URL encoding, batching, LED
+rendering and decay against the previous implementation. They do not replace
+the full PlatformIO build or testing on a physical board.
+
 Firmware releases must include a successfully built binary matching the sketch
 and manifest version. Updating a version number alone does not update boards.

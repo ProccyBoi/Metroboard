@@ -26,7 +26,7 @@
 static const char* kPayloadBase =
     "https://damp-catlin-metroboard-7be2a3b3.koyeb.app/board_payload";
 
-static const char* kFirmwareVersion = "1.5.1";
+static const char* kFirmwareVersion = "1.5.2";
 static const char* kBuildLabel = "public";
 static const uint32_t POLL_MS_MIN = 1000, POLL_MS_MAX = 5000;
 static const uint32_t SETTINGS_FETCH_MS = 30000;
@@ -246,19 +246,24 @@ static inline bool unres(char c) {
            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
            c == '~';
 }
-static String enc(const char* s) {
-    String o;
+static void appendEncoded(String& out, const char* s) {
+    static const char hex[] = "0123456789ABCDEF";
     while (*s) {
-        char c = *s++;
+        unsigned char c = (unsigned char)*s++;
         if (unres(c))
-            o += c;
+            out += (char)c;
         else {
-            char b[4];
-            snprintf(b, sizeof(b), "%%%02X", (unsigned char)c);
-            o += b;
+            out += '%';
+            out += hex[c >> 4];
+            out += hex[c & 0x0F];
         }
     }
-    return o;
+}
+static String enc(const char* s) {
+    String out;
+    out.reserve(strlen(s) * 3);
+    appendEncoded(out, s);
+    return out;
 }
 static String serviceBaseUrl() {
     String url = String(kPayloadBase);
@@ -676,14 +681,15 @@ void applyBatchToState(JsonVariantConst states) {
 void repaintDirtyLinesAndDecayOnce() {
     for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
         strips[ln].setBrightness(gEffectiveBrightness);
-        if (!dirtyLine[ln]) continue;
-        strips[ln].clear();
-        for (size_t i = 0; i < NB; i++) {
-            if (B[i].line != (Line)ln) continue;
-            uint32_t color = lineColorForState(B[i].line, stateBuf[i], ttlBuf[i]);
-            if (color) strips[ln].setPixelColor(B[i].led, color);
-        }
-        strips[ln].show();
+        if (dirtyLine[ln]) strips[ln].clear();
+    }
+    for (size_t i = 0; i < NB; i++) {
+        if (!dirtyLine[B[i].line]) continue;
+        uint32_t color = lineColorForState(B[i].line, stateBuf[i], ttlBuf[i]);
+        if (color) strips[B[i].line].setPixelColor(B[i].led, color);
+    }
+    for (uint8_t ln = 0; ln < LINE_COUNT; ln++) {
+        if (dirtyLine[ln]) strips[ln].show();
     }
     for (size_t i = 0; i < NB; i++)
         if (stateBuf[i] != 3 && ttlBuf[i] > 0) ttlBuf[i]--;
@@ -743,8 +749,9 @@ bool validateBoardIdWithServer(const String& boardId, bool& checked) {
 
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(8000);
-    client.setHandshakeTimeout(8000);
+    // Secure-client timeouts use seconds; HTTPClient timeouts use milliseconds.
+    client.setTimeout(8);
+    client.setHandshakeTimeout(8);
 
     HTTPClient http;
     http.setTimeout(8000);
@@ -1033,8 +1040,8 @@ bool performOtaUpdate(const char* firmwareUrl, const char* expectedMd5,
 
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(30000);
-    client.setHandshakeTimeout(30000);
+    client.setTimeout(30);
+    client.setHandshakeTimeout(30);
 
     HTTPClient http;
     http.setTimeout(30000);
@@ -1209,8 +1216,8 @@ bool checkForOtaUpdate() {
 
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(20000);
-    client.setHandshakeTimeout(20000);
+    client.setTimeout(20);
+    client.setHandshakeTimeout(20);
 
     HTTPClient http;
     http.setTimeout(20000);
@@ -1332,13 +1339,26 @@ void appendDeviceQuery(String& url) {
     url += "?board_id=";
     url += gConfig.boardId;
     url += "&fw=";
-    url += enc(kFirmwareVersion);
+    appendEncoded(url, kFirmwareVersion);
     url += "&build=";
-    url += enc(kBuildLabel);
+    appendEncoded(url, kBuildLabel);
     url += "&ota=";
-    url += enc(gLastOtaResult.c_str());
+    appendEncoded(url, gLastOtaResult.c_str());
     url += "&ota_target=";
-    url += enc(gLastOtaTargetVersion.c_str());
+    appendEncoded(url, gLastOtaTargetVersion.c_str());
+}
+
+String makeBatchUrl(size_t first, size_t end) {
+    String url;
+    url.reserve(URL_CHAR_BUDGET);
+    url += kPayloadBase;
+    appendDeviceQuery(url);
+    url += "&only=";
+    for (size_t j = first; j < end; j++) {
+        if (j > first) url += ',';
+        appendEncoded(url, B[j].station);
+    }
+    return url;
 }
 
 bool applySettingsFromPayload(JsonObject root, bool force) {
@@ -1449,8 +1469,8 @@ bool applySettingsFromPayload(JsonObject root, bool force) {
 bool fetchSettingsOnly() {
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(12000);
-    client.setHandshakeTimeout(12000);
+    client.setTimeout(12);
+    client.setHandshakeTimeout(12);
 
     String url = String(kPayloadBase);
     appendDeviceQuery(url);
@@ -1499,8 +1519,8 @@ int fetchAllBatchesAndRenderOnce(bool allowRender) {
 
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(20000);
-    client.setHandshakeTimeout(20000);
+    client.setTimeout(20);
+    client.setHandshakeTimeout(20);
 
     size_t i = 0;
     int ok = 0;
@@ -1510,13 +1530,7 @@ int fetchAllBatchesAndRenderOnce(bool allowRender) {
     while (i < NB && fired < MAX_BATCHES_PER_POLL) {
         size_t end = computeBatchEnd(i);
 
-        String url = String(kPayloadBase);
-        appendDeviceQuery(url);
-        url += "&only=";
-        for (size_t j = i; j < end; j++) {
-            if (j > i) url += ',';
-            url += enc(B[j].station);
-        }
+        String url = makeBatchUrl(i, end);
 
         HTTPClient http;
         http.setTimeout(20000);
@@ -1612,8 +1626,8 @@ void initStatusLed() {
 bool isBoardIdValid() {
     WiFiClientSecure client;
     client.setInsecure();
-    client.setTimeout(20000);
-    client.setHandshakeTimeout(20000);
+    client.setTimeout(20);
+    client.setHandshakeTimeout(20);
 
     HTTPClient http;
     String url = serviceBaseUrl();

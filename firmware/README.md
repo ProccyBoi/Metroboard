@@ -14,6 +14,23 @@ Workflow:
 4. Commit and push. After Koyeb deploys, boards already running OTA-capable
    firmware will see the newer manifest and install the update.
 
+The PlatformIO environments pin the ESP32 platform to retain the Arduino
+2.0.17 / ESP-IDF 4.4.7 generation used by the deployed firmware. Treat a major
+SDK upgrade as a separate change with hardware validation.
+
+Before publishing, run the regression suite and build both targets:
+
+```bash
+python -m unittest discover -s tests -v
+python -m platformio run -e metroboard_public -e metroboard_bridge
+```
+
+The host firmware tests need `g++` or `clang++`. Check that the public image fits
+the configured OTA partition, and publish its new binary and matching version
+together. A successful deployment makes the image available to eligible boards;
+verify `/board_status` firmware reports separately to confirm devices installed
+it. Preserve per-board OTA holds and overrides unless deliberately changing them.
+
 If `metroboard_public.bin` is absent, `/firmware_manifest` safely reports that
 no update is available.
 
